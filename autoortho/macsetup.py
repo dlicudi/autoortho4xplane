@@ -1,5 +1,7 @@
 import os
 import logging
+import subprocess
+import time
 
 # Handle imports for both frozen (PyInstaller) and direct Python execution
 try:
@@ -53,8 +55,22 @@ def setup_macfuse_mount(path):
 
     if os.path.lexists(real):
         if safe_ismount(real):
-            log.warning(f"Mount point {path} is already mounted")
-            return False
+            log.warning(f"Mount point {path} is already mounted; attempting to unmount")
+            try:
+                subprocess.run(["diskutil", "unmount", "force", real], 
+                               check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # Wait briefly for unmount to complete
+                deadline = time.time() + 3.0
+                while time.time() < deadline:
+                    if not safe_ismount(real):
+                        break
+                    time.sleep(0.2)
+            except Exception as e:
+                log.debug(f"Pre-mount unmount failed: {e}")
+            
+            if safe_ismount(real):
+                log.error(f"Mount point {path} is still already mounted and could not be unmounted.")
+                return False
         if not os.path.isdir(real):
             log.error(f"Mount point {path} exists but is not a directory")
             return False

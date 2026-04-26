@@ -5741,8 +5741,7 @@ class ConfigUI(QMainWindow):
             
             # Predictive DDS settings
             self.cfg.autoortho.predictive_dds_enabled = (
-                self.prefetch_enabled_check.isChecked()
-                and self.predictive_dds_enabled_check.isChecked()
+                self.predictive_dds_enabled_check.isChecked()
             )
             self.cfg.autoortho.predictive_dds_build_interval_ms = str(
                 self.predictive_interval_slider.value()

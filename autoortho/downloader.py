@@ -44,10 +44,12 @@ def _get_download_session(pool_size=10):
         with _session_lock:
             if _download_session is None:
                 session = requests.Session()
+                # Use moderate retries at the adapter level for transient L4/L5 issues.
+                # L7 retries are handled in the specific download loops.
                 adapter = requests.adapters.HTTPAdapter(
                     pool_connections=pool_size,
                     pool_maxsize=pool_size,
-                    max_retries=0,
+                    max_retries=3,
                     pool_block=True,
                 )
                 session.mount('https://', adapter)
@@ -56,11 +58,22 @@ def _get_download_session(pool_size=10):
     return _download_session
 
 
-def do_url(url, headers={}):
+def do_url(url, headers={}, max_retries=3):
     session = _get_download_session()
-    resp = session.get(url, headers=headers, timeout=15)
-    resp.raise_for_status()
-    return resp.content
+    retries = 0
+    while retries < max_retries:
+        try:
+            resp = session.get(url, headers=headers, timeout=30)
+            resp.raise_for_status()
+            return resp.content
+        except requests.RequestException as e:
+            retries += 1
+            if retries >= max_retries:
+                log.error(f"do_url: Max retries ({max_retries}) reached for {url}. Error: {e}")
+                raise
+            backoff = 2 ** retries
+            log.warning(f"do_url: Attempt {retries} failed for {url}, retrying in {backoff}s... Error: {e}")
+            time.sleep(backoff)
 
 
 cur_activity = {}

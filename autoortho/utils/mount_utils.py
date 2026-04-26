@@ -1,7 +1,10 @@
 import os
 import sys
+import signal
 import logging
 import shutil
+import subprocess
+import time
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -40,17 +43,118 @@ def safe_ismount(path) -> bool:
 _IGNORE_FILES = {".DS_Store", ".metadata_never_index"}
 _AO_PLACEHOLDER_ITEMS = {"Earth nav data", "terrain", "textures", ".AO_PLACEHOLDER"}
 
+def kill_stale_processes(mountpoint):
+    """
+    Find and terminate any stale autoortho processes that appear to be 
+    managing the given mountpoint.
+    """
+    mountpoint = os.path.abspath(os.path.expanduser(mountpoint))
+    log.debug(f"Checking for stale processes using mountpoint: {mountpoint}")
+    
+    try:
+        # Get all processes with PIDs and full arguments
+        # -axww ensures we get the full command line even if it's long
+        output = subprocess.check_output(["ps", "-axww", "-o", "pid,args"], text=True, errors='ignore')
+        
+        for line in output.splitlines()[1:]:  # Skip header
+            line = line.strip()
+            if not line:
+                continue
+                
+            parts = line.split(None, 1)
+            if len(parts) < 2:
+                continue
+                
+            pid_str, args = parts
+            try:
+                pid = int(pid_str)
+            except ValueError:
+                continue
+                
+            # Skip ourselves
+            if pid == os.getpid():
+                continue
+                
+            # Check if this looks like an autoortho process managing our mountpoint
+            if "autoortho" in args and mountpoint in args:
+                log.info(f"Found stale autoortho process {pid} for mount {mountpoint}. Terminating...")
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    # Give it a moment to clean up gracefully
+                    for _ in range(10):
+                        time.sleep(0.1)
+                        try:
+                            os.kill(pid, 0)
+                        except ProcessLookupError:
+                            break
+                    else:
+                        # Still alive, use SIGKILL
+                        log.warning(f"Process {pid} did not exit gracefully; sending SIGKILL")
+                        os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                except Exception as e:
+                    log.error(f"Failed to kill stale process {pid}: {e}")
+                    
+    except Exception as e:
+        log.warning(f"Error checking for stale processes: {e}")
+
+
 def cleanup_mountpoint(mountpoint):
+    """
+    Safely cleanup a mountpoint, attempting to unmount if necessary,
+    and restoring placeholder content.
+    """
     placeholder_path = os.path.join(mountpoint, ".AO_PLACEHOLDER")
-    if os.path.lexists(mountpoint):
-        log.info(f"Cleaning up mountpoint: {mountpoint}")
-        os.rmdir(mountpoint)
+    
     if safe_ismount(mountpoint):
-        log.debug(f"Skipping cleanup: still mounted: {mountpoint}")
+        log.info(f"Mountpoint {mountpoint} is active; attempting to unmount first")
+        try:
+            if sys.platform == 'darwin':
+                subprocess.run(["diskutil", "unmount", "force", mountpoint], 
+                               check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            elif sys.platform == 'linux':
+                if shutil.which("fusermount"):
+                    subprocess.run(["fusermount", "-u", "-z", mountpoint], 
+                                   check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:
+                    subprocess.run(["umount", "-l", mountpoint], 
+                                   check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            
+            # Brief wait for OS to reflect unmount
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                if not safe_ismount(mountpoint):
+                    break
+                time.sleep(0.2)
+                
+        except Exception as e:
+            log.warning(f"Cleanup unmount attempt failed for {mountpoint}: {e}")
+
+    if os.path.lexists(mountpoint):
+        log.info(f"Cleaning up mountpoint directory: {mountpoint}")
+        try:
+            # First try rmdir - will only work if empty and not a mount
+            os.rmdir(mountpoint)
+        except OSError:
+            # If not empty or still mounted, try to clear placeholder items at least
+            try:
+                clear_ao_placeholder(mountpoint)
+            except Exception:
+                pass
+
+    # If we are now unmounted (or were never mounted), restore the placeholder
+    if not safe_ismount(mountpoint):
+        try:
+            os.makedirs(mountpoint, exist_ok=True)
+            for d in ('Earth nav data', 'terrain', 'textures'):
+                os.makedirs(os.path.join(mountpoint, d), exist_ok=True)
+            Path(placeholder_path).touch()
+            log.info(f"Restored placeholder content at {mountpoint}")
+        except Exception as e:
+            log.warning(f"Failed to restore placeholder at {mountpoint}: {e}")
     else:
-        for d in ('Earth nav data', 'terrain', 'textures'):
-            os.makedirs(os.path.join(mountpoint, d), exist_ok=True)
-        Path(placeholder_path).touch()
+        log.warning(f"Mountpoint {mountpoint} still active after cleanup attempt; skipping placeholder restoration")
 
 
 def _is_frozen() -> bool:

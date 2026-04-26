@@ -153,6 +153,18 @@ def main():
 
     signal.signal(signal.SIGUSR1, _handle_sigusr1)
 
+    # Start DatarefTracker so the prefetcher and ZL-throttle can see when
+    # X-Plane connects.  Must happen before FUSE blocks.
+    try:
+        try:
+            from autoortho.datareftrack import dt
+        except ImportError:
+            from datareftrack import dt
+        dt.start()
+        log.info("DatarefTracker started in FUSE worker")
+    except Exception as e:
+        log.warning(f"Could not start DatarefTracker in worker: {e}")
+
     try:
         # Initial heartbeat before mounting
         try:
@@ -178,6 +190,10 @@ def main():
             pass
         try:
             clear_process_memory_stat()
+        except Exception:
+            pass
+        try:
+            dt.stop()
         except Exception:
             pass
 

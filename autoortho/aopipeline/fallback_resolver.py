@@ -30,6 +30,7 @@ Usage:
 """
 
 import logging
+import math
 import os
 import time
 from typing import Optional, Dict, Any, TYPE_CHECKING
@@ -364,20 +365,37 @@ class FallbackResolver:
                 if chunk_offset_y + crop_size > higher_height:
                     continue
                 
-                # Crop and downscale
-                cropped = higher_img.crop((
-                    chunk_offset_x, chunk_offset_y,
-                    chunk_offset_x + crop_size, chunk_offset_y + crop_size
-                ))
-                
-                if crop_size != 256:
-                    cropped = cropped.resize((256, 256), resample=1)  # BILINEAR
-                
-                if cropped.mode != 'RGBA':
-                    cropped = cropped.convert('RGBA')
-                
-                log.debug(f"FallbackResolver: mipmap scale hit from mipmap {higher_mipmap}")
-                return cropped.tobytes()
+                # Crop and downscale using native AoImage methods
+                # 1. Create temporary image for the crop region
+                temp_crop = AoImage.new('RGBA', (crop_size, crop_size), (0, 0, 0, 255))
+                if not temp_crop:
+                    continue
+
+                try:
+                    # Perform native crop
+                    higher_img.crop(temp_crop, (chunk_offset_x, chunk_offset_y))
+                    
+                    # 2. Downscale if needed (using reduce_2 for power-of-two reduction)
+                    if scale_factor > 1:
+                        steps = int(math.log2(scale_factor))
+                        final_img = temp_crop.reduce_2(steps)
+                        if not final_img:
+                            continue
+                    else:
+                        # No scaling needed, just use the crop
+                        final_img = temp_crop
+                    
+                    try:
+                        # 3. Return raw bytes
+                        log.debug(f"FallbackResolver: mipmap scale hit from mipmap {higher_mipmap}")
+                        return final_img.tobytes()
+                    finally:
+                        # Ensure final_img is closed if it's different from temp_crop
+                        if final_img is not temp_crop:
+                            final_img.close()
+                finally:
+                    # Always close the temporary crop image
+                    temp_crop.close()
                 
             except Exception as e:
                 log.debug(f"FallbackResolver: mipmap scale failed: {e}")

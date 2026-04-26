@@ -50,6 +50,7 @@ try:
         is_only_ao_placeholder,
         clear_ao_placeholder,
         safe_ismount,
+        kill_stale_processes,
     )
 except ImportError:
     from utils.mount_utils import (
@@ -59,6 +60,7 @@ except ImportError:
         is_only_ao_placeholder,
         clear_ao_placeholder,
         safe_ismount,
+        kill_stale_processes,
     )
 
 try:
@@ -597,23 +599,8 @@ class AOMount:
                         pass
 
                     snap = self._shared_store.snapshot()
-                    # Hide internal per-process and batching keys from logs
-                    # Keep proc_mem_mb for debugging memory issues
                     try:
-                        def _is_internal(k):
-                            return (
-                                (isinstance(k, str) and (
-                                    k.startswith('proc_mem_rss_bytes') or
-                                    k.startswith('proc_alive_ts') or
-                                    k.startswith('proc_threads') or
-                                    k.startswith('last_tile_access_ts') or
-                                    k.startswith('mm_count:') or
-                                    k.startswith('mm_time_total_ms:') or
-                                    k.startswith('partial_mm_count:') or
-                                    k.startswith('partial_mm_time_total_ms:')
-                                )) or k in ('proc_count', 'cur_mem_mb_ts')
-                            )
-                        filtered = {k: v for k, v in snap.items() if not _is_internal(k)}
+                        filtered = aostats.filter_stats_snapshot(snap)
                     except Exception:
                         filtered = snap
 
@@ -801,6 +788,12 @@ class AOMount:
                             nothreads
                     )
             elif system_type == 'darwin':
+                # First, ensure no stale worker processes are managing this mountpoint
+                try:
+                    kill_stale_processes(mountpoint)
+                except Exception as e:
+                    log.debug(f"kill_stale_processes failed (ignored): {e}")
+
                 # If the directory only has our placeholder, clear it first so the preflight accepts it.
                 try:
                     if os.path.isdir(mountpoint) and is_only_ao_placeholder(mountpoint):

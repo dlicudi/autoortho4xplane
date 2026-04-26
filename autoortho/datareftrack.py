@@ -272,6 +272,7 @@ class DatarefTracker(object):
         self.connected = False
         self.data_valid = False
         self.has_ever_connected = False  # True once first connection established
+        self.last_start_time = 0.0
 
         # Flight data averager for smoothed predictions
         self.flight_averager = FlightDataAverager()
@@ -600,6 +601,7 @@ class DatarefTracker(object):
                     log.info("Flight is starting.")
                     self.connected = True
                     self.has_ever_connected = True  # Permanent flag for startup detection
+                    self.last_start_time = time.monotonic()
 
                 # Accept 5+ values for backward compatibility
                 # (6th=local_time_sec, 7th=pressure_alt, 8th=sun_pitch)
