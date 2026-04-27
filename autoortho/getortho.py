@@ -695,7 +695,7 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
                     jpeg_datas,
                     format=dxt_format,
                     missing_color=missing_color,
-                    max_threads=_compute_thread_budget()
+                    max_threads=_compute_background_thread_budget()
                 )
 
             if result.success and result.bytes_written >= 128:
@@ -825,6 +825,11 @@ def _live_read_start():
     global _live_reads_in_progress
     with _live_reads_lock:
         _live_reads_in_progress += 1
+        bump('live_reads_started')
+        set_stat('live_reads_in_progress', _live_reads_in_progress)
+        peak = get_stat('live_reads_peak') or 0
+        if _live_reads_in_progress > peak:
+            set_stat('live_reads_peak', _live_reads_in_progress)
 
 
 def _live_read_end():
@@ -832,6 +837,7 @@ def _live_read_end():
     global _live_reads_in_progress
     with _live_reads_lock:
         _live_reads_in_progress -= 1
+        set_stat('live_reads_in_progress', _live_reads_in_progress)
 
 
 def is_live_building() -> bool:
@@ -859,7 +865,33 @@ def _compute_thread_budget() -> int:
     return max(2, CURRENT_CPU_COUNT // active)
 
 
+def _compute_background_thread_budget() -> int:
+    """Thread budget for background prefetch builds.
+
+    Capped at half of live budget so background finalize holds the native
+    semaphore for less time, reducing live read timeouts.
+    """
+    try:
+        explicit = int(getattr(CFG.autoortho, 'native_pipeline_threads', 0))
+        if explicit > 0:
+            return max(1, explicit // 2)
+    except (ValueError, TypeError, AttributeError):
+        pass
+
+    return max(1, CURRENT_CPU_COUNT // 4)
+
+
 _native_build_semaphore = threading.Semaphore(1)
+
+# Limits concurrent background prefetch builds to 1 through the full
+# decode→finalize pipeline. Zero-copy mode holds decode pool buffers alive
+# until finalize completes, so multiple concurrent background builds saturate
+# the decode pool and starve live tile requests. Live builds bypass this gate.
+_background_decode_semaphore = threading.Semaphore(1)
+
+class _NativeBuildBusy(Exception):
+    """Raised by _native_build_context when semaphore can't be acquired within timeout."""
+
 
 class _native_build_context:
     """Serialize native DDS builds to prevent concurrent OpenMP crashes.
@@ -868,19 +900,49 @@ class _native_build_context:
     ``omp_set_num_threads`` or parallel regions simultaneously.  Using a
     semaphore (count=1) ensures only one ``finalize_to_file`` executes at
     a time while still tracking active builds for thread budget math.
+
+    Pass timeout= to avoid blocking indefinitely in the live FUSE read path.
+    If the semaphore cannot be acquired within timeout seconds, raises
+    _NativeBuildBusy so the caller can fall back to the progressive path.
     """
+    def __init__(self, timeout=None):
+        self._timeout = timeout
+        self._acquired = False
+
     def __enter__(self):
         global _active_native_builds
-        _native_build_semaphore.acquire()
+        caller = threading.current_thread().name
+        t0 = time.monotonic()
+        if self._timeout is not None:
+            self._acquired = _native_build_semaphore.acquire(timeout=self._timeout)
+            wait_ms = (time.monotonic() - t0) * 1000
+            if not self._acquired:
+                log.warning(f"_native_build_context: [{caller}] semaphore busy after {wait_ms:.0f}ms (timeout={self._timeout}s)")
+                raise _NativeBuildBusy("native build semaphore busy")
+            if wait_ms > 100:
+                log.warning(f"_native_build_context: [{caller}] waited {wait_ms:.0f}ms for semaphore")
+        else:
+            log.debug(f"_native_build_context: [{caller}] acquiring semaphore (no timeout)")
+            _native_build_semaphore.acquire()
+            wait_ms = (time.monotonic() - t0) * 1000
+            if wait_ms > 500:
+                log.warning(f"_native_build_context: [{caller}] waited {wait_ms:.0f}ms for semaphore (no timeout)")
+            self._acquired = True
+        self._caller = caller
+        self._acquire_time = time.monotonic()
         with _active_native_builds_lock:
             _active_native_builds += 1
         return self
 
     def __exit__(self, *exc):
         global _active_native_builds
+        held_ms = (time.monotonic() - self._acquire_time) * 1000
+        if held_ms > 1000:
+            log.warning(f"_native_build_context: [{self._caller}] held semaphore for {held_ms:.0f}ms")
         with _active_native_builds_lock:
             _active_native_builds -= 1
-        _native_build_semaphore.release()
+        if self._acquired:
+            _native_build_semaphore.release()
         return False
 
 
@@ -1620,6 +1682,48 @@ def _create_chunk_getter(num_workers: int):
 
 
 chunk_getter = _create_chunk_getter(int(CFG.autoortho.fetch_threads))
+
+
+class _TokenBucket:
+    """Thread-safe token bucket for outbound HTTP request rate limiting.
+
+    All 16 download workers share one bucket. Tokens refill at `rate`
+    per second up to `capacity`. Each HTTP request consumes one token;
+    if the bucket is empty the caller sleeps until one is available.
+    """
+    def __init__(self, rate: float, capacity: float):
+        self._rate = rate
+        self._capacity = capacity
+        self._tokens = capacity
+        self._lock = threading.Lock()
+        self._last_refill = time.monotonic()
+
+    def configure(self, rate: float, capacity: float):
+        with self._lock:
+            self._rate = rate
+            self._capacity = capacity
+
+    def acquire(self):
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = now - self._last_refill
+                self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
+                self._last_refill = now
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait = (1.0 - self._tokens) / self._rate
+            time.sleep(wait)
+
+
+_chunk_rate_limit = float(getattr(CFG.autoortho, 'chunk_requests_per_second', 0))
+if _chunk_rate_limit > 0:
+    _request_bucket = _TokenBucket(rate=_chunk_rate_limit, capacity=_chunk_rate_limit)
+    log.info(f"Chunk download rate limiter: {_chunk_rate_limit} req/s")
+else:
+    _request_bucket = None
+    log.info("Chunk download rate limiter: disabled")
 
 #class TileGetter(Getter):
 #    def get(self, obj, *args, **kwargs):
@@ -2394,6 +2498,7 @@ class SpatialPrefetcher:
 
         # Always use instantaneous position (that's where we actually are)
         if not datareftracker.data_valid or not datareftracker.connected:
+            bump('prefetch_skipped_no_data')
             return
 
         lat = datareftracker.lat
@@ -2406,10 +2511,12 @@ class SpatialPrefetcher:
 
         # Yield all resources to live tile reads when X-Plane is active
         if is_live_building():
+            bump('prefetch_skipped_live_gate')
             return
 
         # Check if SimBrief flight path prefetching should be used
         if self._should_use_simbrief_prefetch(lat, lon):
+            bump('prefetch_cycle_simbrief')
             chunks_submitted = self._prefetch_along_flight_plan(lat, lon)
             if chunks_submitted > 0:
                 self._prefetch_count += chunks_submitted
@@ -2418,6 +2525,7 @@ class SpatialPrefetcher:
             return
 
         # Fall back to velocity-based prefetching
+        bump('prefetch_cycle_velocity')
         self._do_velocity_prefetch_cycle(lat, lon)
     
     def _should_use_simbrief_prefetch(self, lat: float, lon: float) -> bool:
@@ -2847,6 +2955,7 @@ class SpatialPrefetcher:
 
         # Don't prefetch if moving slowly (taxiing, parked)
         if spd < self.MIN_SPEED_MPS:
+            bump('prefetch_skipped_slow')
             return
 
         # Calculate max distance based on lookahead time
@@ -2952,11 +3061,13 @@ class SpatialPrefetcher:
             
             # Skip if recently prefetched
             if tile_key in self._recently_prefetched:
+                bump('prefetch_skipped_recently_seen')
                 continue
-            
+
             # Skip if tile is already opened by X-Plane (on-demand logic handles it)
             if self._tile_cacher and self._tile_cacher.is_tile_opened_by_xplane(row, col, maptype, zoom):
                 log.debug(f"Skipping prefetch for {row},{col}@ZL{zoom} - already opened by X-Plane")
+                bump('prefetch_skipped_already_open')
                 continue
             
             submitted, complete = self._prefetch_tile(row, col, zoom, maptype)
@@ -3105,6 +3216,10 @@ class SpatialPrefetcher:
 
 
             complete = (total_submittable == 0) or (submitted == total_submittable)
+            if total_submittable > 0 and not complete:
+                bump('prefetch_tile_partial')
+            elif complete and submitted > 0:
+                bump('prefetch_tile_complete')
             return submitted, complete
             
         except Exception as e:
@@ -3242,6 +3357,8 @@ class TileCompletionTracker:
                 tracked.completed_chunk_ids = completed_ids
                 tracked.completed_chunks = len(completed_ids)
                 self._tracked_tiles[tile_id] = tracked
+                bump('tracker_tile_started')
+                set_stat('tracker_tiles_active', len(self._tracked_tiles))
                 log.debug(f"TileCompletionTracker: Started tracking {tile_id} "
                          f"(expecting {total_expected} native chunks, "
                          f"{len(completed_ids)} already ready)")
@@ -3250,6 +3367,7 @@ class TileCompletionTracker:
             self._maybe_cleanup_unlocked()
 
         if tile_to_callback is not None and self._on_tile_complete is not None:
+            bump('tracker_tile_already_complete')
             try:
                 self._on_tile_complete(tile_id, tile_to_callback,
                                        partial=False,
@@ -3303,18 +3421,18 @@ class TileCompletionTracker:
                 tile_to_callback = tracked.tile
                 del self._tracked_tiles[tile_id]
                 if tracked.build_triggered:
-                    # Already built at threshold — remaining chunks trigger healing
                     callback_healing = True
+                    bump('tracker_healing_triggered')
                     log.debug(f"TileCompletionTracker: {tile_id} COMPLETE - healing pass")
                 else:
+                    bump('tracker_tile_complete')
                     log.debug(f"TileCompletionTracker: {tile_id} COMPLETE - all chunks ready")
             elif ratio >= self._build_threshold and not tracked.build_triggered:
-                # Threshold reached — trigger early build
                 tracked.build_triggered = True
                 tile_to_callback = tracked.tile
                 callback_partial = True
+                bump('tracker_build_triggered')
                 log.debug(f"TileCompletionTracker: {tile_id} THRESHOLD ({ratio:.0%}) - early build")
-                # Keep tracking for healing when remaining chunks arrive
 
         # Call callback OUTSIDE the lock to avoid deadlocks
         if tile_to_callback is not None and self._on_tile_complete is not None:
@@ -3345,6 +3463,7 @@ class TileCompletionTracker:
         
         if oldest_id:
             del self._tracked_tiles[oldest_id]
+            bump('tracker_tile_evicted')
             log.debug(f"TileCompletionTracker: Evicted oldest tile {oldest_id}")
     
     def _maybe_cleanup_unlocked(self) -> None:
@@ -3361,6 +3480,7 @@ class TileCompletionTracker:
         
         for tid in stale:
             del self._tracked_tiles[tid]
+            bump('tracker_tile_stale')
             log.debug(f"TileCompletionTracker: Cleaned up stale tile {tid}")
     
     @property
@@ -3477,16 +3597,20 @@ class BackgroundDDSBuilder:
         if self._dds_cache is not None and self._dds_cache.contains(tile.id, tile.max_zoom, tile):
             if not getattr(tile, '_dds_needs_healing', False):
                 log.debug(f"BackgroundDDSBuilder: Skipping {tile.id} - already cached")
+                bump('builder_submit_skip_cached')
                 return False
             log.debug(f"BackgroundDDSBuilder: healing tile {tile.id} passed through")
+            bump('builder_submit_healing')
         
         try:
             self._queue.put_nowait((priority, tile))
-            self._work_event.set()  # Wake coordinator immediately
+            self._work_event.set()
+            bump('builder_submit_queued')
             log.debug(f"BackgroundDDSBuilder: Queued {tile.id} "
                      f"(queue size: {self._queue.qsize()})")
             return True
         except Full:
+            bump('builder_submit_queue_full')
             log.debug(f"BackgroundDDSBuilder: Queue full, skipping {tile.id}")
             return False
     
@@ -3511,6 +3635,7 @@ class BackgroundDDSBuilder:
 
             # Yield all resources to live tile reads when X-Plane is active
             if is_live_building():
+                bump('background_builder_skipped_live_gate')
                 continue
 
             # Fill all available worker slots
@@ -3633,16 +3758,25 @@ class BackgroundDDSBuilder:
         # Set available mipmap images for scaling fallback
         resolver.set_mipmap_images(tile.imgs)
         
+        # Gate: only 1 background build may hold decode pool buffers at a time.
+        # Zero-copy mode keeps decoded RGBA buffers alive through finalize, so
+        # multiple concurrent builds saturate the decode pool and starve live
+        # tile requests. Live builds bypass this gate entirely.
+        if not _background_decode_semaphore.acquire(timeout=120.0):
+            log.warning(f"BackgroundDDSBuilder: decode gate timeout for {tile_id}")
+            return False
+
         # Acquire streaming builder (blocking OK for background thread)
         config = {
             'chunks_per_side': tile.chunks_per_row,
             'format': dxt_format,
             'missing_color': missing_color
         }
-        
+
         builder = builder_pool.acquire(config=config, timeout=30.0)
         if not builder:
             log.warning(f"BackgroundDDSBuilder: Failed to acquire streaming builder for {tile_id}")
+            _background_decode_semaphore.release()
             return False
 
         # Setup transition tracking
@@ -3684,23 +3818,49 @@ class BackgroundDDSBuilder:
             
             # Phase 2: Process remaining chunks with transition handling
             # Key difference from live: NO initial time budget, but may get one on transition
+            # Overall cap: prefetch build must not hold the decode gate indefinitely.
+            _phase2_start = time.monotonic()
+            _phase2_max = 45.0  # Give up on pending chunks after 45s total
             for i in pending_indices:
                 chunk = chunks[i]
-                
+
+                # Abort if overall phase 2 budget is exhausted (e.g. downloads stalled)
+                if time.monotonic() - _phase2_start > _phase2_max:
+                    log.warning(
+                        f"BackgroundDDSBuilder: phase2 timeout after {_phase2_max:.0f}s "
+                        f"for {tile_id}, marking remaining {len(pending_indices) - pending_indices.index(i)} chunks missing"
+                    )
+                    builder.mark_missing(i)
+                    prefetch_mm0_missing.append(i)
+                    continue
+
                 # === TRANSITION CHECK ===
                 # If tile became live, use its time budget for remaining work
                 time_budget = tile._tile_time_budget if tile._is_live else None
-                
+
                 if tile._is_live and time_budget and time_budget.exhausted:
                     builder.mark_missing(i)
                     prefetch_mm0_missing.append(i)
                     continue
-                
+
                 # Wait for chunk - but check for live transition periodically
+                _chunk_wait_start = time.monotonic()
                 while not chunk.ready.is_set():
                     # Short wait to allow transition detection
                     chunk.ready.wait(timeout=0.1)
-                    
+
+                    _chunk_wait_elapsed = time.monotonic() - _chunk_wait_start
+                    if _chunk_wait_elapsed > 30 and int(_chunk_wait_elapsed) % 10 == 0:
+                        log.warning(
+                            f"BackgroundDDSBuilder: chunk {i}/{len(chunks)} for {tile_id} "
+                            f"still not ready after {_chunk_wait_elapsed:.0f}s "
+                            f"(is_live={tile._is_live})"
+                        )
+
+                    # Abort chunk wait if overall phase 2 budget exhausted
+                    if time.monotonic() - _phase2_start > _phase2_max:
+                        break
+
                     # Check for live transition
                     if tile._is_live:
                         time_budget = tile._tile_time_budget
@@ -3757,7 +3917,7 @@ class BackgroundDDSBuilder:
                     return False
                 with _native_build_context():
                     success, bytes_written = builder.finalize_to_file(
-                        staging_path, max_threads=_compute_thread_budget()
+                        staging_path, max_threads=_compute_background_thread_budget()
                     )
                 
                 if success and bytes_written >= 128:
@@ -3790,6 +3950,8 @@ class BackgroundDDSBuilder:
             tile._active_streaming_builder = None
             tile._live_transition_event = None
             builder.release()
+            # Release decode gate so the next background build can proceed
+            _background_decode_semaphore.release()
 
     def _build_tile_dds(self, tile) -> None:
         """
@@ -3905,7 +4067,7 @@ class BackgroundDDSBuilder:
                                             staging_path,
                                             format=dxt_format,
                                             missing_color=missing_color,
-                                            max_threads=_compute_thread_budget()
+                                            max_threads=_compute_background_thread_budget()
                                         )
 
                                     if result.success and result.bytes_written >= 128:
@@ -4624,7 +4786,7 @@ def start_predictive_dds(tile_cacher=None) -> None:
 
     background_builder_workers = int(getattr(CFG.autoortho, 'background_builder_workers', 0))
     if background_builder_workers <= 0:
-        background_builder_workers = max(2, min(12, CURRENT_CPU_COUNT))
+        background_builder_workers = max(2, min(4, CURRENT_CPU_COUNT // 2))
         log.info(f"Predictive DDS: Using dynamic concurrency ({background_builder_workers} workers)")
     else:
         background_builder_workers = max(1, min(16, background_builder_workers))
@@ -5120,6 +5282,11 @@ class Chunk(object):
         time.sleep(backoff_sleep)
         self.attempt += 1
 
+        # Rate limiting: shared token bucket across all download workers.
+        # Prevents flooding the map provider, which causes invalid JPEG responses.
+        if _request_bucket is not None:
+            _request_bucket.acquire()
+
         # Read timeout = maxwait + 1s safety margin. No point keeping a
         # download alive longer than the caller is willing to wait.
         try:
@@ -5214,10 +5381,19 @@ class Chunk(object):
                 log.debug(f"Data for {self} is JPEG")
                 self.data = data
             else:
+                bump('chunk_invalid_jpeg')
+                self.retry_count += 1
+                _max_jpeg_retries = 2
+                if self.retry_count <= _max_jpeg_retries:
+                    log.debug(f"Invalid JPEG for {self} (HTTP {resp.status_code} "
+                              f"content-type={resp.headers.get('content-type', '?')} "
+                              f"size={len(data) if data else 0}): retrying "
+                              f"({self.retry_count}/{_max_jpeg_retries})")
+                    time.sleep(1.0 * self.retry_count)  # 1s, 2s
+                    return False  # Return to worker queue for retry
                 log.debug(f"Invalid JPEG for {self} (HTTP {resp.status_code} "
                           f"content-type={resp.headers.get('content-type', '?')} "
-                          f"size={len(data) if data else 0}): marked permanently unavailable")
-                bump('chunk_invalid_jpeg')
+                          f"size={len(data) if data else 0}): giving up after {_max_jpeg_retries} retries")
                 self.data = b''
                 self.permanent_failure = True
                 self.failure_reason = 'no_source_data'
@@ -5988,14 +6164,21 @@ class Tile(object):
             # ═══════════════════════════════════════════════════════════════
             # STEP 4: Build DDS with native aopipeline
             # ═══════════════════════════════════════════════════════════════
-            with _native_build_context():
-                result = native_dds.build_from_jpegs_to_buffer(
-                    buffer,
-                    jpeg_datas,
-                    format=dxt_format,
-                    missing_color=missing_color,
-                    max_threads=_compute_thread_budget()
-                )
+            # Use a 5s timeout so a background prefetch build holding the
+            # semaphore doesn't deadlock the FUSE read thread indefinitely.
+            try:
+                with _native_build_context(timeout=5.0):
+                    result = native_dds.build_from_jpegs_to_buffer(
+                        buffer,
+                        jpeg_datas,
+                        format=dxt_format,
+                        missing_color=missing_color,
+                        max_threads=_compute_thread_budget()
+                    )
+            except _NativeBuildBusy:
+                log.debug(f"_try_aopipeline_build: semaphore busy for {self.id}, falling back")
+                bump('live_aopipeline_semaphore_busy')
+                return False
 
             if not result.success:
                 log.debug(f"_try_aopipeline_build: Native build failed for {self.id}: {result.error}")
@@ -6334,8 +6517,13 @@ class Tile(object):
                 return False
             
             try:
-                with _native_build_context():
-                    result = builder.finalize(buffer, max_threads=_compute_thread_budget())
+                try:
+                    with _native_build_context(timeout=5.0):
+                        result = builder.finalize(buffer, max_threads=_compute_thread_budget())
+                except _NativeBuildBusy:
+                    log.debug(f"_try_streaming_aopipeline_build: semaphore busy for {self.id}, falling back")
+                    bump('live_aopipeline_semaphore_busy')
+                    return False
                 if result.success and result.bytes_written >= 128:
                     dds_bytes = bytes(buffer[:result.bytes_written])
                     if self._populate_dds_from_prebuilt(dds_bytes):
@@ -8729,12 +8917,17 @@ class Tile(object):
                 # significant CPU).  Mipmaps 1-4 have <=64 chunks and don't
                 # need it.
                 if mipmap == 0:
-                    with _native_build_context():
-                        result = native_dds.build_all_mipmaps_native(
-                            jpeg_datas_per_zoom,
-                            format=dxt_format,
-                            missing_color=missing_color
-                        )
+                    try:
+                        with _native_build_context(timeout=5.0):
+                            result = native_dds.build_all_mipmaps_native(
+                                jpeg_datas_per_zoom,
+                                format=dxt_format,
+                                missing_color=missing_color
+                            )
+                    except _NativeBuildBusy:
+                        log.debug(f"_try_native_mipmap_build: semaphore busy for {self.id}, falling back")
+                        bump('live_aopipeline_semaphore_busy')
+                        return False
                 else:
                     result = native_dds.build_all_mipmaps_native(
                         jpeg_datas_per_zoom,
@@ -8743,13 +8936,18 @@ class Tile(object):
                     )
             elif hasattr(native_dds, 'build_mipmap_chain'):
                 if mipmap == 0:
-                    with _native_build_context():
-                        result = native_dds.build_mipmap_chain(
-                            jpeg_datas,
-                            format=dxt_format,
-                            missing_color=missing_color,
-                            max_mipmaps=max_mipmaps
-                        )
+                    try:
+                        with _native_build_context(timeout=5.0):
+                            result = native_dds.build_mipmap_chain(
+                                jpeg_datas,
+                                format=dxt_format,
+                                missing_color=missing_color,
+                                max_mipmaps=max_mipmaps
+                            )
+                    except _NativeBuildBusy:
+                        log.debug(f"_try_native_mipmap_build: semaphore busy for {self.id}, falling back")
+                        bump('live_aopipeline_semaphore_busy')
+                        return False
                 else:
                     result = native_dds.build_mipmap_chain(
                         jpeg_datas,
@@ -8759,12 +8957,17 @@ class Tile(object):
                     )
             else:
                 if mipmap == 0:
-                    with _native_build_context():
-                        result = native_dds.build_single_mipmap(
-                            jpeg_datas,
-                            format=dxt_format,
-                            missing_color=missing_color
-                        )
+                    try:
+                        with _native_build_context(timeout=5.0):
+                            result = native_dds.build_single_mipmap(
+                                jpeg_datas,
+                                format=dxt_format,
+                                missing_color=missing_color
+                            )
+                    except _NativeBuildBusy:
+                        log.debug(f"_try_native_mipmap_build: semaphore busy for {self.id}, falling back")
+                        bump('live_aopipeline_semaphore_busy')
+                        return False
                 else:
                     result = native_dds.build_single_mipmap(
                         jpeg_datas,

@@ -320,6 +320,8 @@ tile_queue_enabled = True
 # Recommended: 100 (default)
 tile_queue_max_size = 100
 fetch_threads = 32
+# Maximum outbound tile requests per second across all download workers (0 = disabled)
+chunk_requests_per_second = 0
 # Simheaven compatibility mode.
 simheaven_compat = False
 # Using custom generated Ortho4XP tiles along with AutoOrtho.
