@@ -689,7 +689,7 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
             return None
         
         try:
-            with _native_build_context():
+            with _native_build_context(timeout=30.0):
                 result = native.build_from_jpegs_to_buffer(
                     buffer,
                     jpeg_datas,
@@ -914,7 +914,12 @@ class _native_build_context:
     def __enter__(self):
         global _active_native_builds, _native_semaphore_waiters
         caller = threading.current_thread().name
-        is_background = 'background' in caller.lower() or 'prefetch' in caller.lower() or 'builder' in caller.lower()
+        is_background = (
+            'background' in caller.lower() or
+            'prefetch' in caller.lower() or
+            'builder' in caller.lower() or
+            'threadpoolexecutor' in caller.lower()
+        )
         self._is_background = is_background
         t0 = time.monotonic()
         with _native_semaphore_waiters_lock:
@@ -3932,7 +3937,7 @@ class BackgroundDDSBuilder:
                 staging_path = self._dds_cache.get_staging_path(tile_id, tile.max_zoom, tile)
                 if not staging_path:
                     return False
-                with _native_build_context():
+                with _native_build_context(timeout=30.0):
                     success, bytes_written = builder.finalize_to_file(
                         staging_path, max_threads=_compute_background_thread_budget()
                     )
@@ -4078,7 +4083,7 @@ class BackgroundDDSBuilder:
                                     if not staging_path:
                                         return
 
-                                    with _native_build_context():
+                                    with _native_build_context(timeout=30.0):
                                         result = native_dds.build_from_jpegs_to_file(
                                             jpeg_datas,
                                             staging_path,

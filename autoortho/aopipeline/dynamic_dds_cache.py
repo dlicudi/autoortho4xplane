@@ -996,6 +996,30 @@ class DynamicDDSCache:
         if source_size < 128:
             return False
 
+        # Reject truncated DDS files. For BC1/DXT1, mm0 alone is (w*h)/2 bytes.
+        # A valid file must contain at least a full mm0 plus the 128-byte header.
+        try:
+            chunks_per_row = getattr(tile, 'chunks_per_row', 0)
+            dxt_format = str(getattr(tile, 'dxt_format', 'BC1')).upper() if hasattr(tile, 'dxt_format') else 'BC1'
+            if chunks_per_row > 0:
+                tex_side = chunks_per_row * 256
+                bytes_per_pixel = 1 if 'BC3' in dxt_format else 0.5
+                min_mm0 = int(tex_side * tex_side * bytes_per_pixel)
+                min_valid = 128 + min_mm0
+                if source_size < min_valid:
+                    import logging as _logging
+                    _logging.getLogger(__name__).warning(
+                        f"DDS cache: rejecting truncated file {source_path} "
+                        f"({source_size} bytes, expected >= {min_valid} for {chunks_per_row}x tile)"
+                    )
+                    try:
+                        os.unlink(source_path)
+                    except OSError:
+                        pass
+                    return False
+        except Exception:
+            pass
+
         try:
             dds_path, ddm_path = self._paths_for(
                 tile.row, tile.col, tile.maptype,
