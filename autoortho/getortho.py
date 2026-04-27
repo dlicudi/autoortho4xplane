@@ -629,6 +629,9 @@ def _get_tile_queue_max_size() -> int:
         return 100
 
 
+_BUILD_TIMEOUT_SENTINEL = object()
+
+
 def _build_dds_hybrid(chunks: list, dxt_format: str,
                       missing_color: tuple) -> bytes:
     """
@@ -690,16 +693,17 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
         
         try:
             with _native_build_context(timeout=30.0):
-                result = native.build_from_jpegs_to_buffer(
-                    buffer,
-                    jpeg_datas,
-                    format=dxt_format,
-                    missing_color=missing_color,
-                    max_threads=_compute_background_thread_budget()
+                _build_result = _run_with_build_timeout(
+                    native.build_from_jpegs_to_buffer,
+                    buffer, jpeg_datas,
+                    format=dxt_format, missing_color=missing_color,
+                    max_threads=1, timeout=25.0
                 )
 
-            if result.success and result.bytes_written >= 128:
-                dds_bytes = result.to_bytes()
+            if _build_result is _BUILD_TIMEOUT_SENTINEL:
+                return None
+            if _build_result.success and _build_result.bytes_written >= 128:
+                dds_bytes = _build_result.to_bytes()
                 log.debug(f"Hybrid DDS build: {valid_count}/{len(chunks)} chunks, "
                           f"{len(dds_bytes)} bytes")
                 return dds_bytes
@@ -865,21 +869,6 @@ def _compute_thread_budget() -> int:
     return max(2, CURRENT_CPU_COUNT // active)
 
 
-def _compute_background_thread_budget() -> int:
-    """Thread budget for background prefetch builds.
-
-    Capped at half of live budget so background finalize holds the native
-    semaphore for less time, reducing live read timeouts.
-    """
-    try:
-        explicit = int(getattr(CFG.autoortho, 'native_pipeline_threads', 0))
-        if explicit > 0:
-            return max(1, explicit // 2)
-    except (ValueError, TypeError, AttributeError):
-        pass
-
-    return max(1, CURRENT_CPU_COUNT // 4)
-
 
 _native_build_semaphore = threading.Semaphore(1)
 _native_semaphore_waiters = 0  # threads currently waiting to acquire
@@ -966,6 +955,55 @@ class _native_build_context:
         if self._acquired:
             _native_build_semaphore.release()
         return False
+
+
+def _run_with_build_timeout(native_func, *args, timeout=25.0, _keep_alive=None, **kwargs):
+    """Run a native C build function with a per-build timeout.
+
+    Must be called inside a ``_native_build_context`` block. If the C code
+    does not return within ``timeout`` seconds, the stuck thread is left to
+    finish on its own (daemon thread) and ``_BUILD_TIMEOUT_SENTINEL`` is
+    returned so the caller can exit the context manager and release the
+    semaphore.
+
+    ``_keep_alive`` accepts a list of Python objects that must not be
+    garbage-collected while the C thread is running.  Pass a *copy* of any
+    zero-copy JPEG buffer lists here so that the C pointer stays valid even
+    after the caller's finally-block clears its own reference.
+    """
+    result = [_BUILD_TIMEOUT_SENTINEL]
+    exc = [None]
+    # Keep a copy in the closure so the thread holds references until it exits,
+    # even if the caller's finally block clears its own reference first.
+    _refs = list(_keep_alive) if _keep_alive is not None else None
+
+    def _worker():
+        try:
+            result[0] = native_func(*args, **kwargs)
+        except Exception as e:
+            exc[0] = e
+        finally:
+            # Explicit release after C code returns so the reference lifetime
+            # is clear: these objects survive until the thread is done.
+            nonlocal _refs
+            _refs = None
+
+    t = threading.Thread(target=_worker, daemon=True, name="ao-native-bg-build")
+    t.start()
+    t.join(timeout=timeout)
+
+    if t.is_alive():
+        caller = threading.current_thread().name
+        log.warning(
+            f"[{caller}] native C build hung after {timeout:.0f}s — "
+            f"releasing semaphore (background thread continues)"
+        )
+        bump('native_build_c_timeout')
+        return _BUILD_TIMEOUT_SENTINEL
+
+    if exc[0] is not None:
+        raise exc[0]
+    return result[0]
 
 
 def _get_progressive_executor(max_workers=None):
@@ -3933,15 +3971,22 @@ class BackgroundDDSBuilder:
                         prefetch_mm0_missing.append(i)
             
             # Finalize directly to disk via DynamicDDSCache staging path
+            _builder_timed_out = False
             if self._dds_cache is not None:
                 staging_path = self._dds_cache.get_staging_path(tile_id, tile.max_zoom, tile)
                 if not staging_path:
                     return False
                 with _native_build_context(timeout=30.0):
-                    success, bytes_written = builder.finalize_to_file(
-                        staging_path, max_threads=_compute_background_thread_budget()
+                    _result = _run_with_build_timeout(
+                        builder.finalize_to_file,
+                        staging_path, max_threads=1, timeout=25.0,
+                        _keep_alive=jpeg_refs_for_nocopy
                     )
-                
+
+                if _result is _BUILD_TIMEOUT_SENTINEL:
+                    _builder_timed_out = True
+                    return False
+                success, bytes_written = _result
                 if success and bytes_written >= 128:
                     self._dds_cache.store_from_file(
                         tile_id, tile.max_zoom, staging_path, tile,
@@ -3971,7 +4016,12 @@ class BackgroundDDSBuilder:
             # Clear transition tracking
             tile._active_streaming_builder = None
             tile._live_transition_event = None
-            builder.release()
+            # If the C thread timed out it is still running inside this builder —
+            # releasing the builder now would race with the C thread and SIGSEGV.
+            # Leak the builder slot; _run_with_build_timeout's _keep_alive closure
+            # will clean up JPEG refs once the daemon thread eventually exits.
+            if not _builder_timed_out:
+                builder.release()
             # Release decode gate so the next background build can proceed
             _background_decode_semaphore.release()
 
@@ -4084,28 +4134,28 @@ class BackgroundDDSBuilder:
                                         return
 
                                     with _native_build_context(timeout=30.0):
-                                        result = native_dds.build_from_jpegs_to_file(
-                                            jpeg_datas,
-                                            staging_path,
-                                            format=dxt_format,
-                                            missing_color=missing_color,
-                                            max_threads=_compute_background_thread_budget()
+                                        _dtd_result = _run_with_build_timeout(
+                                            native_dds.build_from_jpegs_to_file,
+                                            jpeg_datas, staging_path,
+                                            format=dxt_format, missing_color=missing_color,
+                                            max_threads=1, timeout=25.0
                                         )
 
-                                    if result.success and result.bytes_written >= 128:
+                                    if _dtd_result is _BUILD_TIMEOUT_SENTINEL:
+                                        return
+                                    if _dtd_result.success and _dtd_result.bytes_written >= 128:
                                         self._dds_cache.store_from_file(
                                             tile_id, tile.max_zoom, staging_path, tile,
                                             mm0_missing_indices=hybrid_mm0_missing or None)
                                         build_time = (time.monotonic() - build_start) * 1000
                                         self._builds_completed += 1
                                         log.debug(f"BackgroundDDSBuilder: Direct-to-disk built {tile_id} "
-                                                  f"in {build_time:.0f}ms ({result.bytes_written} bytes)")
+                                                  f"in {build_time:.0f}ms ({_dtd_result.bytes_written} bytes)")
                                         bump('prebuilt_dds_builds_direct')
-                                        
                                         return
                                     else:
                                         log.debug(f"BackgroundDDSBuilder: Direct-to-disk failed for "
-                                                  f"{tile_id}: {result.error}, trying buffer path")
+                                                  f"{tile_id}: {_dtd_result.error}, trying buffer path")
                             except Exception as e:
                                 log.debug(f"BackgroundDDSBuilder: Direct-to-disk failed for {tile_id}: "
                                           f"{e}, trying buffer path")
