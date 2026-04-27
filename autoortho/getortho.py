@@ -882,6 +882,8 @@ def _compute_background_thread_budget() -> int:
 
 
 _native_build_semaphore = threading.Semaphore(1)
+_native_semaphore_waiters = 0  # threads currently waiting to acquire
+_native_semaphore_waiters_lock = threading.Lock()
 
 # Limits concurrent background prefetch builds to 1 through the full
 # decode→finalize pipeline. Zero-copy mode holds decode pool buffers alive
@@ -910,24 +912,38 @@ class _native_build_context:
         self._acquired = False
 
     def __enter__(self):
-        global _active_native_builds
+        global _active_native_builds, _native_semaphore_waiters
         caller = threading.current_thread().name
+        is_background = 'background' in caller.lower() or 'prefetch' in caller.lower() or 'builder' in caller.lower()
+        self._is_background = is_background
         t0 = time.monotonic()
-        if self._timeout is not None:
-            self._acquired = _native_build_semaphore.acquire(timeout=self._timeout)
-            wait_ms = (time.monotonic() - t0) * 1000
-            if not self._acquired:
-                log.warning(f"_native_build_context: [{caller}] semaphore busy after {wait_ms:.0f}ms (timeout={self._timeout}s)")
-                raise _NativeBuildBusy("native build semaphore busy")
-            if wait_ms > 100:
-                log.warning(f"_native_build_context: [{caller}] waited {wait_ms:.0f}ms for semaphore")
-        else:
-            log.debug(f"_native_build_context: [{caller}] acquiring semaphore (no timeout)")
-            _native_build_semaphore.acquire()
-            wait_ms = (time.monotonic() - t0) * 1000
-            if wait_ms > 500:
-                log.warning(f"_native_build_context: [{caller}] waited {wait_ms:.0f}ms for semaphore (no timeout)")
-            self._acquired = True
+        with _native_semaphore_waiters_lock:
+            _native_semaphore_waiters += 1
+            current_waiters = _native_semaphore_waiters
+        set_stat('native_semaphore_waiters', current_waiters)
+        try:
+            if self._timeout is not None:
+                self._acquired = _native_build_semaphore.acquire(timeout=self._timeout)
+                wait_ms = (time.monotonic() - t0) * 1000
+                if not self._acquired:
+                    bump('native_semaphore_timeout_live' if not is_background else 'native_semaphore_timeout_bg')
+                    log.warning(f"_native_build_context: [{caller}] semaphore busy after {wait_ms:.0f}ms (timeout={self._timeout}s, waiters={current_waiters})")
+                    raise _NativeBuildBusy("native build semaphore busy")
+                bump('native_semaphore_wait_ms_live' if not is_background else 'native_semaphore_wait_ms_bg', int(wait_ms))
+                if wait_ms > 100:
+                    log.warning(f"_native_build_context: [{caller}] waited {wait_ms:.0f}ms for semaphore (waiters={current_waiters})")
+            else:
+                log.debug(f"_native_build_context: [{caller}] acquiring semaphore (no timeout, waiters={current_waiters})")
+                _native_build_semaphore.acquire()
+                wait_ms = (time.monotonic() - t0) * 1000
+                bump('native_semaphore_wait_ms_live' if not is_background else 'native_semaphore_wait_ms_bg', int(wait_ms))
+                if wait_ms > 500:
+                    log.warning(f"_native_build_context: [{caller}] waited {wait_ms:.0f}ms for semaphore (no timeout, waiters={current_waiters})")
+                self._acquired = True
+        finally:
+            with _native_semaphore_waiters_lock:
+                _native_semaphore_waiters -= 1
+                set_stat('native_semaphore_waiters', _native_semaphore_waiters)
         self._caller = caller
         self._acquire_time = time.monotonic()
         with _active_native_builds_lock:
@@ -937,8 +953,9 @@ class _native_build_context:
     def __exit__(self, *exc):
         global _active_native_builds
         held_ms = (time.monotonic() - self._acquire_time) * 1000
-        if held_ms > 1000:
-            log.warning(f"_native_build_context: [{self._caller}] held semaphore for {held_ms:.0f}ms")
+        bump('native_semaphore_hold_ms_live' if not self._is_background else 'native_semaphore_hold_ms_bg', int(held_ms))
+        if held_ms > 500:
+            log.warning(f"_native_build_context: [{self._caller}] held semaphore for {held_ms:.0f}ms ({'bg' if self._is_background else 'live'})")
         with _active_native_builds_lock:
             _active_native_builds -= 1
         if self._acquired:
