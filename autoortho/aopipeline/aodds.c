@@ -556,26 +556,10 @@ static int32_t preallocate_file_dds(FILE* f, size_t size) {
         }
     }
 #elif defined(AOPIPELINE_MACOS)
-    /* macOS: Use F_PREALLOCATE for physical block allocation */
-    int fd = fileno(f);
-    if (fd >= 0) {
-        fstore_t store = {0};
-        store.fst_flags = F_ALLOCATECONTIG;  /* Try contiguous first */
-        store.fst_posmode = F_PEOFPOSMODE;
-        store.fst_offset = 0;
-        store.fst_length = (off_t)size;
-        store.fst_bytesalloc = 0;
-        
-        if (fcntl(fd, F_PREALLOCATE, &store) == -1) {
-            /* Fall back to non-contiguous allocation */
-            store.fst_flags = F_ALLOCATEALL;
-            fcntl(fd, F_PREALLOCATE, &store);
-        }
-        /* Set the file size to match */
-        if (ftruncate(fd, (off_t)size) == 0) {
-            return 1;
-        }
-    }
+    /* macOS: F_PREALLOCATE + ftruncate can block for 30-60s under X-Plane I/O
+     * load (contiguous allocation stalls on busy SSD). SSDs don't benefit from
+     * contiguous allocation, so skip preallocation entirely. */
+    (void)f; (void)size;
 #elif defined(AOPIPELINE_WINDOWS)
     int fd = _fileno(f);
     if (fd >= 0) {
