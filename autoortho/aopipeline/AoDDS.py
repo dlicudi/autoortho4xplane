@@ -1239,17 +1239,18 @@ def get_default_builder_pool() -> StreamingBuilderPool:
         with _default_builder_pool_lock:
             if _default_builder_pool is None:
                 pool_size = _calculate_builder_pool_size()
-                
-                # Get or create the global decode pool for memory-limited JPEG decoding
-                decode_pool = get_default_decode_pool()
-                decode_pool_handle = decode_pool.handle if decode_pool else None
-                
+
+                # Use NULL decode pool (pure malloc) for background streaming builders.
+                # The shared decode pool uses AOCOND_WAIT when exhausted, which deadlocks
+                # when a timed-out build holds its 256 chunk buffers indefinitely:
+                # stuck builder holds pool slots → new builds wait forever → circular.
+                # Pure malloc avoids AOCOND_WAIT entirely; malloc can fail but never deadlocks.
                 _default_builder_pool = StreamingBuilderPool(
                     pool_size=pool_size,
-                    decode_pool=decode_pool_handle
+                    decode_pool=None
                 )
                 log.info(f"Streaming builder pool initialized: {pool_size} builders, "
-                        f"decode_pool={'enabled' if decode_pool_handle else 'disabled'}")
+                        f"decode_pool=disabled (malloc fallback, deadlock-safe)")
     return _default_builder_pool
 
 
