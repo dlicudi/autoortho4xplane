@@ -957,7 +957,8 @@ class _native_build_context:
         return False
 
 
-def _run_with_build_timeout(native_func, *args, timeout=25.0, _keep_alive=None, **kwargs):
+def _run_with_build_timeout(native_func, *args, timeout=25.0, _keep_alive=None,
+                            _on_timeout_cleanup=None, **kwargs):
     """Run a native C build function with a per-build timeout.
 
     Must be called inside a ``_native_build_context`` block. If the C code
@@ -970,6 +971,11 @@ def _run_with_build_timeout(native_func, *args, timeout=25.0, _keep_alive=None, 
     garbage-collected while the C thread is running.  Pass a *copy* of any
     zero-copy JPEG buffer lists here so that the C pointer stays valid even
     after the caller's finally-block clears its own reference.
+
+    ``_on_timeout_cleanup`` is an optional callable invoked once the stuck
+    daemon thread eventually exits (which it always will — C code finishes
+    eventually).  Use this to reclaim resources that cannot be freed while
+    the C thread is still running (e.g. returning a builder to its pool).
     """
     result = [_BUILD_TIMEOUT_SENTINEL]
     exc = [None]
@@ -999,6 +1005,16 @@ def _run_with_build_timeout(native_func, *args, timeout=25.0, _keep_alive=None, 
             f"releasing semaphore (background thread continues)"
         )
         bump('native_build_c_timeout')
+        if _on_timeout_cleanup is not None:
+            def _reclaimer():
+                t.join()  # wait however long the C code takes to finish
+                try:
+                    _on_timeout_cleanup()
+                except Exception as e:
+                    log.debug(f"ao-builder-reclaim: cleanup error: {e}")
+            threading.Thread(
+                target=_reclaimer, daemon=True, name="ao-builder-reclaim"
+            ).start()
         return _BUILD_TIMEOUT_SENTINEL
 
     if exc[0] is not None:
@@ -3980,7 +3996,8 @@ class BackgroundDDSBuilder:
                     _result = _run_with_build_timeout(
                         builder.finalize_to_file,
                         staging_path, max_threads=1, timeout=25.0,
-                        _keep_alive=jpeg_refs_for_nocopy
+                        _keep_alive=jpeg_refs_for_nocopy,
+                        _on_timeout_cleanup=builder.release
                     )
 
                 if _result is _BUILD_TIMEOUT_SENTINEL:
@@ -4016,10 +4033,9 @@ class BackgroundDDSBuilder:
             # Clear transition tracking
             tile._active_streaming_builder = None
             tile._live_transition_event = None
-            # If the C thread timed out it is still running inside this builder —
-            # releasing the builder now would race with the C thread and SIGSEGV.
-            # Leak the builder slot; _run_with_build_timeout's _keep_alive closure
-            # will clean up JPEG refs once the daemon thread eventually exits.
+            # If the C thread timed out it is still running — releasing the builder
+            # now would race with it (SIGSEGV). The _on_timeout_cleanup reclaimer
+            # will call builder.release() once the daemon thread eventually exits.
             if not _builder_timed_out:
                 builder.release()
             # Release decode gate so the next background build can proceed
@@ -7098,6 +7114,12 @@ class Tile(object):
                     if self.dds and self.dds.mipmap_list and self.dds.mipmap_list[0].retrieved:
                         log.debug(f"GET_BYTES: Dynamic DDS cache HIT (complete) for {self.id}")
                         bump('dynamic_dds_cache_hit')
+                        # If the cached tile was built with missing chunks (blank tiles),
+                        # re-queue it for background rebuild so it eventually gets fixed.
+                        # Serves immediately from cache; background fixes it asynchronously.
+                        if getattr(self, '_dds_needs_healing', False) and background_dds_builder is not None:
+                            background_dds_builder.submit(self)
+                            bump('dynamic_dds_cache_hit_healing_queued')
                         return True
                     else:
                         log.debug(f"GET_BYTES: Dynamic DDS cache HIT (partial, mm0 missing) for {self.id} "
