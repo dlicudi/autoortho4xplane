@@ -875,10 +875,13 @@ _native_semaphore_waiters = 0  # threads currently waiting to acquire
 _native_semaphore_waiters_lock = threading.Lock()
 
 # Limits concurrent background prefetch builds to 1 through the full
-# decode→finalize pipeline. Zero-copy mode holds decode pool buffers alive
-# until finalize completes, so multiple concurrent background builds saturate
-# the decode pool and starve live tile requests. Live builds bypass this gate.
-_background_decode_semaphore = threading.Semaphore(1)
+# NOTE: _background_decode_semaphore was removed. It was introduced to prevent
+# AOCOND_WAIT deadlock when the shared decode pool was exhausted. The deadlock
+# was fixed by using decode_pool=None (pure malloc) for streaming builders, so
+# the semaphore is no longer needed. It was also causing background streaming
+# builds to stall: the semaphore could be held for 130s+ (30s builder +
+# 45s phase2 + 30s native semaphore + 25s finalize), exceeding the 120s
+# worker timeout and silently killing all background DDS builds.
 
 class _NativeBuildBusy(Exception):
     """Raised by _native_build_context when semaphore can't be acquired within timeout."""
@@ -3834,14 +3837,6 @@ class BackgroundDDSBuilder:
         # Set available mipmap images for scaling fallback
         resolver.set_mipmap_images(tile.imgs)
         
-        # Gate: only 1 background build may hold decode pool buffers at a time.
-        # Zero-copy mode keeps decoded RGBA buffers alive through finalize, so
-        # multiple concurrent builds saturate the decode pool and starve live
-        # tile requests. Live builds bypass this gate entirely.
-        if not _background_decode_semaphore.acquire(timeout=120.0):
-            log.warning(f"BackgroundDDSBuilder: decode gate timeout for {tile_id}")
-            return False
-
         # Acquire streaming builder (blocking OK for background thread)
         config = {
             'chunks_per_side': tile.chunks_per_row,
@@ -3852,7 +3847,6 @@ class BackgroundDDSBuilder:
         builder = builder_pool.acquire(config=config, timeout=30.0)
         if not builder:
             log.warning(f"BackgroundDDSBuilder: Failed to acquire streaming builder for {tile_id}")
-            _background_decode_semaphore.release()
             return False
 
         # Setup transition tracking
@@ -4038,8 +4032,6 @@ class BackgroundDDSBuilder:
             # will call builder.release() once the daemon thread eventually exits.
             if not _builder_timed_out:
                 builder.release()
-            # Release decode gate so the next background build can proceed
-            _background_decode_semaphore.release()
 
     def _build_tile_dds(self, tile) -> None:
         """
