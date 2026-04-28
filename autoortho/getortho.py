@@ -1425,6 +1425,7 @@ class Getter(object):
                 obj.in_queue = False
                 obj.in_flight = True
 
+                re_submitted = False
                 if not self.get(obj, *args, **kwargs):
                     # Check if chunk is permanently failed or cancelled before re-submitting
                     if obj.permanent_failure:
@@ -1438,6 +1439,7 @@ class Getter(object):
                     # will see in_flight=True and silently drop the chunk!
                     obj.in_flight = False
                     self.submit(obj, *args, **kwargs)
+                    re_submitted = True
             except Exception as err:
                 log.error(f"ERROR {err} getting: {obj} {args} {kwargs}, re-submit.")
                 # Don't re-submit if permanently failed or cancelled
@@ -1450,8 +1452,10 @@ class Getter(object):
                 # CRITICAL: Clear in_flight BEFORE re-submitting
                 obj.in_flight = False
                 self.submit(obj, *args, **kwargs)
+                re_submitted = True
             finally:
-                obj.in_flight = False
+                if not re_submitted:
+                    obj.in_flight = False
         
         # Worker loop ended - cleanup thread-local HTTP session
         try:
