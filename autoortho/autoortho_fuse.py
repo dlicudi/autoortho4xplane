@@ -985,6 +985,13 @@ class AutoOrtho(Operations):
                 if data is None:
                     log.error(f"Tile read returned None for {key} - returning fallback data")
                     return _generate_fallback_dds_bytes(offset, length)
+                # Pad with zeros if the actual DDS is smaller than requested.
+                # getattr() reports the maximum possible zoom size for VRAM headroom;
+                # the cached DDS may be at a lower zoom and therefore shorter.
+                # Without padding X-Plane logs a truncation warning and renders stripes.
+                if len(data) < length:
+                    log.debug(f"DDS read padding: {path} got {len(data)} bytes, expected {length} — padding with zeros")
+                    data = data + bytes(length - len(data))
                 return data
             except FuseOSError:
                 log.error(f"FUSE error for tile {key} - returning fallback data to prevent CTD")
