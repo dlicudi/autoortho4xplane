@@ -3348,8 +3348,9 @@ class TileCompletionTracker:
 
 class BackgroundDDSBuilder:
     
-    # Maximum queue depth (prevents unbounded memory growth)
-    MAX_QUEUE_SIZE = 100
+    # Maximum queue depth. 500 covers a full region's worth of tiles without
+    # allowing unbounded memory growth (old cap of 100 caused cap_hit saturation).
+    MAX_QUEUE_SIZE = 500
     
     def __init__(self, dds_cache,
                  build_interval_sec: float = 0.5,
@@ -3483,10 +3484,6 @@ class BackgroundDDSBuilder:
 
             if self._stop_event.is_set():
                 break
-
-            # Yield all resources to live tile reads when X-Plane is active
-            if is_live_building():
-                continue
 
             # Fill all available worker slots
             with self._active_lock:
