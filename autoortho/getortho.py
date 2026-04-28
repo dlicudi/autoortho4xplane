@@ -6031,41 +6031,11 @@ class Tile(object):
         pre_collected_missing = getattr(self, '_last_collected_missing', None)
         use_precollected = (pre_collected is not None and pre_collected_missing is not None)
         
-        # Acquire streaming builder from pool
-        # Enable nocopy_mode when using pre-collected data for zero-copy optimization
-        config = {
-            'chunks_per_side': self.chunks_per_row,
-            'format': dxt_format,
-            'missing_color': missing_color,
-            'nocopy_mode': use_precollected,  # Zero-copy when we hold JPEG refs
-        }
-        
-        # BLOCKING ACQUIRE: Wait for builder (bank-queue style)
-        # Use remaining time budget as timeout, or default
-        if time_budget is not None and hasattr(time_budget, 'remaining'):
-            builder_timeout = max(1.0, time_budget.remaining)
-        else:
-            builder_timeout = 30.0
-        
-        wait_start = time.monotonic()
-        builder = builder_pool.acquire(config=config, timeout=builder_timeout)
-        if not builder:
-            wait_time_ms = (time.monotonic() - wait_start) * 1000
-            log.debug(f"_try_streaming_aopipeline_build: Builder pool timeout after {wait_time_ms:.0f}ms")
-            bump('streaming_builder_queue_timeout')
-            # Clear pre-collected data to free memory on early return
-            self._last_collected_jpegs = None
-            self._last_collected_missing = None
-            self._last_collected_ratio = None
-            return False
-        
-        wait_time_ms = (time.monotonic() - wait_start) * 1000
-        if wait_time_ms > 10:
-            bump('streaming_builder_queue_wait_count')
-        
         # Keep references alive for zero-copy mode (cleared after finalize)
         jpeg_refs_for_nocopy = []
-        
+        final_ready_chunks = []
+        builder = None
+
         try:
             
             # Ensure chunks are created for target zoom
@@ -6086,18 +6056,16 @@ class Tile(object):
                 max_wait = time_budget.remaining
             else:
                 max_wait = 5.0
-            
+
             if use_precollected:
                 # Use pre-collected data from batch attempt
                 log.debug(f"_try_streaming_aopipeline_build: Reusing {len(pre_collected) - len(pre_collected_missing)} "
                           f"chunks from batch collection (missing: {len(pre_collected_missing)})")
-                
-                # ZERO-COPY: Batch add all ready chunks using nocopy mode
-                # C stores pointers directly, we keep references in jpeg_refs_for_nocopy
+
                 ready_chunks = [(i, data) for i, data in enumerate(pre_collected) if data is not None]
                 if ready_chunks:
-                    builder.add_chunks_batch_nocopy(ready_chunks, jpeg_refs_for_nocopy)
-                
+                    final_ready_chunks.extend(ready_chunks)
+
                 # Use pre-computed missing indices
                 pending_indices = list(pre_collected_missing)
                 
@@ -6119,12 +6087,8 @@ class Tile(object):
                             chunk_getter.submit(chunk)
                         pending_indices.append(i)
                 
-                # ZERO-COPY: Batch add all ready chunks using nocopy mode
-                # C stores pointers directly, we keep references in jpeg_refs_for_nocopy
-                # CRITICAL: jpeg_refs_for_nocopy keeps bytes objects alive for zero-copy mode.
-                # Do NOT clear this list until after finalize() returns.
                 if ready_chunks:
-                    builder.add_chunks_batch_nocopy(ready_chunks, jpeg_refs_for_nocopy)
+                    final_ready_chunks.extend(ready_chunks)
             
             # Phase 2: Wait for pending downloads, then collect results
             # Single wait with reasonable timeout - much more efficient than iterating
@@ -6149,10 +6113,8 @@ class Tile(object):
                 else:
                     failed_indices.append(i)
             
-            # ZERO-COPY: Batch add newly-ready chunks using nocopy mode
-            # References kept alive in jpeg_refs_for_nocopy until finalize completes
             if newly_ready:
-                builder.add_chunks_batch_nocopy(newly_ready, jpeg_refs_for_nocopy)
+                final_ready_chunks.extend(newly_ready)
             
             # Phase 4: Resolve fallbacks for failed chunks
             # Use ThreadPoolExecutor for parallel disk I/O and image operations.
@@ -6163,62 +6125,69 @@ class Tile(object):
             # permanent missing-color patches on first load, because the DDS was
             # built with missing_color baked in and marked retrieved=True,
             # preventing any later retry.
+            fallback_results = []
             if failed_indices:
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-                
                 # When main budget is exhausted, give fallback resolution a
                 # fresh budget for disk-only operations (no network), using the
                 # user-configured fallback_timeout.
                 fallback_resolve_budget = float(getattr(CFG.autoortho, 'fallback_timeout', 30.0))
-                
-                def resolve_fallback(idx):
-                    """Resolve fallback for a single chunk - can run in parallel."""
-                    chunk_col = self.col + (idx % self.chunks_per_row)
-                    chunk_row = self.row + (idx // self.chunks_per_row)
-                    
-                    # Create fallback time budget:
-                    # - If main budget has time remaining, use that
-                    # - Otherwise use a fresh small budget for disk-only fallbacks
-                    fb_budget = None
-                    if time_budget:
-                        fb_remaining = time_budget.remaining
-                        if fb_remaining > 0:
-                            fb_budget = FBTimeBudget(fb_remaining)
-                        else:
-                            fb_budget = FBTimeBudget(fallback_resolve_budget)
-                    
-                    rgba = resolver.resolve(
-                        chunk_col, chunk_row, self.max_zoom,
-                        target_mipmap=0,
-                        time_budget=fb_budget
-                    )
-                    return idx, rgba
-                
-                # Limit parallelism to avoid overwhelming disk I/O
-                max_workers = min(8, len(failed_indices))
-                fallback_results = []
-                
+
                 # Use remaining budget or a fresh small budget for collection
                 resolve_deadline_secs = max(1.0, max_wait) if not (time_budget and time_budget.exhausted) else fallback_resolve_budget
-                
-                try:
-                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                        futures = {executor.submit(resolve_fallback, i): i for i in failed_indices}
-                        
-                        # Collect results with timeout
-                        deadline = time.monotonic() + resolve_deadline_secs
-                        for future in as_completed(futures, timeout=max(0.1, deadline - time.monotonic())):
-                            try:
-                                idx, rgba = future.result(timeout=0.1)
-                                fallback_results.append((idx, rgba))
-                            except Exception:
-                                # Fallback failed, will be marked missing
-                                idx = futures[future]
-                                fallback_results.append((idx, None))
-                except Exception:
-                    # Timeout or other error - mark remaining as missing
-                    pass
-                
+
+                # SERIAL: fallback resolution uses non-thread-safe native libs
+                shared_fb_budget = FBTimeBudget(resolve_deadline_secs)
+                for idx in failed_indices:
+                    if shared_fb_budget.exhausted:
+                        break
+                    chunk_col = self.col + (idx % self.chunks_per_row)
+                    chunk_row = self.row + (idx // self.chunks_per_row)
+                    try:
+                        rgba = resolver.resolve(
+                            chunk_col, chunk_row, self.max_zoom,
+                            target_mipmap=0,
+                            time_budget=shared_fb_budget
+                        )
+                        fallback_results.append((idx, rgba))
+                    except Exception as e:
+                        log.debug(f"_try_streaming_aopipeline_build: Fallback failed for {self.id} chunk {idx}: {e}")
+                        fallback_results.append((idx, None))
+
+            # ═══════════════════════════════════════════════════════════════════════
+            # ACQUIRE BUILDER: Now that we have all data, grab a builder.
+            # Acquiring late keeps the pool unblocked while chunks download (~7s)
+            # and fallbacks resolve (~100ms of disk I/O). The builder slot is only
+            # held during compression (~100ms).
+            # ═══════════════════════════════════════════════════════════════════════
+            config = {
+                'chunks_per_side': self.chunks_per_row,
+                'format': dxt_format,
+                'missing_color': missing_color,
+                'nocopy_mode': use_precollected,
+            }
+            if time_budget is not None and hasattr(time_budget, 'remaining'):
+                builder_timeout = max(1.0, time_budget.remaining)
+            else:
+                builder_timeout = 30.0
+
+            wait_start = time.monotonic()
+            builder = builder_pool.acquire(config=config, timeout=builder_timeout)
+            if not builder:
+                wait_time_ms = (time.monotonic() - wait_start) * 1000
+                log.debug(f"_try_streaming_aopipeline_build: Builder pool timeout after {wait_time_ms:.0f}ms")
+                bump('streaming_builder_queue_timeout')
+                return False
+
+            wait_time_ms = (time.monotonic() - wait_start) * 1000
+            if wait_time_ms > 10:
+                bump('streaming_builder_queue_wait_count')
+
+            # CRITICAL: jpeg_refs_for_nocopy keeps bytes objects alive for zero-copy mode.
+            # C stores pointers directly into these buffers — do NOT clear until after finalize().
+            if final_ready_chunks:
+                builder.add_chunks_batch_nocopy(final_ready_chunks, jpeg_refs_for_nocopy)
+
+            if failed_indices:
                 # Apply fallback results to builder
                 resolved_indices = set()
                 for idx, rgba in fallback_results:
@@ -6229,13 +6198,13 @@ class Tile(object):
                     else:
                         builder.mark_missing(idx)
                         streaming_mm0_missing.append(idx)
-                
+
                 # Mark unresolved chunks as missing
                 for i in failed_indices:
                     if i not in resolved_indices:
                         builder.mark_missing(i)
                         streaming_mm0_missing.append(i)
-            
+
             # Finalize: acquire DDS buffer and build
             pool = _get_dds_buffer_pool()
             if pool is None:
@@ -6304,7 +6273,8 @@ class Tile(object):
         finally:
             # Clear JPEG refs to release memory held for zero-copy mode
             jpeg_refs_for_nocopy.clear()
-            builder.release()
+            if builder is not None:
+                builder.release()
 
     def _get_fallback_level(self) -> int:
         """
