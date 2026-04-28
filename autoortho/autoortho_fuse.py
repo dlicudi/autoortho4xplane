@@ -1011,6 +1011,12 @@ class AutoOrtho(Operations):
                 if data is None:
                     log.error(f"Tile read returned None for {key} - returning fallback data")
                     return _generate_fallback_dds_bytes(offset, length)
+                # Pad with zeros if the actual DDS is smaller than what getattr
+                # reported (can happen in dynamic zoom when a cached ZL16 tile is
+                # served but FUSE reported ZL17 size). Without padding X-Plane
+                # logs a truncation warning and renders stripes.
+                if len(data) < length:
+                    data = data + bytes(length - len(data))
                 return data
             except FuseOSError:
                 log.error(f"FUSE error for tile {key} - returning fallback data to prevent CTD")
