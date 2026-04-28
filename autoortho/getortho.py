@@ -866,9 +866,9 @@ def _live_read_end():
 
 
 def is_live_building() -> bool:
-    """Return True if any live tile reads are in progress."""
+    """Return True if live read pressure is high enough to pause background builds."""
     with _live_reads_lock:
-        return _live_reads_in_progress > 0
+        return _live_reads_in_progress >= 6
 
 
 def _compute_thread_budget() -> int:
@@ -3852,7 +3852,7 @@ class BackgroundDDSBuilder:
                 staging_path = self._dds_cache.get_staging_path(tile_id, tile.max_zoom, tile)
                 if not staging_path:
                     return False
-                with _native_build_context(timeout=30.0):
+                with _native_build_context(timeout=5.0):
                     _result = _run_with_build_timeout(
                         builder.finalize_to_file,
                         staging_path, max_threads=_compute_thread_budget(), timeout=25.0,
@@ -4007,7 +4007,7 @@ class BackgroundDDSBuilder:
                                     if not staging_path:
                                         return
 
-                                    with _native_build_context(timeout=30.0):
+                                    with _native_build_context(timeout=5.0):
                                         _dtd_result = _run_with_build_timeout(
                                             native_dds.build_from_jpegs_to_file,
                                             jpeg_datas, staging_path,
