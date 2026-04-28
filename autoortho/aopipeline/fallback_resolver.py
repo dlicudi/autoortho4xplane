@@ -38,6 +38,11 @@ from typing import Optional, Dict, Any, TYPE_CHECKING
 if TYPE_CHECKING:
     from autoortho.aoimage.AoImage import AoImage
 
+try:
+    from autoortho.utils.time_utils import TimeBudget
+except ImportError:
+    from utils.time_utils import TimeBudget
+
 log = logging.getLogger(__name__)
 
 # Chunk dimensions
@@ -46,32 +51,7 @@ CHUNK_HEIGHT = 256
 CHUNK_BUFFER_SIZE = CHUNK_WIDTH * CHUNK_HEIGHT * 4
 
 
-class TimeBudget:
-    """
-    Simple time budget tracker for fallback operations.
-    
-    Compatible with the existing TimeBudget in getortho.py but simplified
-    for use in the fallback resolver.
-    """
-    
-    def __init__(self, timeout_seconds: float):
-        self.timeout = timeout_seconds
-        self.start_time = time.monotonic()
-    
-    @property
-    def elapsed(self) -> float:
-        """Seconds elapsed since budget started."""
-        return time.monotonic() - self.start_time
-    
-    @property
-    def remaining(self) -> float:
-        """Seconds remaining in budget."""
-        return max(0.0, self.timeout - self.elapsed)
-    
-    @property
-    def exhausted(self) -> bool:
-        """True if budget is exhausted."""
-        return self.elapsed >= self.timeout
+
 
 
 class FallbackResolver:
@@ -213,11 +193,14 @@ class FallbackResolver:
         target chunk position, then crops and upscales.
         """
         try:
-            # Import AoImage here to avoid circular imports
-            from autoortho.aoimage.AoImage import AoImage
+            # Import AoImage module here to avoid circular imports
+            from autoortho.aoimage import AoImage as aoi
         except ImportError:
-            log.warning("FallbackResolver: Could not import AoImage for disk cache fallback")
-            return None
+            try:
+                import AoImage as aoi
+            except ImportError:
+                log.warning("FallbackResolver: Could not import AoImage for disk cache fallback")
+                return None
         
         max_search_zoom = self.tile_zoom
         
@@ -244,25 +227,18 @@ class FallbackResolver:
             log.debug(f"FallbackResolver: disk cache hit at {cache_path}")
             
             try:
-                data = None
-                max_attempts = 3
-                for attempt in range(1, max_attempts + 1):
-                    try:
-                        with open(cache_path, 'rb') as f:
-                            data = f.read()
-                        break
-                    except (IOError, OSError) as e:
-                        if attempt < max_attempts:
-                            time.sleep(0.01 * attempt)
-                        else:
-                            log.warning(f"FallbackResolver: failed to read cache {cache_path}: {e}")
-                            continue
+                try:
+                    with open(cache_path, 'rb') as f:
+                        data = f.read()
+                except (IOError, OSError) as e:
+                    log.warning(f"FallbackResolver: failed to read cache {cache_path}: {e}")
+                    continue
                 
                 if not data or len(data) < 100:
                     continue
                 
                 # Decode JPEG using AoImage (loads from memory bytes)
-                parent_img = AoImage.load_from_memory(data)
+                parent_img = aoi.load_from_memory(data)
                 if not parent_img:
                     continue
                 
@@ -286,7 +262,7 @@ class FallbackResolver:
                     else:
                         # No scaling needed - just crop
                         # Create destination image for crop
-                        cropped = AoImage.new('RGBA', (256, 256), (0, 0, 0, 255))
+                        cropped = aoi.new('RGBA', (256, 256), (0, 0, 0, 255))
                         parent_img.crop(cropped, (crop_offset_x, crop_offset_y))
                     
                     if not cropped:
@@ -325,9 +301,12 @@ class FallbackResolver:
             return None
         
         try:
-            from autoortho.aoimage.AoImage import AoImage
+            from autoortho.aoimage import AoImage as aoi
         except ImportError:
-            return None
+            try:
+                import AoImage as aoi
+            except ImportError:
+                return None
         
         # Check higher-detail mipmaps (lower mipmap numbers = higher detail)
         for higher_mipmap in range(target_mipmap):
@@ -367,7 +346,7 @@ class FallbackResolver:
                 
                 # Crop and downscale using native AoImage methods
                 # 1. Create temporary image for the crop region
-                temp_crop = AoImage.new('RGBA', (crop_size, crop_size), (0, 0, 0, 255))
+                temp_crop = aoi.new('RGBA', (crop_size, crop_size), (0, 0, 0, 255))
                 if not temp_crop:
                     continue
 
@@ -447,29 +426,50 @@ class FallbackResolver:
                     continue
                 
                 # Decode
-                parent_img = AoImage.open(chunk_data)
+                parent_img = aoi.load_from_memory(chunk_data)
                 if not parent_img:
                     continue
                 
-                # Calculate crop region
-                crop_offset_x = (col % scale_factor) * (256 // scale_factor)
-                crop_offset_y = (row % scale_factor) * (256 // scale_factor)
-                crop_size = 256 // scale_factor
-                
-                # Crop and upscale
-                cropped = parent_img.crop((
-                    crop_offset_x, crop_offset_y,
-                    crop_offset_x + crop_size, crop_offset_y + crop_size
-                ))
-                
-                if crop_size != 256:
-                    cropped = cropped.resize((256, 256), resample=1)
-                
-                if cropped.mode != 'RGBA':
-                    cropped = cropped.convert('RGBA')
-                
-                log.debug(f"FallbackResolver: network fallback hit at zoom {zoom_p}")
-                return cropped.tobytes()
+                cropped = None
+                try:
+                    # Calculate crop region
+                    crop_offset_x = (col % scale_factor) * (256 // scale_factor)
+                    crop_offset_y = (row % scale_factor) * (256 // scale_factor)
+                    crop_size = 256 // scale_factor
+                    
+                    # Use crop_and_upscale for atomic crop+scale operation
+                    if crop_size != 256:
+                        # Need to scale up - calculate scale factor to reach 256x256
+                        upscale_factor = 256 // crop_size
+                        cropped = parent_img.crop_and_upscale(
+                            crop_offset_x, crop_offset_y,
+                            crop_size, crop_size,
+                            upscale_factor
+                        )
+                    else:
+                        # No scaling needed - just crop
+                        # Create destination image for crop
+                        cropped = aoi.new('RGBA', (256, 256), (0, 0, 0, 255))
+                        if cropped:
+                            parent_img.crop(cropped, (crop_offset_x, crop_offset_y))
+                    
+                    if not cropped:
+                        continue
+                    
+                    # Return raw bytes
+                    log.debug(f"FallbackResolver: network fallback hit at zoom {zoom_p}")
+                    return cropped.tobytes()
+                finally:
+                    # Clean up images to free native memory
+                    try:
+                        parent_img.close()
+                    except Exception:
+                        pass
+                    try:
+                        if cropped is not None:
+                            cropped.close()
+                    except Exception:
+                        pass
                 
             except Exception as e:
                 log.debug(f"FallbackResolver: network fallback failed: {e}")

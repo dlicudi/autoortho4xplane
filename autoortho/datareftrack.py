@@ -274,6 +274,14 @@ class DatarefTracker(object):
         self.has_ever_connected = False  # True once first connection established
         self.last_start_time = 0.0
 
+        # Teleport detection state
+        self.last_lat = -1.0
+        self.last_lon = -1.0
+        self.teleport_active = False
+        self.teleport_time = 0.0
+        self.TELEPORT_COOLDOWN = 45.0  # seconds to stay in "teleport" mode
+        self.TELEPORT_THRESHOLD_NM = 1.0  # jump > 1nm is a teleport
+
         # Flight data averager for smoothed predictions
         self.flight_averager = FlightDataAverager()
 
@@ -443,6 +451,37 @@ class DatarefTracker(object):
             if not self.connected or not self.data_valid:
                 return -999.0
             return self.sun_pitch
+
+    @property
+    def is_teleporting(self) -> bool:
+        """
+        Return True if a teleport was recently detected.
+        
+        A teleport is a sudden jump in position (e.g. via map click) that
+        requires the scenery pipeline to quickly shift focus and potentially
+        lower quality to maintain responsiveness.
+        """
+        with self._lock:
+            if not self.teleport_active:
+                return False
+            
+            elapsed = time.monotonic() - self.teleport_time
+            if elapsed > self.TELEPORT_COOLDOWN:
+                self.teleport_active = False
+                return False
+            
+            return True
+
+    def _calculate_distance_nm(self, lat1, lon1, lat2, lon2) -> float:
+        """Calculate distance between two points in nautical miles (Haversine)."""
+        R = 3440.065  # Earth radius in nautical miles
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = (math.sin(dlat / 2) * math.sin(dlat / 2) +
+             math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+             math.sin(dlon / 2) * math.sin(dlon / 2))
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        return R * c
 
     def start(self):
         """Start the UDP listening thread."""
@@ -620,8 +659,22 @@ class DatarefTracker(object):
 
                     # Validate position data
                     if self._validate_position(lat, lon, alt):
+                        # Teleport detection
+                        if self.last_lat != -1.0:
+                            dist = self._calculate_distance_nm(self.last_lat, self.last_lon, lat, lon)
+                            # Only trigger if spd is relatively low (to avoid false positives at Mach 2)
+                            # or if the jump is absolutely huge.
+                            if dist > self.TELEPORT_THRESHOLD_NM:
+                                # spd is m/s. 1nm/0.1s update = 10nm/s = 36000 knots. 
+                                # So any jump > 1nm in 0.1s is definitely a teleport.
+                                log.info(f"DT: Teleport detected! Jumped {dist:.1f}nm. Activating QuickLoad mode.")
+                                self.teleport_active = True
+                                self.teleport_time = time.monotonic()
+
                         self.lat = lat
                         self.lon = lon
+                        self.last_lat = lat
+                        self.last_lon = lon
                         self.alt = alt
                         self.hdg = hdg
                         self.spd = spd

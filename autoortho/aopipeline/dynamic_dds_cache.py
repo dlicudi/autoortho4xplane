@@ -23,11 +23,7 @@ import time
 from collections import OrderedDict
 from typing import List, Optional, Tuple
 
-try:
-    import zstandard
-    _HAS_ZSTD = True
-except ImportError:
-    _HAS_ZSTD = False
+_HAS_ZSTD = False
 
 log = logging.getLogger(__name__)
 
@@ -68,20 +64,15 @@ def cleanup_source_jpegs(cache_dir: str, col: int, row: int,
         for r in range(scaled_row, scaled_row + scaled_height):
             for c in range(scaled_col, scaled_col + scaled_width):
                 jpeg_path = os.path.join(cache_dir, f"{c}_{r}_{zoom}_{maptype}.jpg")
-                for attempt in range(3):
-                    try:
-                        file_size = os.path.getsize(jpeg_path)
-                        os.remove(jpeg_path)
-                        deleted += 1
-                        bytes_freed += file_size
-                        break
-                    except FileNotFoundError:
-                        break
-                    except PermissionError:
-                        if attempt < 2:
-                            time.sleep(0.01)
-                    except OSError:
-                        break
+                try:
+                    file_size = os.path.getsize(jpeg_path)
+                    os.remove(jpeg_path)
+                    deleted += 1
+                    bytes_freed += file_size
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    log.debug(f"cleanup_source_jpegs: failed to remove {jpeg_path}: {e}")
 
     if deleted > 0:
         log.debug(f"Cleaned up {deleted} source JPEGs for "
@@ -652,22 +643,16 @@ class DynamicDDSCache:
         level = max(1, min(19, level))
         return comp, level
 
-    def _compress_dds(self, data: bytes) -> bytes:
-        """Compress raw DDS bytes with zstd. Returns original data if compression disabled."""
-        if self._compression != "zstd" or not _HAS_ZSTD:
-            return data
-        cctx = zstandard.ZstdCompressor(level=self._compression_level)
-        return cctx.compress(data)
 
-    def _decompress_dds(self, data: bytes, meta: dict) -> bytes:
-        """Decompress DDS bytes based on DDM metadata. Returns data unchanged if uncompressed."""
-        disk_comp = meta.get("disk_compression", "none")
-        if disk_comp != "zstd":
-            return data
-        if not _HAS_ZSTD:
-            raise RuntimeError("Compressed DDS but zstandard not installed")
-        dctx = zstandard.ZstdDecompressor()
-        return dctx.decompress(data)
+    def _compress_dds(self, data: bytes) -> bytes:
+        """zstd compression disabled; returns data unchanged."""
+        return data
+
+    def _decompress_dds(self, data: bytes, meta: dict | None) -> bytes:
+        """Decompress DDS bytes. Raises RuntimeError for legacy zstd files (triggers cache rebuild)."""
+        if (meta or {}).get("disk_compression", "none") == "zstd":
+            raise RuntimeError("zstd-compressed DDS cache requires zstandard library; cache will be rebuilt")
+        return data
 
     def _create_dds_skeleton(self, dds_path: str, header_bytes: bytes,
                              total_size: int) -> bool:
@@ -749,11 +734,8 @@ class DynamicDDSCache:
 
             dds_format, compressor = self._get_format_and_compressor()
 
-            # Compress DDS data for disk storage
-            disk_bytes = self._compress_dds(dds_bytes)
-            disk_compression = self._compression if len(disk_bytes) < len(dds_bytes) else "none"
-            if disk_compression == "none":
-                disk_bytes = dds_bytes
+            disk_bytes = dds_bytes
+            disk_compression = "none"
 
             # Write DDS atomically
             tmp_dds = dds_path + f".tmp.{os.getpid()}"
@@ -857,76 +839,27 @@ class DynamicDDSCache:
             if not new_mipmaps:
                 return True
 
-            # 3. Build the DDS content with new mipmaps, then compress
-            use_compression = self._compression == "zstd" and _HAS_ZSTD
             merged_populated = sorted(already_populated | set(new_mipmaps.keys()))
 
-            if use_compression:
-                # Compressed path: work in memory, compress, write atomically.
-                # Partial DDS files (mostly zeros) compress extremely well
-                # (~43 MB skeleton → ~200 KB compressed).
-                if os.path.isfile(dds_path):
-                    with open(dds_path, "rb") as f:
-                        raw = f.read()
-                    was_compressed = (existing_meta or {}).get(
-                        "disk_compression", "none") == "zstd"
-                    if was_compressed:
-                        try:
-                            dds_data = bytearray(
-                                self._decompress_dds(raw, existing_meta))
-                        except Exception:
-                            dds_data = bytearray(total_size)
-                            dds_data[:len(header_bytes)] = header_bytes
-                    else:
-                        dds_data = bytearray(raw)
-                        # Pad if file is shorter than expected (truncated)
-                        if len(dds_data) < total_size:
-                            dds_data.extend(b'\x00' * (total_size - len(dds_data)))
-                else:
-                    dds_data = bytearray(total_size)
-                    dds_data[:len(header_bytes)] = header_bytes
+            # Uncompressed path: seek-write in place (original behavior)
+            if not os.path.isfile(dds_path):
+                self._create_dds_skeleton(dds_path, header_bytes, total_size)
 
+            with open(dds_path, "r+b") as f:
                 for idx, data in new_mipmaps.items():
                     startpos, length = mipmap_offsets[idx]
                     if len(data) != length:
                         log.debug(f"Incremental save: mipmap {idx} size mismatch "
                                   f"({len(data)} vs {length}), skipping")
                         continue
-                    dds_data[startpos:startpos + length] = data
+                    f.seek(startpos)
+                    f.write(data)
 
-                compressed = self._compress_dds(bytes(dds_data))
-                if len(compressed) < len(dds_data):
-                    disk_compression = self._compression
-                    disk_bytes = compressed
-                else:
-                    disk_compression = "none"
-                    disk_bytes = bytes(dds_data)
-
-                tmp = dds_path + f".tmp.{os.getpid()}"
-                with open(tmp, "wb") as f:
-                    f.write(disk_bytes)
-                os.replace(tmp, dds_path)
-                disk_size = len(disk_bytes)
-            else:
-                # Uncompressed path: seek-write in place (original behavior)
-                if not os.path.isfile(dds_path):
-                    self._create_dds_skeleton(dds_path, header_bytes, total_size)
-
-                with open(dds_path, "r+b") as f:
-                    for idx, data in new_mipmaps.items():
-                        startpos, length = mipmap_offsets[idx]
-                        if len(data) != length:
-                            log.debug(f"Incremental save: mipmap {idx} size mismatch "
-                                      f"({len(data)} vs {length}), skipping")
-                            continue
-                        f.seek(startpos)
-                        f.write(data)
-
-                disk_compression = "none"
-                try:
-                    disk_size = os.path.getsize(dds_path)
-                except OSError:
-                    disk_size = total_size
+            disk_compression = "none"
+            try:
+                disk_size = os.path.getsize(dds_path)
+            except OSError:
+                disk_size = total_size
 
             # 4. Update DDM *after* data writes (crash-safe ordering)
             dds_format, compressor = self._get_format_and_compressor()
@@ -1032,36 +965,24 @@ class DynamicDDSCache:
             # Atomic placement: create at a temp name, then os.replace().
             tmp_dds = dds_path + f".tmp.{os.getpid()}"
 
-            if self._compression == "zstd" and _HAS_ZSTD:
-                # Read source, compress, write compressed version
-                with open(source_path, "rb") as f:
-                    raw_bytes = f.read()
-                disk_bytes = self._compress_dds(raw_bytes)
-                disk_compression = self._compression if len(disk_bytes) < len(raw_bytes) else "none"
-                if disk_compression == "none":
-                    disk_bytes = raw_bytes
-                with open(tmp_dds, "wb") as f:
-                    f.write(disk_bytes)
-                disk_size = len(disk_bytes)
-            else:
-                disk_compression = "none"
-                # Try hard-link first -- zero-copy, instant, works when source
-                # and destination are on the same filesystem.
-                linked = False
+            disk_compression = "none"
+            # Try hard-link first -- zero-copy, instant, works when source
+            # and destination are on the same filesystem.
+            linked = False
+            try:
                 try:
-                    try:
-                        os.remove(tmp_dds)
-                    except OSError:
-                        pass
-                    os.link(source_path, tmp_dds)
-                    linked = True
+                    os.remove(tmp_dds)
                 except OSError:
                     pass
+                os.link(source_path, tmp_dds)
+                linked = True
+            except OSError:
+                pass
 
-                if not linked:
-                    import shutil
-                    shutil.copy2(source_path, tmp_dds)
-                disk_size = source_size
+            if not linked:
+                import shutil
+                shutil.copy2(source_path, tmp_dds)
+            disk_size = source_size
 
             os.replace(tmp_dds, dds_path)
 

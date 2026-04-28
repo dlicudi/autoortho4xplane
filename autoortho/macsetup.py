@@ -5,36 +5,28 @@ import time
 
 # Handle imports for both frozen (PyInstaller) and direct Python execution
 try:
-    from autoortho.utils.mount_utils import safe_ismount
+    from autoortho.utils.mount_utils import (
+        safe_ismount, 
+        is_only_ao_placeholder, 
+        clear_ao_placeholder
+    )
 except ImportError:
-    from utils.mount_utils import safe_ismount
+    from utils.mount_utils import (
+        safe_ismount, 
+        is_only_ao_placeholder, 
+        clear_ao_placeholder
+    )
 
 log = logging.getLogger(__name__)
 
-_IGNORE_FILES = {".DS_Store", ".metadata_never_index"}
-_AO_PLACEHOLDER_ITEMS = {"Earth nav data", "terrain", "textures", ".AO_PLACEHOLDER"}
-
-
-
-def _is_only_ao_placeholder(dirpath):
-    try:
-        entries = [e for e in os.listdir(dirpath) if e not in _IGNORE_FILES]
-    except Exception:
-        return False
-    return set(entries).issubset(_AO_PLACEHOLDER_ITEMS)
-
-def _clear_ao_placeholder(dirpath):
-    import shutil, os
-    for name in _AO_PLACEHOLDER_ITEMS:
-        p = os.path.join(dirpath, name)
-        if os.path.isdir(p) and not os.path.islink(p):
-            shutil.rmtree(p, ignore_errors=True)
-        elif os.path.lexists(p):
-            try: os.remove(p)
-            except Exception: pass
 
 
 def _is_effectively_empty(dirpath):
+    try:
+        from autoortho.utils.mount_utils import _IGNORE_FILES
+    except ImportError:
+        from utils.mount_utils import _IGNORE_FILES
+
     try:
         entries = [e for e in os.listdir(dirpath) if e not in _IGNORE_FILES]
         return len(entries) == 0
@@ -76,8 +68,8 @@ def setup_macfuse_mount(path):
             return False
         if not _is_effectively_empty(real):
             # Accept directories that contain only our placeholder; clear them.
-            if _is_only_ao_placeholder(real):
-                _clear_ao_placeholder(real)
+            if is_only_ao_placeholder(real):
+                clear_ao_placeholder(real)
             else:
                 log.warning(f"Mount point {path} exists and is not empty")
                 return False

@@ -93,6 +93,11 @@ except ImportError:
     from utils.custom_map import get_custom_map_config
 
 try:
+    from autoortho.utils.time_utils import TimeBudget
+except ImportError:
+    from utils.time_utils import TimeBudget
+
+try:
     from autoortho.datareftrack import dt as datareftracker
 except ImportError:
     from datareftrack import dt as datareftracker
@@ -633,7 +638,7 @@ _BUILD_TIMEOUT_SENTINEL = object()
 
 
 def _build_dds_hybrid(chunks: list, dxt_format: str,
-                      missing_color: tuple) -> bytes:
+                      missing_color: tuple, priority: int = PRIORITY_LIVE) -> bytes:
     """
     Build DDS using HYBRID approach: chunks already in memory + native decode.
     
@@ -647,6 +652,7 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
         chunks: List of Chunk objects (must have .data attribute)
         dxt_format: "BC1" or "BC3"
         missing_color: RGB tuple for missing chunks
+        priority: Priority for buffer pool acquisition (default: PRIORITY_LIVE)
     
     Returns:
         DDS bytes on success, None on failure
@@ -676,32 +682,44 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
             return None
         
         # Acquire buffer from pool (blocking with priority queue)
-        # Live builds are high priority, prefetch is low priority
         pool = _get_dds_buffer_pool()
         if pool is None or not hasattr(native, 'build_from_jpegs_to_buffer'):
             log.debug("Hybrid DDS build: buffer pool not available")
             return None
         
         try:
-            # Blocking acquire with LIVE priority (front of queue)
-            # No fallback to allocation - wait for buffer to be available
-            buffer, buffer_id = pool.acquire(timeout=30.0, priority=PRIORITY_LIVE)
+            # Blocking acquire with specified priority
+            buffer, buffer_id = pool.acquire(timeout=30.0, priority=priority)
         except TimeoutError:
-            log.debug("Hybrid DDS build: buffer pool timeout (queue full)")
+            log.debug(f"Hybrid DDS build: buffer pool timeout (priority={priority})")
             bump('hybrid_buffer_pool_timeout')
             return None
         
+        # Track if we've already released the buffer
+        buffer_released = False
+        def _reclaim_buffer():
+            nonlocal buffer_released
+            if not buffer_released:
+                pool.release(buffer_id)
+                buffer_released = True
+
+        _build_result = _BUILD_TIMEOUT_SENTINEL
         try:
             with _native_build_context(timeout=30.0):
                 _build_result = _run_with_build_timeout(
                     native.build_from_jpegs_to_buffer,
                     buffer, jpeg_datas,
                     format=dxt_format, missing_color=missing_color,
-                    max_threads=1, timeout=25.0
+                    max_threads=1, timeout=25.0,
+                    _keep_alive=[buffer, jpeg_datas],
+                    _on_timeout_cleanup=_reclaim_buffer
                 )
 
             if _build_result is _BUILD_TIMEOUT_SENTINEL:
+                # Thread hung, it will be reclaimed by _reclaim_buffer once it exits.
+                # Returning now is safe as the reclaimer owns the buffer release.
                 return None
+
             if _build_result.success and _build_result.bytes_written >= 128:
                 dds_bytes = _build_result.to_bytes()
                 log.debug(f"Hybrid DDS build: {valid_count}/{len(chunks)} chunks, "
@@ -711,7 +729,10 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
                 log.debug("Hybrid DDS build: compression failed")
                 return None
         finally:
-            pool.release(buffer_id)
+            # If the build didn't time out, we can release the buffer now.
+            # If it did time out, _run_with_build_timeout will handle reclamation.
+            if _build_result is not _BUILD_TIMEOUT_SENTINEL:
+                _reclaim_buffer()
             
     except Exception as e:
         log.debug(f"Hybrid DDS build exception: {e}")
@@ -1361,150 +1382,8 @@ def locked(fn):
     return wrapped
 
 
-class TimeBudget:
-    """
-    Track elapsed wall-clock time for a single X-Plane tile request.
+
     
-    This class solves the per-chunk vs per-request timeout problem:
-    - Previously, each chunk had its own maxwait timeout, leading to
-      serialized chunks taking N * maxwait total time
-    - Now, all chunks share a single time budget, ensuring the total
-      wall-clock time stays close to the configured limit
-    
-    Usage:
-        budget = TimeBudget(max_seconds=2.0)
-        while not budget.exhausted:
-            chunk_ready = budget.wait_with_budget(chunk.ready)
-            if not chunk_ready:
-                break  # Budget exhausted or event not set
-    
-    Thread-safety: Uses time.monotonic() which is thread-safe and immune
-    to system clock adjustments.
-    """
-    
-    # Minimum wait granularity - how often we check if budget is exhausted
-    # during a wait. Smaller = more responsive but slightly more CPU.
-    # 50ms is a good balance: responsive enough for UI, not too chatty.
-    WAIT_GRANULARITY_SEC = 0.05
-    
-    def __init__(self, max_seconds: float):
-        """
-        Initialize a time budget.
-        
-        Args:
-            max_seconds: Maximum wall-clock time allowed for this request.
-                        This should be the value the user expects X-Plane
-                        to actually wait, not a per-chunk timeout.
-        """
-        self.max_seconds = max_seconds
-        self.start_time = time.monotonic()
-        self._exhausted = False
-        self._chunks_processed = 0
-        self._chunks_skipped = 0
-    
-    @property
-    def remaining(self) -> float:
-        """Return remaining time in seconds (never negative)."""
-        return max(0.0, self.max_seconds - self.elapsed)
-    
-    @property 
-    def elapsed(self) -> float:
-        """Return elapsed time since budget creation in seconds."""
-        return time.monotonic() - self.start_time
-    
-    @property
-    def exhausted(self) -> bool:
-        """
-        Check if the time budget is exhausted.
-        
-        Once exhausted, always returns True (sticky flag for efficiency).
-        """
-        if self._exhausted:
-            return True
-        if self.elapsed >= self.max_seconds:
-            self._exhausted = True
-            return True
-        return False
-    
-    def wait_with_budget(self, event: threading.Event, max_single_wait: float = None) -> bool:
-        """
-        Wait on an event while respecting both the time budget AND an optional per-chunk maxwait.
-        
-        This combines two timeout mechanisms:
-        1. Time budget: Total wall-clock time for the entire tile
-        2. Max single wait: Per-chunk timeout (like the old maxwait parameter)
-        
-        Args:
-            event: A threading.Event to wait on (e.g., chunk.ready)
-            max_single_wait: Optional per-chunk timeout in seconds. If provided,
-                           the wait will not exceed this time even if budget remains.
-                           This corresponds to the old "maxwait" config setting.
-        
-        Returns:
-            True if the event was set (success)
-            False if budget exhausted or max_single_wait exceeded before event was set
-        
-        Behavior:
-            - If event is already set, returns immediately with True
-            - If budget is already exhausted, returns event.is_set() immediately
-            - Otherwise, waits up to min(remaining_budget, max_single_wait)
-        """
-        # Fast path: already set
-        if event.is_set():
-            return True
-        
-        # Fast path: budget already gone
-        if self.exhausted:
-            return event.is_set()
-        
-        # Track start time for max_single_wait
-        single_wait_start = time.monotonic() if max_single_wait else None
-        
-        # Poll with granularity until event set or budget/maxwait exhausted
-        while not self.exhausted:
-            # Check max_single_wait limit
-            if max_single_wait is not None:
-                single_elapsed = time.monotonic() - single_wait_start
-                if single_elapsed >= max_single_wait:
-                    log.debug(f"max_single_wait ({max_single_wait:.2f}s) exceeded")
-                    break
-                single_remaining = max_single_wait - single_elapsed
-            else:
-                single_remaining = float('inf')
-            
-            # Wait the minimum of: budget remaining, single wait remaining, granularity
-            wait_time = min(self.remaining, single_remaining, self.WAIT_GRANULARITY_SEC)
-            if wait_time <= 0:
-                break
-            if event.wait(timeout=wait_time):
-                return True
-        
-        # Final check after loop exits
-        return event.is_set()
-    
-    def record_chunk_processed(self):
-        """Record that a chunk was successfully processed."""
-        self._chunks_processed += 1
-    
-    def record_chunk_skipped(self):
-        """Record that a chunk was skipped due to budget exhaustion."""
-        self._chunks_skipped += 1
-    
-    @property
-    def chunks_processed(self) -> int:
-        """Number of chunks successfully processed within budget."""
-        return self._chunks_processed
-    
-    @property
-    def chunks_skipped(self) -> int:
-        """Number of chunks skipped due to budget exhaustion."""
-        return self._chunks_skipped
-    
-    def __repr__(self):
-        return (f"TimeBudget(max={self.max_seconds:.2f}s, "
-                f"elapsed={self.elapsed:.2f}s, "
-                f"remaining={self.remaining:.2f}s, "
-                f"exhausted={self.exhausted})")
 
 
 class Getter(object):
@@ -4176,7 +4055,8 @@ class BackgroundDDSBuilder:
                             dds_bytes = _build_dds_hybrid(
                                 chunks=chunks_for_hybrid,
                                 dxt_format=dxt_format,
-                                missing_color=missing_color
+                                missing_color=missing_color,
+                                priority=PRIORITY_PREFETCH
                             )
                             
                             if dds_bytes and len(dds_bytes) >= 128:
@@ -7449,6 +7329,16 @@ class Tile(object):
         # - Each request gets its full time budget for chunk collection
         # Default 30s is responsive for flight sims - config can override for quality
         budget_seconds = float(getattr(CFG.autoortho, 'tile_time_budget', 30.0))
+        
+        # Teleport recovery: If the aircraft just teleported, we prioritize
+        # responsiveness over quality. Reducing the budget to 5s ensures
+        # we return valid (potentially lower detail) scenery quickly to
+        # prevent X-Plane from timing out or showing gray tiles.
+        if datareftracker.is_teleporting:
+            # Hard cap budget during teleport recovery
+            log.debug("READ_DDS_BYTES: Teleport active - using QuickLoad 5s budget")
+            budget_seconds = min(5.0, budget_seconds)
+
         request_budget = TimeBudget(budget_seconds)
 
         # Track when this tile was first requested (for stats only)
