@@ -710,7 +710,7 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
                     native.build_from_jpegs_to_buffer,
                     buffer, jpeg_datas,
                     format=dxt_format, missing_color=missing_color,
-                    max_threads=1, timeout=25.0,
+                    max_threads=_compute_thread_budget(), timeout=25.0,
                     _keep_alive=[buffer, jpeg_datas],
                     _on_timeout_cleanup=_reclaim_buffer
                 )
@@ -3868,7 +3868,7 @@ class BackgroundDDSBuilder:
                 with _native_build_context(timeout=30.0):
                     _result = _run_with_build_timeout(
                         builder.finalize_to_file,
-                        staging_path, max_threads=1, timeout=25.0,
+                        staging_path, max_threads=_compute_thread_budget(), timeout=25.0,
                         _keep_alive=jpeg_refs_for_nocopy,
                         _on_timeout_cleanup=builder.release
                     )
@@ -4025,7 +4025,7 @@ class BackgroundDDSBuilder:
                                             native_dds.build_from_jpegs_to_file,
                                             jpeg_datas, staging_path,
                                             format=dxt_format, missing_color=missing_color,
-                                            max_threads=1, timeout=25.0
+                                            max_threads=_compute_thread_budget(), timeout=25.0
                                         )
 
                                     if _dtd_result is _BUILD_TIMEOUT_SENTINEL:
