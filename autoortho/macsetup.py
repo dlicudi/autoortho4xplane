@@ -6,15 +6,17 @@ import time
 # Handle imports for both frozen (PyInstaller) and direct Python execution
 try:
     from autoortho.utils.mount_utils import (
-        safe_ismount, 
-        is_only_ao_placeholder, 
-        clear_ao_placeholder
+        safe_ismount,
+        is_only_ao_placeholder,
+        clear_ao_placeholder,
+        _IGNORE_FILES,
     )
 except ImportError:
     from utils.mount_utils import (
-        safe_ismount, 
-        is_only_ao_placeholder, 
-        clear_ao_placeholder
+        safe_ismount,
+        is_only_ao_placeholder,
+        clear_ao_placeholder,
+        _IGNORE_FILES,
     )
 
 log = logging.getLogger(__name__)
@@ -22,11 +24,6 @@ log = logging.getLogger(__name__)
 
 
 def _is_effectively_empty(dirpath):
-    try:
-        from autoortho.utils.mount_utils import _IGNORE_FILES
-    except ImportError:
-        from utils.mount_utils import _IGNORE_FILES
-
     try:
         entries = [e for e in os.listdir(dirpath) if e not in _IGNORE_FILES]
         return len(entries) == 0

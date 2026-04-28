@@ -140,16 +140,13 @@ class DynamicDDSCache:
         self._evictions = 0
         self._upgrades = 0
 
-        # Disk compression settings (read once from config)
-        self._compression, self._compression_level = self._get_compression_settings()
-        if self._compression == "zstd" and not _HAS_ZSTD:
-            log.warning("zstandard not installed - DDS cache compression disabled")
-            self._compression = "none"
+        self._compression = "none"
+        self._compression_level = 0
 
         if self._enabled:
             os.makedirs(self._dds_root, exist_ok=True)
             log.info(f"DynamicDDSCache initialized: {self._dds_root} "
-                     f"(max={max_size_mb}MB, compression={self._compression})")
+                     f"(max={max_size_mb}MB)")
 
     # ------------------------------------------------------------------
     # Path helpers
@@ -623,21 +620,6 @@ class DynamicDDSCache:
             dds_format = "BC3"
         compressor = CFG.pydds.compressor.upper()
         return dds_format, compressor
-
-    @staticmethod
-    def _get_compression_settings():
-        """Return (compression_type, level) from config."""
-        try:
-            from autoortho.aoconfig import CFG
-        except ImportError:
-            from aoconfig import CFG  # type: ignore[no-redef]
-        comp = getattr(CFG.pydds, 'dds_compression', 'zstd').lower()
-        if comp not in ('none', 'zstd'):
-            comp = 'zstd'
-        level = int(getattr(CFG.pydds, 'dds_compression_level', 3))
-        level = max(1, min(19, level))
-        return comp, level
-
 
     def _compress_dds(self, data: bytes) -> bytes:
         """zstd compression disabled; returns data unchanged."""
@@ -1891,7 +1873,9 @@ class DynamicDDSCache:
         t.start()
 
     def _heal_incomplete_async(self, tile_id: str, max_zoom: int, tile) -> None:
-        """Background healing coordinator for strict cache misses."""
+        """Background healing coordinator for incomplete cached tiles."""
+        if getattr(tile, '_closed', False):
+            return
         network_dispatched = False
         try:
             unhealable = self._try_heal_from_disk_cache(tile_id, max_zoom, tile)

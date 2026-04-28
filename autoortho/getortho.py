@@ -1035,7 +1035,7 @@ def _run_with_build_timeout(native_func, *args, timeout=25.0, _keep_alive=None,
                 try:
                     _on_timeout_cleanup()
                 except Exception as e:
-                    log.debug(f"ao-builder-reclaim: cleanup error: {e}")
+                    log.warning(f"ao-builder-reclaim: cleanup error: {e}")
             threading.Thread(
                 target=_reclaimer, daemon=True, name="ao-builder-reclaim"
             ).start()
@@ -1380,10 +1380,6 @@ def locked(fn):
             result = fn(self, *args, **kwargs)
         return result
     return wrapped
-
-
-
-    
 
 
 class Getter(object):

@@ -52,8 +52,6 @@ CHUNK_BUFFER_SIZE = CHUNK_WIDTH * CHUNK_HEIGHT * 4
 
 
 
-
-
 class FallbackResolver:
     """
     Resolves missing chunks using the fallback chain.
