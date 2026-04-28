@@ -1494,6 +1494,7 @@ class Getter(object):
 class ChunkGetter(Getter):
     # Track in-progress chunk_ids GLOBALLY to prevent queueing duplicates
     _queued_chunk_ids = set()
+    _queued_chunk_waiters = {}  # chunk_id -> [Chunk, ...] waiting for the primary download
     _queued_lock = threading.Lock()
 
     def submit(self, obj, *args, **kwargs):
@@ -1504,16 +1505,7 @@ class ChunkGetter(Getter):
         if getattr(obj, 'cancelled', False):
             bump('submit_skip_cancelled')
             return
-        
-        chunk_id = getattr(obj, 'chunk_id', None)
-        
-        # Check if already queued (fast path)
-        if chunk_id:
-            with self._queued_lock:
-                if chunk_id in self._queued_chunk_ids:
-                    bump('submit_skip_id_already_queued')
-                    return
-        
+
         # Per-object coalescing checks
         if obj.ready.is_set():
             bump('submit_skip_already_ready')
@@ -1524,15 +1516,44 @@ class ChunkGetter(Getter):
         if obj.in_flight:
             bump('submit_skip_in_flight')
             return
-        
+
+        chunk_id = getattr(obj, 'chunk_id', None)
+
+        # If an equivalent chunk is already queued or in-flight, park this
+        # caller as a waiter. The primary downloader will fan the result out
+        # to all waiters on completion so they don't block until timeout.
+        if chunk_id:
+            with self._queued_lock:
+                if chunk_id in self._queued_chunk_ids:
+                    obj.in_queue = True
+                    self._queued_chunk_waiters.setdefault(chunk_id, []).append(obj)
+                    bump('submit_skip_id_already_queued')
+                    return
+
         obj.in_queue = True
-        
+
         # Add to queue
         if chunk_id:
             with self._queued_lock:
                 self._queued_chunk_ids.add(chunk_id)
-        
+
         self.queue.put((obj, args, kwargs))
+
+    def _complete_duplicate_waiters(self, obj, waiters):
+        """Fan out one downloaded chunk result to duplicate Chunk objects."""
+        if not waiters:
+            return
+        for waiter in waiters:
+            if waiter is obj or waiter.ready.is_set():
+                continue
+            waiter.data = obj.data
+            waiter.permanent_failure = obj.permanent_failure
+            waiter.failure_reason = obj.failure_reason
+            waiter.fetchtime = obj.fetchtime
+            waiter.url = getattr(obj, 'url', None)
+            waiter.in_queue = False
+            waiter.in_flight = False
+            waiter.ready.set()
 
     def show_stats(self):
         while self.WORKING.is_set():
@@ -1549,14 +1570,18 @@ class ChunkGetter(Getter):
         kwargs['idx'] = self.localdata.idx
         kwargs['session'] = getattr(self.localdata, 'session', None) or requests
         result = obj.get(*args, **kwargs)
-        
+
         chunk_id = getattr(obj, 'chunk_id', None)
+        waiters = []
         if chunk_id:
             with self._queued_lock:
                 self._queued_chunk_ids.discard(chunk_id)
+                waiters = self._queued_chunk_waiters.pop(chunk_id, [])
                 if result:
                     bump('chunk_download_completed')
-        
+
+        self._complete_duplicate_waiters(obj, waiters)
+
         return result
 
 
