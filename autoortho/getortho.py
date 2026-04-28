@@ -832,8 +832,7 @@ _active_native_builds = 0
 _active_native_builds_lock = threading.Lock()
 
 # Track live (FUSE-requested) tile reads in progress.
-# When > 0, prefetching and background DDS building pause to give
-# all chunk download and tile building resources to live requests.
+# When > 0, prefetching pauses to give network resources to live requests.
 _live_reads_in_progress = 0
 _live_reads_lock = threading.Lock()
 
@@ -866,7 +865,7 @@ def _live_read_end():
 
 
 def is_live_building() -> bool:
-    """Return True if live read pressure is high enough to pause background builds."""
+    """Return True if live read pressure is high enough to pause prefetching."""
     with _live_reads_lock:
         return _live_reads_in_progress >= 6
 
@@ -3439,7 +3438,7 @@ class TileCompletionTracker:
 class BackgroundDDSBuilder:
     
     # Maximum queue depth (prevents unbounded memory growth)
-    MAX_QUEUE_SIZE = 100
+    MAX_QUEUE_SIZE = 500
     
     def __init__(self, dds_cache,
                  build_interval_sec: float = 0.5,
@@ -3577,11 +3576,6 @@ class BackgroundDDSBuilder:
 
             if self._stop_event.is_set():
                 break
-
-            # Yield all resources to live tile reads when X-Plane is active
-            if is_live_building():
-                bump('background_builder_skipped_live_gate')
-                continue
 
             # Fill all available worker slots
             with self._active_lock:
@@ -6789,9 +6783,9 @@ class Tile(object):
         radius_nm = max(1.0, min(80.0, radius_nm))
 
         try:
-            max_promotions = int(getattr(CFG.autoortho, 'partial_cache_promote_max_tiles', 160))
+            max_promotions = int(getattr(CFG.autoortho, 'partial_cache_promote_max_tiles', 500))
         except Exception:
-            max_promotions = 160
+            max_promotions = 500
         max_promotions = max(0, min(1000, max_promotions))
         if max_promotions <= 0:
             bump('partial_mm0_promote_cap_zero')
@@ -6824,7 +6818,7 @@ class Tile(object):
                 return False
         else:
             try:
-                startup_cap = int(getattr(CFG.autoortho, 'partial_cache_promote_startup_max_tiles', 96))
+                startup_cap = int(getattr(CFG.autoortho, 'partial_cache_promote_startup_max_tiles', 500))
             except Exception:
                 startup_cap = 96
             startup_cap = max(0, min(max_promotions, startup_cap))
