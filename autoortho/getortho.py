@@ -3072,7 +3072,12 @@ class SpatialPrefetcher:
             # Register tile with completion tracker for predictive DDS generation
             # This must happen AFTER creating all chunks so the tracker can count them
             if tile_completion_tracker is not None and submitted > 0:
-                tile_completion_tracker.start_tracking(tile, zoom, submitted_count=submitted)
+                tile_completion_tracker.start_tracking(tile, zoom)
+            elif total_submittable == 0 and background_dds_builder is not None:
+                # All chunks already in JPEG cache — no downloads needed.
+                # The completion tracker never fires in this path, so submit
+                # directly for DDS build or warm-cache tiles never get one.
+                background_dds_builder.submit(tile)
 
             complete = (total_submittable == 0) or (submitted == total_submittable)
             return submitted, complete
@@ -3164,9 +3169,9 @@ class TileCompletionTracker:
         # build_from_jpegs handles None entries for missing chunks; healing fills gaps later.
         self._build_threshold = 1.0  # Always require all chunks for quality
     
-    def start_tracking(self, tile, zoom: int, submitted_count: int = 0) -> None:
+    def start_tracking(self, tile, zoom: int) -> None:
         """
-        Begin tracking a tile's chunk completion for ALL mipmap levels.
+        Begin tracking a tile's native mipmap-0 chunk resolution.
 
         Called by SpatialPrefetcher when it starts prefetching a tile.
         If tile is already being tracked, this is a no-op.
@@ -3174,46 +3179,60 @@ class TileCompletionTracker:
         Args:
             tile: Tile object to track
             zoom: Max zoom level for this tile (tile.max_zoom)
-            submitted_count: Actual number of chunks submitted by _prefetch_tile().
-                             When > 0, used as the expected count (guarantees match).
-                             When 0, falls back to counting non-ready chunks.
         """
         if tile is None:
             return
 
         tile_id = tile.id
+        tile_to_callback = None
+
+        required_chunks = list(tile.chunks.get(tile.max_zoom, []))
+        if not required_chunks:
+            return
 
         with self._lock:
             # Already tracking this tile
             if tile_id in self._tracked_tiles:
                 return
 
-            if submitted_count > 0:
-                total_expected = submitted_count
-            else:
-                # Fallback: count non-ready chunks in tile.chunks
-                total_expected = 0
-                for mipmap in range(tile.max_mipmap + 1):
-                    mipmap_zoom = tile.max_zoom - mipmap
-                    if mipmap_zoom < tile.min_zoom:
-                        break
-                    for chunk in tile.chunks.get(mipmap_zoom, []):
-                        if not chunk.ready.is_set():
-                            total_expected += 1
-
+            total_expected = len(required_chunks)
             if total_expected == 0:
-                return  # Nothing to track
+                return
 
-            # Enforce max tracked limit (evict oldest if needed)
-            if len(self._tracked_tiles) >= self._max_tracked:
-                self._evict_oldest_unlocked()
+            # Credit chunks already satisfied from the JPEG disk cache so
+            # warm-cache tiles (zero downloads needed) still fire the callback.
+            completed_ids = {
+                chunk.chunk_id
+                for chunk in required_chunks
+                if chunk.ready.is_set()
+            }
 
-            self._tracked_tiles[tile_id] = _TrackedTile(tile, zoom, total_expected)
-            log.debug(f"TileCompletionTracker: Started tracking {tile_id} "
-                     f"(expecting {total_expected} chunks across all mipmaps)")
-            
+            if len(completed_ids) >= total_expected:
+                # All mm0 chunks already ready — fire callback immediately
+                tile_to_callback = tile
+            else:
+                # Enforce max tracked limit (evict oldest if needed)
+                if len(self._tracked_tiles) >= self._max_tracked:
+                    self._evict_oldest_unlocked()
+
+                tracked = _TrackedTile(tile, zoom, total_expected)
+                tracked.completed_chunk_ids = completed_ids
+                tracked.completed_chunks = len(completed_ids)
+                self._tracked_tiles[tile_id] = tracked
+                log.debug(f"TileCompletionTracker: Started tracking {tile_id} "
+                         f"(expecting {total_expected} native mm0 chunks, "
+                         f"{len(completed_ids)} already ready)")
+
             # Periodic cleanup of stale entries
             self._maybe_cleanup_unlocked()
+
+        if tile_to_callback is not None and self._on_tile_complete is not None:
+            try:
+                self._on_tile_complete(tile_id, tile_to_callback,
+                                       partial=False,
+                                       healing=False)
+            except Exception as e:
+                log.warning(f"TileCompletionTracker: Callback error for {tile_id}: {e}")
     
     def notify_chunk_ready(self, tile_id: str, chunk) -> None:
         """
@@ -4969,6 +4988,11 @@ class Chunk(object):
 
         if self.get_cache():
             self.ready.set()
+            try:
+                if tile_completion_tracker is not None and self.tile_id:
+                    tile_completion_tracker.notify_chunk_ready(self.tile_id, self)
+            except Exception:
+                pass
             return True
 
         _max_attempts = max_attempts or MAX_TOTAL_ATTEMPTS
