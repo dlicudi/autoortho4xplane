@@ -895,15 +895,6 @@ _native_build_semaphore = threading.Semaphore(1)
 _native_semaphore_waiters = 0  # threads currently waiting to acquire
 _native_semaphore_waiters_lock = threading.Lock()
 
-# Limits concurrent background prefetch builds to 1 through the full
-# NOTE: _background_decode_semaphore was removed. It was introduced to prevent
-# AOCOND_WAIT deadlock when the shared decode pool was exhausted. The deadlock
-# was fixed by using decode_pool=None (pure malloc) for streaming builders, so
-# the semaphore is no longer needed. It was also causing background streaming
-# builds to stall: the semaphore could be held for 130s+ (30s builder +
-# 45s phase2 + 30s native semaphore + 25s finalize), exceeding the 120s
-# worker timeout and silently killing all background DDS builds.
-
 class _NativeBuildBusy(Exception):
     """Raised by _native_build_context when semaphore can't be acquired within timeout."""
 
@@ -4981,6 +4972,7 @@ class Chunk(object):
         self.permanent_failure = False
         self.failure_reason = None
         self.retry_count = 0
+        self.invalid_jpeg_count = 0
 
         # Coalescing flags to prevent duplicate submissions
         self.in_queue = False
@@ -5338,14 +5330,14 @@ class Chunk(object):
                 self.data = data
             else:
                 bump('chunk_invalid_jpeg')
-                self.retry_count += 1
+                self.invalid_jpeg_count += 1
                 _max_jpeg_retries = 2
-                if self.retry_count <= _max_jpeg_retries:
+                if self.invalid_jpeg_count <= _max_jpeg_retries:
                     log.debug(f"Invalid JPEG for {self} (HTTP {resp.status_code} "
                               f"content-type={resp.headers.get('content-type', '?')} "
                               f"size={len(data) if data else 0}): retrying "
-                              f"({self.retry_count}/{_max_jpeg_retries})")
-                    time.sleep(1.0 * self.retry_count)  # 1s, 2s
+                              f"({self.invalid_jpeg_count}/{_max_jpeg_retries})")
+                    time.sleep(1.0 * self.invalid_jpeg_count)  # 1s, 2s
                     return False  # Return to worker queue for retry
                 log.debug(f"Invalid JPEG for {self} (HTTP {resp.status_code} "
                           f"content-type={resp.headers.get('content-type', '?')} "

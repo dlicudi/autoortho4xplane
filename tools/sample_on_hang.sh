@@ -4,7 +4,7 @@
 #
 # Usage: ./tools/sample_on_hang.sh
 
-LOG=/Users/duanelicudi/.autoortho-data/logs/autoortho.log
+LOG="${AUTOORTHO_LOG:-$HOME/.autoortho-data/logs/autoortho.log}"
 SAMPLE_OUT=/tmp/aoortho_hang_sample.txt
 SAMPLE_DURATION=10  # seconds of stack sampling
 

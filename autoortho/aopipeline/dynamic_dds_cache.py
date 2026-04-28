@@ -152,7 +152,7 @@ class DynamicDDSCache:
         if self._enabled:
             os.makedirs(self._dds_root, exist_ok=True)
             log.info(f"DynamicDDSCache initialized: {self._dds_root} "
-                     f"(max={max_size_mb}MB)")
+                     f"(max={max_size_mb}MB, compression={self._compression})")
 
     # ------------------------------------------------------------------
     # Path helpers
@@ -438,18 +438,20 @@ class DynamicDDSCache:
                 self._misses += 1
                 return None
 
-            # Healing detection: serve the cached DDS immediately, dispatch
-            # async healing for any missing or fallback chunks in the background.
+            # Incomplete tiles are cache misses: set healing flags so the caller
+            # knows why, dispatch background healing, then return None.
             missing_indices = meta.get("missing_indices", []) or []
             fallback_indices = meta.get("fallback_indices", []) or []
             if not self._mm0_cache_complete(meta):
                 tile._dds_needs_healing = True
                 tile._dds_missing_indices = missing_indices
                 tile._dds_fallback_indices = fallback_indices
-                log.debug(f"DDS cache: serving incomplete tile {tile_id} "
+                log.debug(f"DDS cache: incomplete tile {tile_id} is a cache miss "
                           f"({len(missing_indices)} missing, "
-                          f"{len(fallback_indices)} fallback chunks need healing)")
+                          f"{len(fallback_indices)} fallback chunks), healing dispatched")
                 self._dispatch_healing_for_incomplete(tile_id, max_zoom, tile)
+                self._misses += 1
+                return None
 
             # Read the DDS file (possibly compressed on disk)
             try:
@@ -738,8 +740,13 @@ class DynamicDDSCache:
 
             dds_format, compressor = self._get_format_and_compressor()
 
-            disk_bytes = dds_bytes
-            disk_compression = "none"
+            compressed = self._compress_dds(dds_bytes)
+            if len(compressed) < len(dds_bytes):
+                disk_bytes = compressed
+                disk_compression = self._compression
+            else:
+                disk_bytes = dds_bytes
+                disk_compression = "none"
 
             # Write DDS atomically
             tmp_dds = dds_path + f".tmp.{os.getpid()}"
@@ -859,11 +866,29 @@ class DynamicDDSCache:
                     f.seek(startpos)
                     f.write(data)
 
-            disk_compression = "none"
-            try:
-                disk_size = os.path.getsize(dds_path)
-            except OSError:
-                disk_size = total_size
+            # Compress only when all mipmaps are now populated — partial files
+            # must stay uncompressed so future calls can seek-and-patch them.
+            if (self._compression != "none" and _HAS_ZSTD
+                    and len(merged_populated) == mm_count):
+                with open(dds_path, "rb") as f:
+                    raw = f.read()
+                compressed = self._compress_dds(raw)
+                if len(compressed) < len(raw):
+                    tmp_dds = dds_path + f".tmp.{os.getpid()}"
+                    with open(tmp_dds, "wb") as f:
+                        f.write(compressed)
+                    os.replace(tmp_dds, dds_path)
+                    disk_compression = self._compression
+                    disk_size = len(compressed)
+                else:
+                    disk_compression = "none"
+                    disk_size = len(raw)
+            else:
+                disk_compression = "none"
+                try:
+                    disk_size = os.path.getsize(dds_path)
+                except OSError:
+                    disk_size = total_size
 
             # 4. Update DDM *after* data writes (crash-safe ordering)
             dds_format, compressor = self._get_format_and_compressor()
@@ -969,24 +994,38 @@ class DynamicDDSCache:
             # Atomic placement: create at a temp name, then os.replace().
             tmp_dds = dds_path + f".tmp.{os.getpid()}"
 
-            disk_compression = "none"
-            # Try hard-link first -- zero-copy, instant, works when source
-            # and destination are on the same filesystem.
-            linked = False
-            try:
+            if self._compression != "none" and _HAS_ZSTD:
+                # Read, compress, write — hard-link is incompatible with compression.
+                with open(source_path, "rb") as f:
+                    raw = f.read()
+                compressed = self._compress_dds(raw)
+                if len(compressed) < len(raw):
+                    disk_bytes = compressed
+                    disk_compression = self._compression
+                else:
+                    disk_bytes = raw
+                    disk_compression = "none"
+                with open(tmp_dds, "wb") as f:
+                    f.write(disk_bytes)
+                disk_size = len(disk_bytes)
+            else:
+                disk_compression = "none"
+                # Try hard-link first -- zero-copy, instant, works when source
+                # and destination are on the same filesystem.
+                linked = False
                 try:
-                    os.remove(tmp_dds)
+                    try:
+                        os.remove(tmp_dds)
+                    except OSError:
+                        pass
+                    os.link(source_path, tmp_dds)
+                    linked = True
                 except OSError:
                     pass
-                os.link(source_path, tmp_dds)
-                linked = True
-            except OSError:
-                pass
-
-            if not linked:
-                import shutil
-                shutil.copy2(source_path, tmp_dds)
-            disk_size = source_size
+                if not linked:
+                    import shutil
+                    shutil.copy2(source_path, tmp_dds)
+                disk_size = source_size
 
             os.replace(tmp_dds, dds_path)
 

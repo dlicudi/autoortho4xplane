@@ -27,19 +27,14 @@ class TimeBudget:
     WAIT_GRANULARITY_SEC = 0.05
     
     def __init__(self, max_seconds: float):
-        """
-        Initialize a time budget.
-        
-        Args:
-            max_seconds: Maximum wall-clock time allowed for this budget.
-        """
         self.max_seconds = max_seconds
         self.start_time = time.monotonic()
         self._exhausted = False
-    
+        self._chunks_processed = 0
+        self._chunks_skipped = 0
+
     @property
     def timeout(self) -> float:
-        """Alias for max_seconds for compatibility."""
         return self.max_seconds
 
     @property
@@ -114,26 +109,18 @@ class TimeBudget:
         return event.is_set()
 
     def record_chunk_processed(self):
-        """Record that a chunk was successfully processed."""
-        if not hasattr(self, '_chunks_processed'):
-            self._chunks_processed = 0
         self._chunks_processed += 1
-    
+
     def record_chunk_skipped(self):
-        """Record that a chunk was skipped due to budget exhaustion."""
-        if not hasattr(self, '_chunks_skipped'):
-            self._chunks_skipped = 0
         self._chunks_skipped += 1
-    
+
     @property
     def chunks_processed(self) -> int:
-        """Number of chunks successfully processed within budget."""
-        return getattr(self, '_chunks_processed', 0)
-    
+        return self._chunks_processed
+
     @property
     def chunks_skipped(self) -> int:
-        """Number of chunks skipped due to budget exhaustion."""
-        return getattr(self, '_chunks_skipped', 0)
+        return self._chunks_skipped
 
     def __repr__(self):
         return (f"TimeBudget(max={self.max_seconds:.2f}s, "
