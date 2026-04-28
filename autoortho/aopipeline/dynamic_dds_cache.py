@@ -435,23 +435,18 @@ class DynamicDDSCache:
                 self._misses += 1
                 return None
 
-            # Strict quality gate: do not serve prebuilt DDS files that still
-            # contain missing-color or lower-ZL fallback chunks.  Returning None
-            # lets the live path build a fresh tile instead of showing degraded
-            # predictive-cache output for the rest of the flight.
+            # Healing detection: serve the cached DDS immediately, dispatch
+            # async healing for any missing or fallback chunks in the background.
             missing_indices = meta.get("missing_indices", []) or []
             fallback_indices = meta.get("fallback_indices", []) or []
             if not self._mm0_cache_complete(meta):
                 tile._dds_needs_healing = True
                 tile._dds_missing_indices = missing_indices
                 tile._dds_fallback_indices = fallback_indices
-                log.debug(f"DDS cache: strict miss for incomplete tile {tile_id} "
+                log.debug(f"DDS cache: serving incomplete tile {tile_id} "
                           f"({len(missing_indices)} missing, "
-                          f"{len(fallback_indices)} fallback chunks)")
-
+                          f"{len(fallback_indices)} fallback chunks need healing)")
                 self._dispatch_healing_for_incomplete(tile_id, max_zoom, tile)
-                self._misses += 1
-                return None
 
             # Read the DDS file (possibly compressed on disk)
             try:
