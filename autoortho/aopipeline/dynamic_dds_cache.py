@@ -23,7 +23,11 @@ import time
 from collections import OrderedDict
 from typing import List, Optional, Tuple
 
-_HAS_ZSTD = False
+try:
+    import zstandard
+    _HAS_ZSTD = True
+except ImportError:
+    _HAS_ZSTD = False
 
 log = logging.getLogger(__name__)
 
@@ -140,8 +144,10 @@ class DynamicDDSCache:
         self._evictions = 0
         self._upgrades = 0
 
-        self._compression = "none"
-        self._compression_level = 0
+        self._compression, self._compression_level = self._get_compression_settings()
+        if self._compression == "zstd" and not _HAS_ZSTD:
+            log.warning("zstandard not installed - DDS cache compression disabled")
+            self._compression = "none"
 
         if self._enabled:
             os.makedirs(self._dds_root, exist_ok=True)
@@ -621,15 +627,36 @@ class DynamicDDSCache:
         compressor = CFG.pydds.compressor.upper()
         return dds_format, compressor
 
-    def _compress_dds(self, data: bytes) -> bytes:
-        """zstd compression disabled; returns data unchanged."""
-        return data
+    @staticmethod
+    def _get_compression_settings():
+        """Return (compression_type, level) from config."""
+        try:
+            from autoortho.aoconfig import CFG
+        except ImportError:
+            from aoconfig import CFG  # type: ignore[no-redef]
+        comp = getattr(CFG.pydds, 'dds_compression', 'zstd').lower()
+        if comp not in ('none', 'zstd'):
+            comp = 'zstd'
+        level = int(getattr(CFG.pydds, 'dds_compression_level', 3))
+        level = max(1, min(19, level))
+        return comp, level
 
-    def _decompress_dds(self, data: bytes, meta: dict | None) -> bytes:
-        """Decompress DDS bytes. Raises RuntimeError for legacy zstd files (triggers cache rebuild)."""
-        if (meta or {}).get("disk_compression", "none") == "zstd":
-            raise RuntimeError("zstd-compressed DDS cache requires zstandard library; cache will be rebuilt")
-        return data
+    def _compress_dds(self, data: bytes) -> bytes:
+        """Compress raw DDS bytes with zstd. Returns original data if compression disabled."""
+        if self._compression != "zstd" or not _HAS_ZSTD:
+            return data
+        cctx = zstandard.ZstdCompressor(level=self._compression_level)
+        return cctx.compress(data)
+
+    def _decompress_dds(self, data: bytes, meta: dict) -> bytes:
+        """Decompress DDS bytes based on DDM metadata. Returns data unchanged if uncompressed."""
+        disk_comp = meta.get("disk_compression", "none")
+        if disk_comp != "zstd":
+            return data
+        if not _HAS_ZSTD:
+            raise RuntimeError("Compressed DDS but zstandard not installed")
+        dctx = zstandard.ZstdDecompressor()
+        return dctx.decompress(data)
 
     def _create_dds_skeleton(self, dds_path: str, header_bytes: bytes,
                              total_size: int) -> bool:
