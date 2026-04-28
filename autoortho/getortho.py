@@ -6820,7 +6820,7 @@ class Tile(object):
             try:
                 startup_cap = int(getattr(CFG.autoortho, 'partial_cache_promote_startup_max_tiles', 500))
             except Exception:
-                startup_cap = 96
+                startup_cap = 500
             startup_cap = max(0, min(max_promotions, startup_cap))
             if startup_cap <= 0:
                 bump('partial_mm0_promote_no_position')
@@ -6852,11 +6852,11 @@ class Tile(object):
                 return False
 
             not_ready = [c for c in chunks if not c.ready.is_set()]
-            self._mm0_promotion_queued = True
 
             if not not_ready:
                 self._pin_mm0_promotion()
                 if background_dds_builder.submit(self, priority=-10):
+                    self._mm0_promotion_queued = True
                     bump('partial_mm0_promote_builder_ready')
                     log.info(
                         f"PARTIAL_MM0_PROMOTE: {self.id} queued DDS build "
@@ -6869,6 +6869,7 @@ class Tile(object):
                 self._clear_mm0_promotion_pin()
                 bump('partial_mm0_promote_builder_rejected')
                 return False
+            self._mm0_promotion_queued = True
 
             self._pin_mm0_promotion()
             tile_completion_tracker.start_tracking(self, self.max_zoom)

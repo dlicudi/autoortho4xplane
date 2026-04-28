@@ -1016,6 +1016,7 @@ class AutoOrtho(Operations):
                 # served but FUSE reported ZL17 size). Without padding X-Plane
                 # logs a truncation warning and renders stripes.
                 if len(data) < length:
+                    log.debug(f"DDS read padding: {path} got {len(data)} bytes, expected {length} — padding with zeros")
                     data = data + bytes(length - len(data))
                 return data
             except FuseOSError:

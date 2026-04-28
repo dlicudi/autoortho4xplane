@@ -852,7 +852,7 @@ class DynamicDDSCache:
 
             merged_populated = sorted(already_populated | set(new_mipmaps.keys()))
 
-            # Uncompressed path: seek-write in place (original behavior)
+            # Seek-write mipmap data in place into the pre-allocated skeleton file.
             if not os.path.isfile(dds_path):
                 self._create_dds_skeleton(dds_path, header_bytes, total_size)
 
