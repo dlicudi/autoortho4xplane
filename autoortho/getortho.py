@@ -901,6 +901,9 @@ class _native_build_context:
         global _active_native_builds
         with _active_native_builds_lock:
             _active_native_builds += 1
+            count = _active_native_builds
+        if count > 1:
+            log.debug(f"Concurrent native builds: {count} active")
         return self
 
     def __exit__(self, *exc):
