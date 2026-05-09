@@ -694,8 +694,7 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
             return None
         
         try:
-            threads = _compute_thread_budget()
-            with _native_build_context():
+            with _native_build_context() as threads:
                 result = native.build_from_jpegs_to_buffer(
                     buffer,
                     jpeg_datas,
@@ -867,8 +866,8 @@ def is_live_building() -> bool:
         return _live_reads_in_progress > 0
 
 
-def _compute_thread_budget() -> int:
-    """Compute per-build OpenMP thread count to avoid oversubscription.
+def _thread_budget_for(active: int) -> int:
+    """Per-build OpenMP thread count given the number of active builds (including self).
 
     Divides CPU cores across active concurrent builds so total threads ~ cpu_count.
     Returns at least 2 to ensure each build makes progress.
@@ -881,9 +880,7 @@ def _compute_thread_budget() -> int:
     except (ValueError, TypeError, AttributeError):
         pass
 
-    with _active_native_builds_lock:
-        active = max(1, _active_native_builds)
-    return max(2, CURRENT_CPU_COUNT // active)
+    return max(2, CURRENT_CPU_COUNT // max(1, active))
 
 
 class _BackgroundBuildDeferred(Exception):
@@ -891,15 +888,20 @@ class _BackgroundBuildDeferred(Exception):
 
 
 class _native_build_context:
-    """Track entry/exit of native DDS builds for thread budget coordination."""
+    """Track entry/exit of native DDS builds; ``__enter__`` returns the per-build thread budget.
+
+    The increment and budget computation share the same lock so a build always sees
+    itself in the active count — closing the race where a second build started while
+    a first was in flight and both asked for full-CPU thread counts.
+    """
     def __enter__(self):
         global _active_native_builds
         with _active_native_builds_lock:
             _active_native_builds += 1
-            count = _active_native_builds
-        if count > 1:
-            log.debug(f"Concurrent native builds: {count} active")
-        return self
+            active = _active_native_builds
+        if active > 1:
+            log.debug(f"Concurrent native builds: {active} active")
+        return _thread_budget_for(active)
 
     def __exit__(self, *exc):
         global _active_native_builds
@@ -3930,9 +3932,9 @@ class BackgroundDDSBuilder:
                 staging_path = self._dds_cache.get_staging_path(tile_id, tile.max_zoom, tile)
                 if not staging_path:
                     return False
-                with _native_build_context():
+                with _native_build_context() as threads:
                     success, bytes_written = builder.finalize_to_file(
-                        staging_path, max_threads=_compute_thread_budget()
+                        staging_path, max_threads=threads
                     )
                 
                 if success and bytes_written >= 128:
@@ -4080,13 +4082,13 @@ class BackgroundDDSBuilder:
                                     if not staging_path:
                                         return
                                     
-                                    with _native_build_context():
+                                    with _native_build_context() as threads:
                                         result = native_dds.build_from_jpegs_to_file(
                                             jpeg_datas,
                                             staging_path,
                                             format=dxt_format,
                                             missing_color=missing_color,
-                                            max_threads=_compute_thread_budget()
+                                            max_threads=threads
                                         )
 
                                     if result.success and result.bytes_written >= 128:
@@ -6198,13 +6200,13 @@ class Tile(object):
             # ═══════════════════════════════════════════════════════════════
             # STEP 4: Build DDS with native aopipeline
             # ═══════════════════════════════════════════════════════════════
-            with _native_build_context():
+            with _native_build_context() as threads:
                 result = native_dds.build_from_jpegs_to_buffer(
                     buffer,
                     jpeg_datas,
                     format=dxt_format,
                     missing_color=missing_color,
-                    max_threads=_compute_thread_budget()
+                    max_threads=threads
                 )
 
             if not result.success:
@@ -6528,8 +6530,8 @@ class Tile(object):
                 return False
             
             try:
-                with _native_build_context():
-                    result = builder.finalize(buffer, max_threads=_compute_thread_budget())
+                with _native_build_context() as threads:
+                    result = builder.finalize(buffer, max_threads=threads)
                 if result.success and result.bytes_written >= 128:
                     dds_bytes = bytes(buffer[:result.bytes_written])
                     if self._populate_dds_from_prebuilt(dds_bytes):
@@ -8871,7 +8873,7 @@ class Tile(object):
         
         try:
             native_build_start = time.monotonic()
-            threads = _compute_thread_budget()
+            threads = 0
             active = 0
 
             # Get compression format and missing color
@@ -8925,7 +8927,7 @@ class Tile(object):
                             jpeg_datas_per_zoom.append([])
                             chain_truncated = True
                 
-                with _native_build_context():
+                with _native_build_context() as threads:
                     with _active_native_builds_lock:
                         active = _active_native_builds
                     result = native_dds.build_all_mipmaps_native(
@@ -8935,7 +8937,7 @@ class Tile(object):
                         max_threads=threads
                     )
             elif hasattr(native_dds, 'build_mipmap_chain'):
-                with _native_build_context():
+                with _native_build_context() as threads:
                     with _active_native_builds_lock:
                         active = _active_native_builds
                     result = native_dds.build_mipmap_chain(
@@ -8946,7 +8948,7 @@ class Tile(object):
                         max_threads=threads
                     )
             else:
-                with _native_build_context():
+                with _native_build_context() as threads:
                     with _active_native_builds_lock:
                         active = _active_native_builds
                     result = native_dds.build_single_mipmap(
