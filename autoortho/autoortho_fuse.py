@@ -344,6 +344,13 @@ class AutoOrtho(Operations):
         # Used when time exclusion redirects DSF reads to global scenery
         self._redirected_dsf_fhs = {}
 
+        # Track disk-passthrough DDS file handles.
+        # When a DDS tile is already complete in the persistent disk cache we
+        # open the real .dds file and return an OS fd instead of going through
+        # TileCacher.  Reads on these fds are handled by the normal passthrough
+        # path (os.lseek + os.read) without touching Python memory at all.
+        self._disk_dds_fhs: set = set()
+
         self.use_ns = kwargs.get("use_ns", False)
         
         # Initialize time exclusion manager with dataref tracker
@@ -663,6 +670,33 @@ class AutoOrtho(Operations):
         self._size_cache[key] = size
         self._size_cache.move_to_end(key)
 
+    def _get_disk_dds_path(self, row: int, col: int, maptype: str, zoom: int):
+        """Return path to a complete on-disk DDS if one exists, else None.
+
+        Checks the persistent DDS cache using zoom as both tilename_zoom and
+        max_zoom (correct for non-dynamic-zoom tiles; misses are safe — we
+        fall back to the in-memory TileCacher path).
+        """
+        dds_cache = getortho.dynamic_dds_cache
+        if dds_cache is None or not dds_cache._enabled:
+            return None
+        try:
+            from autoortho.utils.cache_paths import get_dds_cache_path
+        except ImportError:
+            from utils.cache_paths import get_dds_cache_path
+        try:
+            dds_path = get_dds_cache_path(
+                dds_cache._cache_dir, row, col, maptype, zoom, zoom
+            ) + ".dds"
+            if not os.path.exists(dds_path):
+                return None
+            # Reject obviously partial files (< 128 KB)
+            if os.path.getsize(dds_path) < 131072:
+                return None
+            return dds_path
+        except Exception:
+            return None
+
     def _getattr_dds(self, path, match, now):
         """Get attributes for virtual DDS files."""
         self._ensure_flighttrack_started(reason_path=path)
@@ -937,6 +971,23 @@ class AutoOrtho(Operations):
             if maptype != "BI":
                 getortho.register_discovered_maptype(maptype)
 
+            # --- Disk-passthrough fast path ---
+            # If a complete DDS already exists on disk, open it as a real file.
+            # XP reads the bytes via the normal passthrough path (os.lseek/os.read)
+            # with no Python tile object in memory — same as Ortho4XP behaviour.
+            disk_path = self._get_disk_dds_path(row, col, maptype, zoom)
+            if disk_path is not None:
+                try:
+                    fh = os.open(disk_path, flags | os.O_RDONLY) if system_type != 'windows' else os.open(disk_path, flags | os.O_RDONLY | os.O_BINARY)
+                    self._disk_dds_fhs.add(fh)
+                    self._set_dds_size_cached(row, col, maptype, zoom, os.path.getsize(disk_path))
+                    log.debug(f"OPEN: DDS disk-passthrough: {path} -> {disk_path}")
+                    getortho.bump('dds_disk_passthrough_open')
+                    return fh
+                except OSError as e:
+                    log.debug(f"OPEN: disk-passthrough failed for {disk_path}: {e}, falling back to TileCacher")
+            # --- End disk-passthrough fast path ---
+
             t = self.tc._open_tile(row, col, maptype, zoom)
             try:
                 self._set_dds_size_cached(row, col, maptype, zoom, t.dds.total_size)
@@ -963,6 +1014,14 @@ class AutoOrtho(Operations):
     #@lru_cache
     def read(self, path, length, offset, fh):
         log.debug(f"READ: {path} {offset} {length} {fh}")
+        # Disk-passthrough DDS fds fall through to the regular passthrough below
+        if fh in self._disk_dds_fhs:
+            with self.fh_locks.setdefault(fh, threading.Lock()):
+                os.lseek(fh, offset, os.SEEK_SET)
+                try:
+                    return os.read(fh, length)
+                except OSError as e:
+                    raise FuseOSError(e.errno)
         m = self.dds_re.match(path)
         if m:
             row, col, maptype, zoom = m.groups()
@@ -1088,6 +1147,14 @@ class AutoOrtho(Operations):
         
         dds_match = self.dds_re.match(path)
         if dds_match:
+            if fh in self._disk_dds_fhs:
+                self._disk_dds_fhs.discard(fh)
+                self.fh_locks.pop(fh, None)
+                try:
+                    os.close(fh)
+                except OSError:
+                    pass
+                return 0
             row, col, maptype, zoom = dds_match.groups()
             row = int(row)
             col = int(col)
