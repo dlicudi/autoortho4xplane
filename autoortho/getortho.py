@@ -1097,6 +1097,28 @@ def _is_jpeg(dataheader):
         return False
 
 
+def _dds_is_uniform(path, sample_bytes=4096, max_unique=3):
+    """Return True if a DDS file's mipmap 0 data is near-uniform (all missing_color).
+
+    Samples the first `sample_bytes` of mipmap 0 and counts distinct DXT1 color0
+    values.  A real-world tile has hundreds of unique colours; an all-missing_color
+    tile has at most 2-3 due to DXT1 encoding of a single solid colour.
+    """
+    import struct as _struct
+    try:
+        with open(path, 'rb') as fh:
+            if fh.read(4) != b'DDS ':
+                return False
+            fh.seek(128)  # skip DDS header
+            data = fh.read(sample_bytes)
+        if len(data) < 8:
+            return False
+        colors = {_struct.unpack_from('<H', data, i * 8)[0] for i in range(len(data) // 8)}
+        return len(colors) <= max_unique
+    except OSError:
+        return False
+
+
 def _gtile_to_quadkey(til_x, til_y, zoomlevel):
     """
     Translates Google coding of tiles to Bing Quadkey coding. 
@@ -7315,14 +7337,15 @@ class Tile(object):
         # Falls back to Python path if native build fails or is unavailable.
         if mipmap == 0:
             native_dds = _get_native_dds()
-            if (native_dds is not None and 
+            if (native_dds is not None and
                 hasattr(native_dds, 'build_partial_mipmap') and
                 self._try_native_partial_mipmap_build(
                     mipmap, startrow, endrow, bytes_per_chunk_row, time_budget)):
                 # Native build succeeded - data written directly to DDS buffer
                 # (ready.set() already called inside _try_native_partial_mipmap_build)
                 return True
-        
+            bump('partial_build_python_fallback')
+
         # ═══════════════════════════════════════════════════════════════════
         # PYTHON FALLBACK PATH
         # ═══════════════════════════════════════════════════════════════════
@@ -7331,6 +7354,10 @@ class Tile(object):
                 maxwait=self.get_maxwait(), time_budget=time_budget)
         if not new_im:
             log.debug("No updates, so no image generated")
+            if mipmap == 0:
+                bump('partial_build_python_fallback_none_mm0')
+            else:
+                bump('partial_build_python_fallback_none')
             return True
 
         # If tile is being closed concurrently, avoid touching DDS
@@ -10482,6 +10509,14 @@ class TileCacher(object):
             tmp_path = pt_path + f'.tmp.{os.getpid()}'
             os.makedirs(os.path.dirname(pt_path), exist_ok=True)
             t.dds.write(tmp_path)
+
+            # Reject near-uniform tiles (all missing_color) before caching
+            if _dds_is_uniform(tmp_path):
+                os.unlink(tmp_path)
+                bump('dds_passthrough_live_save_rejected_uniform')
+                log.warning(f"Rejected uniform (missing_color) tile {t.id} from passthrough cache")
+                return
+
             os.replace(tmp_path, pt_path)
             bump('dds_passthrough_live_save')
             log.debug(f"Saved live-built tile {t.id} to passthrough cache")

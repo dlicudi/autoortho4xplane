@@ -755,6 +755,12 @@ class AutoOrtho(Operations):
             os.makedirs(os.path.dirname(pt_path), exist_ok=True)
             with open(tmp_path, 'wb') as _f:
                 _f.write(dds_bytes)
+            if getortho._dds_is_uniform(tmp_path):
+                os.unlink(tmp_path)
+                log.warning(f"DDS passthrough: rejected uniform (missing_color) tile "
+                            f"{os.path.basename(compressed_path)}")
+                getortho.bump('dds_passthrough_decompress_rejected_uniform')
+                return None
             os.replace(tmp_path, pt_path)
             log.debug(f"DDS passthrough: decompressed {os.path.basename(compressed_path)} "
                       f"-> {len(dds_bytes)//1024}KB")
