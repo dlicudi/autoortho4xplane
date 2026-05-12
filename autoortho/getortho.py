@@ -7949,9 +7949,12 @@ class Tile(object):
 
                 chunk_img = None
                 is_permanent_failure = chunk.permanent_failure
+                # Chunk returned empty data (e.g. Bing "no imagery" PNG) — always
+                # cascade to a lower zoom level regardless of budget state.
+                is_empty_data = chunk.ready.is_set() and not chunk.data
 
                 # Budget exhaustion: attempt local fallbacks only (fast, sub-ms)
-                budget_exhausted_at_entry = time_budget.exhausted
+                budget_exhausted_at_entry = time_budget.exhausted and not is_empty_data
                 if budget_exhausted_at_entry:
                     bump('chunk_budget_exhausted_local_fallback')
 
@@ -10535,12 +10538,24 @@ class TileCacher(object):
                 log.warning(f"Attmpted to close unknown tile {tile_id}!")
                 return False
             t.refs -= 1
-            if t.refs <= 0:
-                log.debug(f"No more refs for {tile_id} closing...")
-                t = self.tiles.pop(tile_id)
-            else:
+            if t.refs > 0:
                 log.debug(f"Still have {t.refs} refs for {tile_id}")
                 return True
+            # refs == 0: only evict if mipmap 0 is fully built.
+            # Incomplete tiles stay in self.tiles so background chunk downloads
+            # can finish before the next open — prevents repeated cold rebuilds
+            # that produce missing_color (green) tiles.
+            mm_retrieved = (
+                t.dds is not None and
+                bool(t.dds.mipmap_list) and
+                t.dds.mipmap_list[0].retrieved
+            )
+            if not mm_retrieved:
+                log.debug(f"Tile {tile_id} refs=0 but mipmap 0 not retrieved, keeping in memory")
+                bump('tile_kept_incomplete')
+                return True
+            log.debug(f"No more refs for {tile_id} closing...")
+            t = self.tiles.pop(tile_id)
 
         # Outside lock: save to passthrough then free tile memory
         self._save_tile_to_passthrough(t)
