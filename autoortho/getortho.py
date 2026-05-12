@@ -4990,6 +4990,16 @@ def stop_predictive_dds() -> None:
         except Exception:
             pass
     
+    # Log disk passthrough stats on shutdown
+    try:
+        passthrough_count = get_stat('dds_disk_passthrough_open') or 0
+        decompress_count = get_stat('dds_passthrough_decompress') or 0
+        if passthrough_count > 0 or decompress_count > 0:
+            log.info(f"DDS disk passthrough: {passthrough_count} tiles served from disk "
+                     f"({decompress_count} decompressed this session)")
+    except Exception:
+        pass
+
     # Log disk budget stats on shutdown
     if disk_budget_manager is not None:
         try:
@@ -10442,6 +10452,42 @@ class TileCacher(object):
         return tile
 
     
+    def _save_tile_to_passthrough(self, t):
+        """Write a fully-built tile's DDS to the passthrough cache directory."""
+        try:
+            if dynamic_dds_cache is None or not dynamic_dds_cache._enabled:
+                return
+            if t.dds is None:
+                return
+            mm_list = t.dds.mipmap_list
+            if not mm_list or not mm_list[0].retrieved:
+                return
+            try:
+                from autoortho.utils.cache_paths import get_dds_cache_path
+            except ImportError:
+                from utils.cache_paths import get_dds_cache_path
+            passthrough_root = os.path.join(dynamic_dds_cache._cache_dir, "dds_passthrough")
+            base = get_dds_cache_path(
+                dynamic_dds_cache._cache_dir, t.row, t.col, t.maptype,
+                t.tilename_zoom, t.max_zoom
+            )
+            rel = os.path.relpath(base + ".dds", dynamic_dds_cache._dds_root)
+            pt_path = os.path.join(passthrough_root, rel)
+            if os.path.exists(pt_path):
+                return
+            tmp_path = pt_path + f'.tmp.{os.getpid()}'
+            os.makedirs(os.path.dirname(pt_path), exist_ok=True)
+            t.dds.write(tmp_path)
+            os.replace(tmp_path, pt_path)
+            bump('dds_passthrough_live_save')
+            log.debug(f"Saved live-built tile {t.id} to passthrough cache")
+        except Exception as e:
+            log.debug(f"Failed to save tile to passthrough: {e}")
+            try:
+                os.unlink(pt_path + f'.tmp.{os.getpid()}')
+            except OSError:
+                pass
+
     def _close_tile(self, row, col, map_type, zoom):
         tile_id = self._to_tile_id(row, col, map_type, zoom)
         with self.tc_lock:
@@ -10449,22 +10495,17 @@ class TileCacher(object):
             if not t:
                 log.warning(f"Attmpted to close unknown tile {tile_id}!")
                 return False
-
             t.refs -= 1
-
-            if self.enable_cache: # and not t.should_close():
-                log.debug(f"Cache enabled.  Delay tile close for {tile_id}")
-                return True
-
             if t.refs <= 0:
                 log.debug(f"No more refs for {tile_id} closing...")
                 t = self.tiles.pop(tile_id)
-                t.close()
-                t = None
-                del(t)
             else:
                 log.debug(f"Still have {t.refs} refs for {tile_id}")
+                return True
 
+        # Outside lock: save to passthrough then free tile memory
+        self._save_tile_to_passthrough(t)
+        t.close()
         return True
     
     def is_tile_opened_by_xplane(self, row: int, col: int, map_type: str, zoom: int) -> bool:

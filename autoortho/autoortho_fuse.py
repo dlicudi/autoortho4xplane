@@ -671,11 +671,12 @@ class AutoOrtho(Operations):
         self._size_cache.move_to_end(key)
 
     def _get_disk_dds_path(self, row: int, col: int, maptype: str, zoom: int):
-        """Return path to a complete on-disk DDS if one exists, else None.
+        """Return path to a ready-to-serve uncompressed DDS if one exists, else None.
 
-        The FUSE filename zoom is the tilename_zoom; max_zoom (used in the
-        disk filename) may be equal or up to 2 levels higher due to dynamic
-        zoom.  Try each in order and return the first complete file found.
+        Checks the passthrough cache first (uncompressed DDS written on prior
+        decompress).  If only a zstd-compressed entry exists, decompresses it
+        now and writes the result to the passthrough cache so future opens are
+        instant.  Falls through to TileCacher if nothing usable is found.
         """
         dds_cache = getortho.dynamic_dds_cache
         if dds_cache is None or not dds_cache._enabled:
@@ -685,14 +686,86 @@ class AutoOrtho(Operations):
         except ImportError:
             from utils.cache_paths import get_dds_cache_path
         try:
+            passthrough_root = os.path.join(dds_cache._cache_dir, "dds_passthrough")
             for max_zoom in (zoom, zoom + 1, zoom + 2):
-                dds_path = get_dds_cache_path(
+                base = get_dds_cache_path(
                     dds_cache._cache_dir, row, col, maptype, zoom, max_zoom
-                ) + ".dds"
-                if os.path.exists(dds_path) and os.path.getsize(dds_path) >= 131072:
-                    return dds_path
+                )
+                compressed_path = base + ".dds"
+                ddm_path = base + ".ddm"
+
+                # Derive the passthrough path: same relative structure under dds_passthrough/
+                rel = os.path.relpath(compressed_path, dds_cache._dds_root)
+                pt_path = os.path.join(passthrough_root, rel)
+
+                # 1. Already-decompressed passthrough copy — instant serve
+                if os.path.exists(pt_path) and os.path.getsize(pt_path) >= 131072:
+                    return pt_path
+
+                # 2. Compressed source must exist and be non-trivial
+                if not (os.path.exists(compressed_path) and
+                        os.path.getsize(compressed_path) >= 131072):
+                    continue
+
+                # 3. Check magic to determine format
+                try:
+                    with open(compressed_path, 'rb') as _f:
+                        magic = _f.read(4)
+                except OSError:
+                    continue
+
+                if magic == b'DDS ':
+                    # Stored uncompressed — serve directly
+                    return compressed_path
+
+                if magic != b'\x28\xb5\x2f\xfd':
+                    # Unknown format
+                    continue
+
+                # 4. zstd-compressed — confirm via DDM then decompress
+                try:
+                    import json as _json
+                    with open(ddm_path, 'r', encoding='utf-8') as _f:
+                        _meta = _json.load(_f)
+                    if _meta.get('disk_compression') != 'zstd':
+                        continue
+                except Exception:
+                    continue
+
+                result = self._decompress_to_passthrough(compressed_path, pt_path)
+                if result is not None:
+                    return result
             return None
         except Exception:
+            return None
+
+    def _decompress_to_passthrough(self, compressed_path: str, pt_path: str):
+        """Decompress a zstd DDS to the passthrough cache; return pt_path on success."""
+        try:
+            import zstandard as _zstd
+        except ImportError:
+            return None
+        tmp_path = pt_path + f'.tmp.{os.getpid()}'
+        try:
+            with open(compressed_path, 'rb') as _f:
+                raw = _f.read()
+            dds_bytes = _zstd.ZstdDecompressor().decompress(raw)
+            if dds_bytes[:4] != b'DDS ':
+                return None
+            os.makedirs(os.path.dirname(pt_path), exist_ok=True)
+            with open(tmp_path, 'wb') as _f:
+                _f.write(dds_bytes)
+            os.replace(tmp_path, pt_path)
+            log.debug(f"DDS passthrough: decompressed {os.path.basename(compressed_path)} "
+                      f"-> {len(dds_bytes)//1024}KB")
+            getortho.bump('dds_passthrough_decompress')
+            return pt_path
+        except Exception as e:
+            log.debug(f"DDS passthrough: decompression failed for {compressed_path}: {e}")
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
             return None
 
     def _getattr_dds(self, path, match, now):
