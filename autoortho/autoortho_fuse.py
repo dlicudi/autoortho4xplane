@@ -673,9 +673,9 @@ class AutoOrtho(Operations):
     def _get_disk_dds_path(self, row: int, col: int, maptype: str, zoom: int):
         """Return path to a complete on-disk DDS if one exists, else None.
 
-        Checks the persistent DDS cache using zoom as both tilename_zoom and
-        max_zoom (correct for non-dynamic-zoom tiles; misses are safe — we
-        fall back to the in-memory TileCacher path).
+        The FUSE filename zoom is the tilename_zoom; max_zoom (used in the
+        disk filename) may be equal or up to 2 levels higher due to dynamic
+        zoom.  Try each in order and return the first complete file found.
         """
         dds_cache = getortho.dynamic_dds_cache
         if dds_cache is None or not dds_cache._enabled:
@@ -685,15 +685,13 @@ class AutoOrtho(Operations):
         except ImportError:
             from utils.cache_paths import get_dds_cache_path
         try:
-            dds_path = get_dds_cache_path(
-                dds_cache._cache_dir, row, col, maptype, zoom, zoom
-            ) + ".dds"
-            if not os.path.exists(dds_path):
-                return None
-            # Reject obviously partial files (< 128 KB)
-            if os.path.getsize(dds_path) < 131072:
-                return None
-            return dds_path
+            for max_zoom in (zoom, zoom + 1, zoom + 2):
+                dds_path = get_dds_cache_path(
+                    dds_cache._cache_dir, row, col, maptype, zoom, max_zoom
+                ) + ".dds"
+                if os.path.exists(dds_path) and os.path.getsize(dds_path) >= 131072:
+                    return dds_path
+            return None
         except Exception:
             return None
 
