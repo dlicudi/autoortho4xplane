@@ -725,7 +725,7 @@ class AutoOrtho(Operations):
 
         try:
             passthrough_root = os.path.join(dds_cache._cache_dir, "dds_passthrough")
-            for max_zoom in (zoom, zoom + 1, zoom + 2):
+            for max_zoom in (zoom,):
                 base = get_dds_cache_path(
                     dds_cache._cache_dir, row, col, maptype, zoom, max_zoom
                 )
