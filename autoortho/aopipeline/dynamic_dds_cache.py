@@ -706,6 +706,24 @@ class DynamicDDSCache:
             if i >= len(chunks) or not getattr(chunks[i], 'permanent_failure', False)
         ]
 
+    def _invalidate_passthrough(self, dds_path: str) -> None:
+        """Delete the passthrough copy of a DDS file so the next open recreates it.
+
+        Called after store() or store_incremental() rewrites the DDS, ensuring
+        that X-Plane gets the updated (now complete) mipmap chain on the next
+        open rather than an older partial version from the passthrough cache.
+        """
+        try:
+            passthrough_root = os.path.join(self._cache_dir, "dds_passthrough")
+            rel = os.path.relpath(dds_path, self._dds_root)
+            pt_path = os.path.join(passthrough_root, rel)
+            if os.path.exists(pt_path):
+                os.unlink(pt_path)
+                log.debug(f"DDS passthrough: invalidated stale passthrough "
+                          f"{os.path.basename(pt_path)}")
+        except OSError:
+            pass
+
     def store(self, tile_id: str, max_zoom: int, dds_bytes: bytes,
               tile,
               mm0_missing_indices: Optional[List[int]] = None,
@@ -767,6 +785,11 @@ class DynamicDDSCache:
                                    mm0_fallback_indices=mm0_fallback_indices,
                                    disk_compression=disk_compression)
             self._write_ddm(ddm_path, meta)
+
+            # Invalidate any stale passthrough — the DDS was just (re)written so
+            # any passthrough built from a prior partial incremental state is now
+            # outdated. The next open() will create a fresh passthrough.
+            self._invalidate_passthrough(dds_path)
 
             # Update LRU tracking (use on-disk size for accurate budget)
             key = self._tile_key(tile_id, max_zoom)
@@ -944,6 +967,12 @@ class DynamicDDSCache:
                 self._entries.move_to_end(key)
                 self._current_size += disk_size
                 self._stores += 1
+
+            # When all mipmaps are now populated, invalidate any stale passthrough
+            # so the next open() picks up the complete DDS rather than serving the
+            # old partial version with zero-filled mip levels.
+            if mm_count > 0 and all(i in set(merged_populated) for i in range(mm_count)):
+                self._invalidate_passthrough(dds_path)
 
             log.debug(f"DDS cache STORE_INCR: {tile_id} z{max_zoom} "
                       f"mipmaps={sorted(new_mipmaps.keys())} "
@@ -1568,6 +1597,273 @@ class DynamicDDSCache:
                      f"saved {saved_bytes / (1024*1024):.1f}MB in {elapsed:.0f}ms")
 
         return migrated
+
+    def scan_passthrough(self) -> int:
+        """Scan the passthrough cache directory for incomplete DDS files and delete them.
+
+        An incomplete passthrough file is one whose DDM reports that not every mipmap
+        in the chain is populated (i.e. ``populated_mipmaps`` does not cover 0..mm-1).
+        Such files are written from partial incremental builds and cause X-Plane to
+        render fallback (green) terrain at distance while close-up looks correct —
+        the low-detail mip levels are zero-filled BC1 blocks.
+
+        Also deletes passthrough files with no corresponding DDM (orphans from old
+        sessions), and files whose trailing bytes are all zero (content check for
+        zero-filled mipmaps, regardless of what the DDM says).
+
+        Called once at startup in the same background thread as scan_existing().
+
+        Returns:
+            Number of bad passthrough files deleted.
+        """
+        if not self._enabled:
+            return 0
+
+        passthrough_root = os.path.join(self._cache_dir, "dds_passthrough")
+        if not os.path.isdir(passthrough_root):
+            return 0
+
+        deleted = 0
+        checked = 0
+        start = time.monotonic()
+
+        def _all_mipmaps_populated(meta):
+            if meta is None:
+                return False  # no DDM → treat as bad (passthrough should always have one)
+            if 'populated_mipmaps' not in meta:
+                return True   # pre-DDM / v2: no incremental builds, assume OK
+            mm_count = meta.get('mm', 0)
+            if mm_count == 0:
+                return True
+            populated = set(meta['populated_mipmaps'])
+            if not all(i in populated for i in range(mm_count)):
+                return False
+            # Reject tiles with missing/fallback chunks — mirrors DynamicDDSCache.load()
+            # and the passthrough guard in _get_disk_dds_path.
+            if meta.get('needs_healing') or meta.get('missing_indices') or meta.get('fallback_indices'):
+                return False
+            return True
+
+        def _dds_header_size(pt_path):
+            """Return expected file size from the DDS header, or 0 on error.
+
+            Reads width, height, mipmap count, and FourCC from the 128-byte
+            DDS header to compute the expected total file size.  If the
+            actual file is smaller than this, the file is truncated.
+            """
+            try:
+                with open(pt_path, 'rb') as f:
+                    hdr = f.read(128)
+                if len(hdr) < 128 or hdr[:4] != b'DDS ':
+                    return 0
+                import struct
+                height = struct.unpack_from('<I', hdr, 12)[0]
+                width = struct.unpack_from('<I', hdr, 16)[0]
+                mm_count = struct.unpack_from('<I', hdr, 28)[0]
+                fourcc = hdr[84:88]
+                if fourcc == b'DXT1':
+                    blocksize = 8
+                elif fourcc in (b'DXT5', b'ATI2', b'BC5S', b'BC5U'):
+                    blocksize = 16
+                else:
+                    return 0  # unknown format, skip check
+                if width == 0 or height == 0 or mm_count == 0:
+                    return 0
+                total = 128
+                w, h = width, height
+                for _ in range(mm_count):
+                    total += max(1, (w * h >> 4)) * blocksize
+                    w >>= 1
+                    h >>= 1
+                return total
+            except OSError:
+                return 0
+
+        def _last_mipmap_is_zero(pt_path):
+            """Return True if the last 32 bytes of the DDS are all zero (unpopulated mip)."""
+            try:
+                size = os.path.getsize(pt_path)
+                if size < 160:  # header (128) + at least one 8-byte BC1 block
+                    return True
+                with open(pt_path, 'rb') as f:
+                    f.seek(-32, os.SEEK_END)
+                    tail = f.read(32)
+                return tail == b'\x00' * 32
+            except OSError:
+                return False
+
+        def _mip1_is_uniform_missing_color(pt_path, sample_blocks=64, tol=20):
+            """Return True if mip1 of an uncompressed DDS is entirely missing_color.
+
+            Reads ``sample_blocks`` BC1 blocks from mip1 and checks whether
+            their color0 entries all fall within ``tol`` of missing_color (66,77,55).
+            A real satellite image has far more colour spread; this only fires when
+            the lower-zoom chunks were unavailable at build time and the mipmap was
+            filled with the missing_color sentinel.
+            """
+            MISSING_R, MISSING_G, MISSING_B = 66, 77, 55
+            try:
+                import struct as _struct
+                with open(pt_path, 'rb') as f:
+                    hdr = f.read(128)
+                if len(hdr) < 128 or hdr[:4] != b'DDS ':
+                    return False
+                width  = _struct.unpack_from('<I', hdr, 16)[0]
+                height = _struct.unpack_from('<I', hdr, 12)[0]
+                fourcc = hdr[84:88]
+                bs = 16 if fourcc in (b'DXT5', b'ATI2') else 8
+                if width == 0 or height == 0:
+                    return False
+                bw = max(1, (width  + 3) // 4)
+                bh = max(1, (height + 3) // 4)
+                mip0_bytes = bw * bh * bs
+                with open(pt_path, 'rb') as f:
+                    f.seek(128 + mip0_bytes)
+                    data = f.read(sample_blocks * bs)
+                if len(data) < bs:
+                    return False
+                total = len(data) // bs
+                near = 0
+                for i in range(total):
+                    c0 = _struct.unpack_from('<H', data, i * bs)[0]
+                    r = ((c0 >> 11) & 0x1F) * 255 // 31
+                    g = ((c0 >>  5) & 0x3F) * 255 // 63
+                    b = (c0 & 0x1F) * 255 // 31
+                    if (abs(r - MISSING_R) <= tol and
+                            abs(g - MISSING_G) <= tol and
+                            abs(b - MISSING_B) <= tol):
+                        near += 1
+                return near >= total * 0.9
+            except OSError:
+                return False
+
+        try:
+            for dirpath, _dirnames, filenames in os.walk(passthrough_root):
+                for fname in filenames:
+                    if not fname.endswith(".dds"):
+                        continue
+
+                    pt_path = os.path.join(dirpath, fname)
+                    checked += 1
+
+                    # Derive the corresponding DDM path in dds_cache/
+                    rel = os.path.relpath(pt_path, passthrough_root)
+                    ddm_path = os.path.join(self._dds_root, rel[:-4] + ".ddm")
+
+                    meta = self._read_ddm(ddm_path)
+                    bad = False
+                    reason = ""
+
+                    if meta is None:
+                        bad = True
+                        reason = "no DDM (orphan)"
+                    elif not _all_mipmaps_populated(meta):
+                        bad = True
+                        populated = sorted(meta.get('populated_mipmaps', []))
+                        mm_count = meta.get('mm', '?')
+                        missing_n = len(meta.get('missing_indices') or [])
+                        fallback_n = len(meta.get('fallback_indices') or [])
+                        if missing_n or fallback_n:
+                            reason = (f"has missing/fallback chunks "
+                                      f"(missing={missing_n}, fallback={fallback_n})")
+                        else:
+                            reason = f"incomplete mipmaps (populated={populated}, mm={mm_count})"
+                    else:
+                        # Format check: if config changed (BC1↔BC3), old passthrough is wrong
+                        current_fmt, _ = self._get_format_and_compressor()
+                        cached_fmt = meta.get('fmt', '')
+                        if cached_fmt and cached_fmt != current_fmt:
+                            bad = True
+                            reason = (f"format mismatch "
+                                      f"(cached={cached_fmt}, current={current_fmt})")
+
+                        # Size check: passthrough must match its declared DDM dimensions.
+                        # A wrong-zoom or wrong-format file causes X-Plane to see a
+                        # truncated texture (getattr-reported size > actual file size).
+                        if not bad:
+                            w = meta.get('w', 0)
+                            h = meta.get('h', 0)
+                            fmt = meta.get('fmt', 'BC1')
+                            if w > 0 and h > 0:
+                                blocksize = 16 if fmt == 'BC3' else 8
+                                expected = 128  # DDS header
+                                cw, ch = w, h
+                                while cw >= 1 and ch >= 1:
+                                    expected += max(1, (cw * ch >> 4)) * blocksize
+                                    cw >>= 1
+                                    ch >>= 1
+                                try:
+                                    actual = os.path.getsize(pt_path)
+                                    if actual != expected:
+                                        bad = True
+                                        reason = (f"size mismatch "
+                                                  f"(actual={actual}, "
+                                                  f"expected from DDM={expected})")
+                                except OSError:
+                                    pass
+
+                    # Header-based truncation check: read the DDS header and
+                    # compute the expected file size from width/height/mipmap count.
+                    # This catches files whose header declares a larger size than
+                    # the actual file (e.g. partial writes from an old ZL-upgrade
+                    # that left a truncated BC1 file with a BC3 mipmap count).
+                    if not bad:
+                        hdr_expected = _dds_header_size(pt_path)
+                        if hdr_expected > 0:
+                            try:
+                                actual = os.path.getsize(pt_path)
+                                if actual != hdr_expected:
+                                    bad = True
+                                    reason = (f"truncated (header expects {hdr_expected}, "
+                                              f"actual {actual})")
+                            except OSError:
+                                pass
+
+                    if not bad and _last_mipmap_is_zero(pt_path):
+                        bad = True
+                        reason = "last mipmap bytes are zero (content check)"
+
+                    # Detect tiles where mm0 is real imagery but mip1+ are
+                    # entirely missing_color — this happens when BackgroundDDS-
+                    # Builder couldn't download the lower-zoom chunks and the DDM
+                    # reports the tile as fully complete (DDM only tracks mm0).
+                    if not bad and _mip1_is_uniform_missing_color(pt_path):
+                        bad = True
+                        reason = "mip1 entirely missing_color (lower-zoom chunks unavailable at build time)"
+
+                    if bad:
+                        # If the source cache DDS is also corrupt (same root
+                        # cause), delete it too so it isn't decompressed back
+                        # into a new passthrough on the next startup.
+                        if "missing_color" in reason or "zero" in reason:
+                            cache_dds = os.path.join(
+                                self._dds_root,
+                                os.path.relpath(pt_path, passthrough_root))
+                            cache_ddm = cache_dds[:-4] + ".ddm"
+                            for cache_path in (cache_dds, cache_ddm):
+                                if os.path.exists(cache_path):
+                                    try:
+                                        os.unlink(cache_path)
+                                        log.warning(f"DDS passthrough: also deleted corrupt cache entry "
+                                                    f"{os.path.basename(cache_path)}")
+                                    except OSError:
+                                        pass
+                        try:
+                            os.unlink(pt_path)
+                            log.warning(f"DDS passthrough: deleted bad tile "
+                                        f"{fname} — {reason}")
+                            deleted += 1
+                        except OSError as e:
+                            log.debug(f"DDS passthrough: failed to delete {pt_path}: {e}")
+
+        except Exception as e:
+            log.warning(f"DDS passthrough scan error: {e}")
+
+        elapsed = (time.monotonic() - start) * 1000
+        log.info(f"DDS passthrough scan: checked {checked}, "
+                 f"deleted {deleted} bad tiles in {elapsed:.0f}ms")
+
+        return deleted
 
     def find_upgrade_candidate(self, tile_id: str, max_zoom: int,
                                tile) -> Optional[Tuple[str, dict]]:

@@ -1119,6 +1119,32 @@ def _dds_is_uniform(path, sample_bytes=4096, max_unique=3):
         return False
 
 
+def _img_is_uniform_missing_color(img, tol=20):
+    """Return True if a PIL image is entirely near missing_color (66, 77, 55).
+
+    Uses per-channel min/max extrema to detect solid-colour fills without
+    iterating every pixel.  A real satellite image has much wider colour spread.
+    """
+    MISSING_COLOR = (66, 77, 55)
+    try:
+        extrema = img.getextrema()
+        mode = img.mode
+        if mode == 'RGBA':
+            r_ext, g_ext, b_ext = extrema[0], extrema[1], extrema[2]
+        elif mode == 'RGB':
+            r_ext, g_ext, b_ext = extrema
+        else:
+            return False
+        return (r_ext[1] - r_ext[0] <= tol and
+                g_ext[1] - g_ext[0] <= tol and
+                b_ext[1] - b_ext[0] <= tol and
+                abs((r_ext[0] + r_ext[1]) / 2 - MISSING_COLOR[0]) <= tol and
+                abs((g_ext[0] + g_ext[1]) / 2 - MISSING_COLOR[1]) <= tol and
+                abs((b_ext[0] + b_ext[1]) / 2 - MISSING_COLOR[2]) <= tol)
+    except Exception:
+        return False
+
+
 def _gtile_to_quadkey(til_x, til_y, zoomlevel):
     """
     Translates Google coding of tiles to Bing Quadkey coding. 
@@ -4448,16 +4474,17 @@ class BackgroundDDSBuilder:
             # Step 4: Build each subsequent mipmap from its native chunks
             # This matches on-demand behavior where X-Plane might request
             # any mipmap first and get native-resolution chunks
+            any_higher_mip_uniform = False
             for mipmap in range(1, tile.max_mipmap + 1):
                 _defer_background_build_if_live(tile)
                 mipmap_zoom = tile.max_zoom - mipmap
                 if mipmap_zoom < tile.min_zoom:
                     break
-                
+
                 # Get native image for this mipmap level
                 img = tile.get_img(mipmap, startrow=0, endrow=None, maxwait=30,
                                   fallback_level_override=fallback_override)
-                
+
                 if img is None:
                     # Fall back to generating remaining mipmaps by downscaling
                     log.debug(f"BackgroundDDSBuilder: {tile_id} - mipmap {mipmap} get_img failed, "
@@ -4465,12 +4492,21 @@ class BackgroundDDSBuilder:
                     # Generate remaining mipmaps from what we have
                     temp_dds.gen_mipmaps(img0, startmipmap=mipmap, maxmipmaps=99)
                     break
-                
+
+                # If the native image is entirely missing_color the lower-zoom
+                # chunks were unavailable.  Flag it so we skip the cache write —
+                # caching this would store green blobs in mip1+ while the DDM
+                # reports the tile as fully complete.
+                if _img_is_uniform_missing_color(img):
+                    log.warning(f"BackgroundDDSBuilder: {tile_id} mip{mipmap} is "
+                                f"uniform missing_color — skipping cache store")
+                    any_higher_mip_uniform = True
+
                 mipmap_images.append(img)
-                
+
                 # Compress just this mipmap from native image
                 temp_dds.gen_mipmaps(img, startmipmap=mipmap, maxmipmaps=1)
-            
+
             # Step 5: Read out the complete DDS as bytes
             _defer_background_build_if_live(tile)
             dds_bytes = temp_dds.read(temp_dds.total_size)
@@ -4481,7 +4517,9 @@ class BackgroundDDSBuilder:
                 return
             
             # Step 6: Store in DDS cache
-            if self._dds_cache is not None:
+            # Skip if any native mipmap image was entirely missing_color — that
+            # would store green blobs in mip1+ while the DDM reports all-clear.
+            if self._dds_cache is not None and not any_higher_mip_uniform:
                 try:
                     mm0_chunks = tile.chunks.get(tile.max_zoom, [])
                     python_mm0_missing = [i for i, c in enumerate(mm0_chunks)
@@ -4927,6 +4965,7 @@ def start_predictive_dds(tile_cacher=None) -> None:
 
         def _scan_and_migrate():
             dynamic_dds_cache.scan_existing()
+            dynamic_dds_cache.scan_passthrough()
             dynamic_dds_cache.migrate_uncompressed()
 
         _scan_thread = _threading.Thread(
@@ -5679,6 +5718,12 @@ class Tile(object):
         self._dds_needs_healing = False
         self._dds_missing_indices = []
         self._dds_fallback_indices = []
+
+        # === PASSTHROUGH GUARD ===
+        # Set True by get_img when mipmap 0 is built with any missing_color chunks.
+        # Prevents stale partial tiles from being cached to the passthrough directory
+        # and served on future opens even after the real JPEGs become available.
+        self._built_with_missing_chunks = False
         
         # === DDS ZL DOWNGRADE HINT ===
         # Set by DynamicDDSCache.load() when a higher-ZL cached DDS exists.
@@ -7974,7 +8019,14 @@ class Tile(object):
 
                 # Fallback 3: network (only if budget allows and fallback_level >= 2)
                 if not chunk_img and (not is_permanent_failure or True) and fallback_level >= 2:
-                    if time_budget.exhausted and not fallback_extends_budget:
+                    if is_empty_data:
+                        # "No imagery" chunk (b'' data) — always cascade regardless of budget
+                        chunk_img = self.get_or_build_lower_mipmap_chunk(
+                            mipmap, chunk.col, chunk.row, zoom,
+                            main_budget=None,
+                            fallback_budget=None
+                        )
+                    elif time_budget.exhausted and not fallback_extends_budget:
                         pass  # Skip network fallback
                     elif time_budget.exhausted and fallback_extends_budget:
                         if fallback_budget is None:
@@ -8052,6 +8104,11 @@ class Tile(object):
                         _safe_paste(new_im, chunk_img, start_x, start_y)
                         chunks_with_images.add(id(chunk))
                         log.debug(f"GET_IMG: Recovered chunk via deferred lazy build fallback")
+
+        # Track whether mipmap 0 had any missing_color fills so _save_tile_to_passthrough
+        # can skip caching a tile that will show stale green chunks on future opens.
+        if mipmap == 0 and len(chunks_with_images) < len(chunks):
+            self._built_with_missing_chunks = True
 
         # Determine if we need to cache this image for fallback/upscaling
         should_cache = complete_img and mipmap <= self.max_mipmap
@@ -10493,8 +10550,28 @@ class TileCacher(object):
                 return
             if t.dds is None:
                 return
+            if getattr(t, '_built_with_missing_chunks', False):
+                log.debug(f"Skipping passthrough save for {t.id}: built with missing chunks")
+                bump('dds_passthrough_skipped_incomplete')
+                return
             mm_list = t.dds.mipmap_list
-            if not mm_list or not mm_list[0].retrieved:
+            if not mm_list:
+                return
+            # All mipmaps must be retrieved (databuffer set) before writing to
+            # passthrough.  If any mipmap was never built in memory (e.g. tile
+            # loaded from a partial incremental DDS cache with only mm0), its
+            # databuffer is None and pydds.write() leaves zeros at that offset.
+            # A passthrough written with zero mm1-4 causes X-Plane to render
+            # fallback (green) terrain at distance.  The DDM may already say
+            # "fully populated" by the time the tile is closed (BackgroundDDS
+            # Builder can complete the DDS cache entry while the tile is open),
+            # so the DDM check in _get_disk_dds_path would pass and the bad file
+            # would be served.
+            if not all(mm.retrieved and mm.databuffer is not None for mm in mm_list):
+                log.debug(f"Skipping passthrough save for {t.id}: "
+                          f"not all mipmaps retrieved "
+                          f"({sum(1 for mm in mm_list if mm.retrieved)}/{len(mm_list)})")
+                bump('dds_passthrough_skipped_incomplete')
                 return
             try:
                 from autoortho.utils.cache_paths import get_dds_cache_path
@@ -10541,10 +10618,6 @@ class TileCacher(object):
             if t.refs > 0:
                 log.debug(f"Still have {t.refs} refs for {tile_id}")
                 return True
-            # refs == 0: only evict if mipmap 0 is fully built.
-            # Incomplete tiles stay in self.tiles so background chunk downloads
-            # can finish before the next open — prevents repeated cold rebuilds
-            # that produce missing_color (green) tiles.
             mm_retrieved = (
                 t.dds is not None and
                 bool(t.dds.mipmap_list) and

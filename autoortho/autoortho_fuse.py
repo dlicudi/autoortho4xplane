@@ -677,6 +677,11 @@ class AutoOrtho(Operations):
         decompress).  If only a zstd-compressed entry exists, decompresses it
         now and writes the result to the passthrough cache so future opens are
         instant.  Falls through to TileCacher if nothing usable is found.
+
+        Only serves DDS files whose mipmap chain is fully populated.  Incremental
+        DDS files (from store_incremental) that have some mipmaps as zeros are
+        rejected — X-Plane reads low mip levels for distant tiles and would render
+        fallback (green) terrain if those levels contain zero-filled BC1 blocks.
         """
         dds_cache = getortho.dynamic_dds_cache
         if dds_cache is None or not dds_cache._enabled:
@@ -685,6 +690,39 @@ class AutoOrtho(Operations):
             from autoortho.utils.cache_paths import get_dds_cache_path
         except ImportError:
             from utils.cache_paths import get_dds_cache_path
+        try:
+            import json as _json
+        except ImportError:
+            return None
+
+        def _all_mipmaps_populated(meta):
+            """True iff DDM confirms every mipmap is fully populated with real data.
+
+            Mirrors the same gate used by DynamicDDSCache.load() — rejects tiles
+            that have missing_color fills or lower-ZL fallback chunks, which produce
+            uniform-colour blobs at distance even if every mipmap *index* is present.
+            """
+            if meta is None:
+                return True  # pre-DDM/v2: treat as complete
+            if 'populated_mipmaps' not in meta:
+                return True  # v2 compat: field absent → all populated
+            mm_count = meta.get('mm', 0)
+            if mm_count == 0:
+                return True
+            populated = set(meta['populated_mipmaps'])
+            if not all(i in populated for i in range(mm_count)):
+                return False
+            # Reject tiles with missing/fallback chunks — missing_color fills become
+            # large uniform blobs in the downsampled mip levels (green at distance).
+            if meta.get('needs_healing') or meta.get('missing_indices') or meta.get('fallback_indices'):
+                return False
+            return True
+
+        # Expected uncompressed DDS size for this tile — must match what getattr
+        # reports, otherwise X-Plane sees a truncated file and falls back to green
+        # terrain (e.g. a ZL16-BC3 passthrough served for a ZL17-BC1 tile).
+        expected_size = self._get_dds_size_cached(row, col, maptype, zoom)
+
         try:
             passthrough_root = os.path.join(dds_cache._cache_dir, "dds_passthrough")
             for max_zoom in (zoom, zoom + 1, zoom + 2):
@@ -698,9 +736,50 @@ class AutoOrtho(Operations):
                 rel = os.path.relpath(compressed_path, dds_cache._dds_root)
                 pt_path = os.path.join(passthrough_root, rel)
 
-                # 1. Already-decompressed passthrough copy — instant serve
-                if os.path.exists(pt_path) and os.path.getsize(pt_path) >= 131072:
-                    return pt_path
+                # Load DDM once for this candidate — used for completeness checks below.
+                try:
+                    with open(ddm_path, 'r', encoding='utf-8') as _f:
+                        _meta = _json.load(_f)
+                except Exception:
+                    _meta = None
+
+                # 1. Already-decompressed passthrough copy — instant serve if valid
+                if os.path.exists(pt_path):
+                    pt_size = os.path.getsize(pt_path)
+                    if pt_size != expected_size:
+                        # Wrong size: DDS built at a different zoom/format than what
+                        # getattr reported.  X-Plane would see a truncated texture.
+                        try:
+                            os.unlink(pt_path)
+                            log.debug(f"DDS passthrough: deleted size-mismatched passthrough "
+                                      f"{os.path.basename(pt_path)} "
+                                      f"({pt_size} != {expected_size})")
+                            getortho.bump('dds_passthrough_deleted_size_mismatch')
+                        except OSError:
+                            pass
+                    elif _meta is None and not os.path.exists(compressed_path):
+                        # No DDM and no source DDS in cache: orphaned passthrough
+                        # written from a live build whose cache entry is at a different
+                        # max_zoom.  Serve it unchecked would bypass all quality gates.
+                        try:
+                            os.unlink(pt_path)
+                            log.debug(f"DDS passthrough: deleted orphaned passthrough "
+                                      f"{os.path.basename(pt_path)} (no DDM, no cache entry)")
+                            getortho.bump('dds_passthrough_deleted_orphan')
+                        except OSError:
+                            pass
+                    elif not _all_mipmaps_populated(_meta):
+                        # DDM says incomplete: stale passthrough from a partial incremental
+                        # build.  Delete it so it's recreated once the DDS is complete.
+                        try:
+                            os.unlink(pt_path)
+                            log.debug(f"DDS passthrough: deleted stale partial passthrough "
+                                      f"{os.path.basename(pt_path)}")
+                            getortho.bump('dds_passthrough_deleted_partial')
+                        except OSError:
+                            pass
+                    else:
+                        return pt_path
 
                 # 2. Compressed source must exist and be non-trivial
                 if not (os.path.exists(compressed_path) and
@@ -715,25 +794,69 @@ class AutoOrtho(Operations):
                     continue
 
                 if magic == b'DDS ':
-                    # Stored uncompressed — serve directly
-                    return compressed_path
+                    # Stored uncompressed — check size and mipmap completeness
+                    actual = os.path.getsize(compressed_path)
+                    if actual != expected_size:
+                        log.debug(f"DDS passthrough: skipping size-mismatched uncompressed DDS "
+                                  f"{os.path.basename(compressed_path)} "
+                                  f"({actual} != {expected_size})")
+                        getortho.bump('dds_passthrough_skipped_size_mismatch')
+                        continue
+                    if _all_mipmaps_populated(_meta):
+                        return compressed_path
+                    log.debug(f"DDS passthrough: skipping partial uncompressed DDS "
+                              f"{os.path.basename(compressed_path)}")
+                    getortho.bump('dds_passthrough_skipped_partial')
+                    continue
 
                 if magic != b'\x28\xb5\x2f\xfd':
                     # Unknown format
                     continue
 
-                # 4. zstd-compressed — confirm via DDM then decompress
-                try:
-                    import json as _json
-                    with open(ddm_path, 'r', encoding='utf-8') as _f:
-                        _meta = _json.load(_f)
-                    if _meta.get('disk_compression') != 'zstd':
-                        continue
-                except Exception:
+                # 4. zstd-compressed — confirm via DDM, check completeness, then decompress
+                if _meta is None or _meta.get('disk_compression') != 'zstd':
                     continue
+
+                if not _all_mipmaps_populated(_meta):
+                    log.debug(f"DDS passthrough: skipping partial incremental DDS "
+                              f"{os.path.basename(compressed_path)} "
+                              f"(populated={sorted(_meta.get('populated_mipmaps', []))})")
+                    getortho.bump('dds_passthrough_skipped_partial')
+                    continue
+
+                # Pre-check size from DDM dimensions before decompressing — avoids
+                # writing a 40+ MB file to disk only to delete it on a size mismatch
+                # (e.g. tile was stored at a different imagery zoom in a prior session).
+                _ddm_w = _meta.get('w', 0)
+                _ddm_h = _meta.get('h', 0)
+                _ddm_fmt = _meta.get('fmt', 'BC1')
+                if _ddm_w > 0 and _ddm_h > 0:
+                    _ddm_bs = 16 if _ddm_fmt == 'BC3' else 8
+                    _ddm_size = 128
+                    _cw, _ch = _ddm_w, _ddm_h
+                    while _cw >= 1 and _ch >= 1:
+                        _ddm_size += max(1, (_cw * _ch >> 4)) * _ddm_bs
+                        _cw >>= 1
+                        _ch >>= 1
+                    if _ddm_size != expected_size:
+                        log.debug(f"DDS passthrough: skipping size-mismatched zstd DDS "
+                                  f"{os.path.basename(compressed_path)} "
+                                  f"(DDM {_ddm_w}x{_ddm_h}={_ddm_size} != expected {expected_size})")
+                        getortho.bump('dds_passthrough_skipped_size_mismatch')
+                        continue
 
                 result = self._decompress_to_passthrough(compressed_path, pt_path)
                 if result is not None:
+                    # Verify the decompressed size matches getattr before returning
+                    if os.path.getsize(result) != expected_size:
+                        log.debug(f"DDS passthrough: decompressed size mismatch "
+                                  f"{os.path.basename(result)}, removing")
+                        try:
+                            os.unlink(result)
+                        except OSError:
+                            pass
+                        getortho.bump('dds_passthrough_deleted_size_mismatch')
+                        continue
                     return result
             return None
         except Exception:
