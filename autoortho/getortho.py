@@ -2633,31 +2633,56 @@ class SpatialPrefetcher:
 
         Falls back to velocity-based prefetching if aircraft deviates from route.
         """
+        # INSTRUMENTATION: count cycle calls and reasons for early exit
+        if not hasattr(self, '_pf_trace_cycles'):
+            self._pf_trace_cycles = 0
+            self._pf_trace_no_cacher = 0
+            self._pf_trace_no_dataref = 0
+            self._pf_trace_invalid_pos = 0
+            self._pf_trace_simbrief = 0
+            self._pf_trace_velocity = 0
+            self._pf_trace_last_heartbeat = time.monotonic()
+        self._pf_trace_cycles += 1
+        _now = time.monotonic()
+        if _now - self._pf_trace_last_heartbeat >= 30.0:
+            log.info(
+                f"PIPELINE_TRACE prefetch_heartbeat pid={os.getpid()} "
+                f"cycles={self._pf_trace_cycles} no_cacher={self._pf_trace_no_cacher} "
+                f"no_dataref={self._pf_trace_no_dataref} invalid_pos={self._pf_trace_invalid_pos} "
+                f"simbrief={self._pf_trace_simbrief} velocity={self._pf_trace_velocity}"
+            )
+            self._pf_trace_last_heartbeat = _now
+
         # Check if tile_cacher is available
         if self._tile_cacher is None:
+            self._pf_trace_no_cacher += 1
             return
 
         # Always use instantaneous position (that's where we actually are)
         if not datareftracker.data_valid or not datareftracker.connected:
+            self._pf_trace_no_dataref += 1
             return
-            
+
         lat = datareftracker.lat
         lon = datareftracker.lon
 
         # Validate position data
         if lat < -90 or lat > 90 or lon < -180 or lon > 180:
+            self._pf_trace_invalid_pos += 1
             return
 
         # Check if SimBrief flight path prefetching should be used
         if self._should_use_simbrief_prefetch(lat, lon):
+            self._pf_trace_simbrief += 1
             chunks_submitted = self._prefetch_along_flight_plan(lat, lon)
             if chunks_submitted > 0:
                 self._prefetch_count += chunks_submitted
                 log.debug(f"Prefetched {chunks_submitted} chunks along flight plan (total: {self._prefetch_count})")
                 bump('prefetch_chunk_count', chunks_submitted)
             return
-        
+
         # Fall back to velocity-based prefetching
+        self._pf_trace_velocity += 1
         self._do_velocity_prefetch_cycle(lat, lon)
     
     def _should_use_simbrief_prefetch(self, lat: float, lon: float) -> bool:
@@ -3423,6 +3448,12 @@ class TileCompletionTracker:
         # Build threshold: trigger DDS build when this fraction of chunks is ready.
         # build_from_jpegs handles None entries for missing chunks; healing fills gaps later.
         self._build_threshold = 1.0  # Always require all chunks for quality
+        # INSTRUMENTATION: track tracker activity so we can see if the predictive
+        # pipeline is being fed at all.
+        self._start_tracking_calls = 0
+        self._complete_callbacks_fired = 0
+        self._last_heartbeat = time.monotonic()
+        log.info(f"PIPELINE_TRACE TileCompletionTracker created pid={os.getpid()} callback={on_tile_complete is not None}")
     
     def start_tracking(self, tile, zoom: int, submitted_count: int = 0) -> None:
         """
@@ -3449,6 +3480,16 @@ class TileCompletionTracker:
             return
 
         with self._lock:
+            self._start_tracking_calls += 1
+            _now = time.monotonic()
+            if _now - self._last_heartbeat >= 30.0:
+                log.info(
+                    f"PIPELINE_TRACE tracker_heartbeat pid={os.getpid()} "
+                    f"start_tracking_calls={self._start_tracking_calls} "
+                    f"complete_fired={self._complete_callbacks_fired} "
+                    f"currently_tracked={len(self._tracked_tiles)}"
+                )
+                self._last_heartbeat = _now
             # Already tracking this tile
             if tile_id in self._tracked_tiles:
                 return
@@ -3695,21 +3736,30 @@ class BackgroundDDSBuilder:
     def submit(self, tile, priority: float = PRIORITY_BACKGROUND_DDS) -> bool:
         """
         Submit a tile for background DDS building.
-        
+
         Args:
             tile: Tile with all chunks downloaded
             priority: Queue priority (lower runs first; values here are
                 background priority and yield to live builds)
-            
+
         Returns:
             True if queued, False if queue is full or tile already cached
         """
         if tile is None:
             return False
-        
+        # INSTRUMENTATION: count submit attempts
+        if not hasattr(self, '_submit_attempts'):
+            self._submit_attempts = 0
+            self._submit_skipped_cached = 0
+            self._submit_queued = 0
+            self._submit_full = 0
+            self._submit_last_heartbeat = time.monotonic()
+        self._submit_attempts += 1
+
         # Skip if already in DDS cache (allow through if healing needed)
         if self._dds_cache is not None and self._dds_cache.contains(tile.id, tile.max_zoom, tile):
             if not getattr(tile, '_dds_needs_healing', False):
+                self._submit_skipped_cached += 1
                 log.debug(f"BackgroundDDSBuilder: Skipping {tile.id} - already cached")
                 return False
             log.debug(f"BackgroundDDSBuilder: healing tile {tile.id} passed through")
@@ -3719,8 +3769,18 @@ class BackgroundDDSBuilder:
             self._work_event.set()  # Wake coordinator immediately
             log.debug(f"BackgroundDDSBuilder: Queued {tile.id} "
                      f"(queue size: {self._queue.qsize()})")
+            self._submit_queued += 1
+            _now = time.monotonic()
+            if _now - self._submit_last_heartbeat >= 30.0:
+                log.info(
+                    f"PIPELINE_TRACE submit_heartbeat pid={os.getpid()} "
+                    f"attempts={self._submit_attempts} queued={self._submit_queued} "
+                    f"skipped_cached={self._submit_skipped_cached} full={self._submit_full}"
+                )
+                self._submit_last_heartbeat = _now
             return True
         except Full:
+            self._submit_full += 1
             log.debug(f"BackgroundDDSBuilder: Queue full, skipping {tile.id}")
             return False
     
@@ -3735,6 +3795,11 @@ class BackgroundDDSBuilder:
         Fills ALL available worker slots each cycle instead of rate-limiting
         to half the workers, maximizing CPU utilization for background builds.
         """
+        log.info(f"PIPELINE_TRACE BackgroundDDSBuilder._coordinator_loop ENTERED pid={os.getpid()}")
+        _last_heartbeat = time.monotonic()
+        _heartbeat_interval = 30.0
+        _submits_seen = 0
+        _last_submits_logged = 0
         while not self._stop_event.is_set() and not is_shutdown_requested():
             # Wait for work signal or timeout as fallback
             self._work_event.wait(timeout=self._build_interval)
@@ -3742,6 +3807,19 @@ class BackgroundDDSBuilder:
 
             if self._stop_event.is_set() or is_shutdown_requested():
                 break
+
+            # Heartbeat: every 30s log how many submits and builds we've seen
+            _now = time.monotonic()
+            if _now - _last_heartbeat >= _heartbeat_interval:
+                qsize = self._queue.qsize()
+                with self._active_lock:
+                    active = self._active_builds
+                log.info(
+                    f"PIPELINE_TRACE coordinator_heartbeat pid={os.getpid()} "
+                    f"queue_size={qsize} active_builds={active}/{self._max_workers} "
+                    f"completed={self._builds_completed} failed={self._builds_failed}"
+                )
+                _last_heartbeat = _now
 
             # Yield all resources to live tile reads when X-Plane is active
             if is_live_building():
@@ -4840,6 +4918,10 @@ def _do_network_healing(tile, indices_to_heal):
             dynamic_dds_cache.clear_network_healing(tile_id, max_zoom)
 
 
+_PIPELINE_CB_COUNT = 0
+_PIPELINE_CB_LAST_HEARTBEAT = 0.0
+
+
 def _on_tile_complete_callback(tile_id: str, tile,
                                partial: bool = False,
                                healing: bool = False) -> None:
@@ -4852,6 +4934,24 @@ def _on_tile_complete_callback(tile_id: str, tile,
         partial: True when threshold reached but not 100% — build with available chunks
         healing: True when remaining chunks arrived after a partial build — patch the DDS
     """
+    global _PIPELINE_CB_COUNT, _PIPELINE_CB_LAST_HEARTBEAT
+    _PIPELINE_CB_COUNT += 1
+    _now = time.monotonic()
+    if _now - _PIPELINE_CB_LAST_HEARTBEAT >= 30.0:
+        log.info(
+            f"PIPELINE_TRACE on_tile_complete heartbeat pid={os.getpid()} "
+            f"total_cb_calls={_PIPELINE_CB_COUNT} "
+            f"builder_present={background_dds_builder is not None} "
+            f"healing={healing} partial={partial}"
+        )
+        _PIPELINE_CB_LAST_HEARTBEAT = _now
+    # Also update tracker counter so its heartbeat reports cb_fired correctly
+    if tile_completion_tracker is not None:
+        try:
+            tile_completion_tracker._complete_callbacks_fired += 1
+        except Exception:
+            pass
+
     if healing:
         # Remaining chunks arrived after partial build — dispatch healing
         _dispatch_healing(tile)
@@ -4884,9 +4984,11 @@ def start_predictive_dds(tile_cacher=None) -> None:
     global background_dds_builder, tile_completion_tracker
     global dynamic_dds_cache, disk_budget_manager
 
+    log.info(f"PIPELINE_TRACE start_predictive_dds: called pid={os.getpid()}")
+
     # Prevent duplicate initialization (Windows/Linux: all mounts share one process)
     if background_dds_builder is not None:
-        log.debug("Predictive DDS already initialized, skipping")
+        log.info(f"PIPELINE_TRACE start_predictive_dds: already initialized pid={os.getpid()}, returning")
         return
 
     # Check if enabled. Predictive DDS is fed by spatial prefetch; keep the
@@ -4904,7 +5006,7 @@ def start_predictive_dds(tile_cacher=None) -> None:
         enabled = enabled.lower() in ('true', '1', 'yes', 'on')
     
     if not enabled:
-        log.info("Predictive DDS generation disabled by configuration")
+        log.info(f"PIPELINE_TRACE start_predictive_dds: DISABLED by config pid={os.getpid()}")
         return
     
     # Get configuration
@@ -5039,7 +5141,9 @@ def start_predictive_dds(tile_cacher=None) -> None:
 
     # Start the builder thread
     background_dds_builder.start()
-    
+
+    log.info(f"PIPELINE_TRACE start_predictive_dds: COMPLETED pid={os.getpid()} "
+             f"workers={background_builder_workers} interval_ms={build_interval_ms}")
     log.info(f"Predictive DDS generation started "
             f"(disk_cache={disk_cache_mb}MB, interval={build_interval_ms}ms)")
 
@@ -7482,18 +7586,26 @@ class Tile(object):
         if self.first_request_time is None:
             self.first_request_time = time.monotonic()
             log.debug(f"READ_DDS_BYTES: First request for tile")
-       
+
         if offset > 0 and offset < self.lowest_offset:
             self.lowest_offset = offset
 
         mm_idx = self.find_mipmap_pos(offset)
         mipmap = self.dds.mipmap_list[mm_idx]
 
+        # INSTRUMENTATION: break down time inside the build/fetch path so we can
+        # see whether reads are waiting on get_bytes/get_mipmap (chunk download
+        # + DXT compress) or the final seek/read (pure memory copy).
+        _branch = 'none'
+        _fetch_t0 = time.monotonic()
+        _mm_retrieved_before = mipmap.retrieved
+
         if offset == 0:
             # If offset = 0, read the header (and possibly some mipmap data)
             # The aopipeline trigger in get_bytes now correctly skips header reads
             # (offset=0) so this won't trigger unnecessary mipmap 0 builds
             log.debug("READ_DDS_BYTES: Read header")
+            _branch = 'header'
             self.get_bytes(0, length, time_budget=request_budget)
         else:
             # Dynamically scale the early-read heuristic based on actual mip-0 bytes per chunk-row
@@ -7507,28 +7619,48 @@ class Tile(object):
             early_threshold = bytes_per_chunk_row_m0
             if mm_idx == 0 and offset < early_threshold:
                 log.debug("READ_DDS_BYTES: Early region of mipmap 0 - fetching from start")
+                _branch = 'early_mm0'
                 self.get_bytes(0, length + offset, time_budget=request_budget)
             elif (offset + length) < mipmap.endpos:
                 # Total length is within this mipmap.  Make sure we have it.
                 log.debug(f"READ_DDS_BYTES: Detected middle read for mipmap {mipmap.idx}")
                 if not mipmap.retrieved:
                     log.debug(f"READ_DDS_BYTES: Retrieve {mipmap.idx}")
+                    _branch = f'middle_get_mm{mipmap.idx}'
                     self.get_mipmap(mipmap.idx, time_budget=request_budget)
+                else:
+                    _branch = f'middle_cached_mm{mipmap.idx}'
             else:
                 log.debug(f"READ_DDS_BYTES: Start before this mipmap {mipmap.idx}")
+                _branch = f'extend_mm{mm_idx}_to_mm{mm_idx + 1}'
                 # We already know we start before the end of this mipmap
                 # We must extend beyond the length.
-                
+
                 # Get bytes prior to this mipmap
                 self.get_bytes(offset, length, time_budget=request_budget)
 
                 # Get the entire next mipmap
                 self.get_mipmap(mm_idx + 1, time_budget=request_budget)
-        
+
+        _fetch_ms = (time.monotonic() - _fetch_t0) * 1000.0
         self.bytes_read += length
         # Seek and return data
+        _seek_t0 = time.monotonic()
         self.dds.seek(offset)
-        return self.dds.read(length)
+        data = self.dds.read(length)
+        _seek_ms = (time.monotonic() - _seek_t0) * 1000.0
+
+        # WARN-level breakdown when the read was slow.  Threshold chosen to
+        # match the FUSE_READ slow threshold (16ms = 1 frame at 60fps).
+        _total_ms = _fetch_ms + _seek_ms
+        if _total_ms > 16.0:
+            log.warning(
+                f"READ_DDS_BYTES slow branch={_branch} mm_idx={mm_idx} "
+                f"mm_retrieved_before={_mm_retrieved_before} "
+                f"fetch_ms={_fetch_ms:.1f} seek_read_ms={_seek_ms:.1f} "
+                f"offset={offset} length={length} tile={self.row}_{self.col}_{self.maptype}_{self.tilename_zoom}"
+            )
+        return data
 
     def write(self):
         outfile = os.path.join(self.cache_dir, f"{self.row}_{self.col}_{self.maptype}_{self.tilename_zoom}_{self.tilename_zoom}.dds")
@@ -9787,6 +9919,10 @@ class TileCacher(object):
         # Eviction behavior controls
         self.evict_hysteresis_frac = 0.10  # keep ~10% headroom below limit
         self.evict_headroom_min_bytes = 256 * 1048576  # at least 256MB headroom
+        # Track consecutive futile evictions (freed < 16MB) so we can warn
+        # when the loop is churning without actually reducing RSS.  Resets on
+        # any eviction that frees >= 16MB.
+        self._futile_eviction_streak = 0
         # Track last tile access time for activity-aware proportional eviction.
         # On macOS multi-process, "cold" workers (no recent access) evict
         # more aggressively than "hot" workers with fresh tiles.
@@ -10190,13 +10326,16 @@ class TileCacher(object):
         """
         evicted = 0
         BATCH_SIZE = 20  # Balance between lock overhead and responsiveness
-        
+
         while evicted < max_to_evict:
             # PHASE 1: Collect batch to evict (under lock - fast dict ops only)
             # Store (tile_id, tile) pairs so we can release external refs
             batch = []
             now = time.monotonic()
+            _lock_t0 = time.monotonic()
             with self.tc_lock:
+                _lock_acq_ms = (time.monotonic() - _lock_t0) * 1000.0
+                _hold_t0 = time.monotonic()
                 for idx in list(self._lru_candidates()):
                     if len(batch) >= BATCH_SIZE:
                         break
@@ -10218,7 +10357,13 @@ class TileCacher(object):
                         batch.append((idx, self.tiles.pop(idx)))
                     except KeyError:
                         continue
-            
+                _hold_ms = (time.monotonic() - _hold_t0) * 1000.0
+                if _lock_acq_ms > 10.0 or _hold_ms > 10.0:
+                    log.warning(
+                        f"tc_lock_evict acq_ms={_lock_acq_ms:.1f} hold_ms={_hold_ms:.1f} "
+                        f"batch_size={len(batch)} tid={threading.get_ident()}"
+                    )
+
             if not batch:
                 break
             
@@ -10454,12 +10599,23 @@ class TileCacher(object):
             if total_evicted > 0:
                 _release_memory_to_os()
                 rss_after_release = _get_process_mem_bytes(process)
+                freed_mb = max(0, rss_before_eviction - rss_after_release) // (1024**2)
+                if freed_mb < 16:
+                    self._futile_eviction_streak += 1
+                else:
+                    self._futile_eviction_streak = 0
                 log.info(
                     f"Eviction complete: evicted={total_evicted} tiles, "
                     f"RSS before={rss_before_eviction // (1024**2)}MB, "
                     f"RSS after release={rss_after_release // (1024**2)}MB, "
-                    f"freed={max(0, rss_before_eviction - rss_after_release) // (1024**2)}MB"
+                    f"freed={freed_mb}MB futile_streak={self._futile_eviction_streak}"
                 )
+                if self._futile_eviction_streak == 3:
+                    log.warning(
+                        f"Eviction futile_streak=3: RSS not responding to evictions "
+                        f"(cur={rss_after_release // (1024**2)}MB limit={self.cache_mem_lim // (1024**2)}MB). "
+                        f"This is expected on macOS (memory compressor) but causes lock churn."
+                    )
 
             if MEMTRACE:
                 snapshot = tracemalloc.take_snapshot()
@@ -10485,9 +10641,16 @@ class TileCacher(object):
             time.sleep(poll_interval)
 
     def _get_tile(self, row, col, map_type, zoom):
-        
+
         idx = self._to_tile_id(row, col, map_type, zoom)
+        _lock_t0 = time.monotonic()
         with self.tc_lock:
+            _wait_ms = (time.monotonic() - _lock_t0) * 1000.0
+            if _wait_ms > 10.0:
+                log.warning(
+                    f"tc_lock_wait op=_get_tile wait_ms={_wait_ms:.1f} "
+                    f"tid={threading.get_ident()} idx={idx}"
+                )
             tile = self.tiles.get(idx)
             if not tile:
                 tile = self._open_tile(row, col, map_type, zoom)
@@ -10501,7 +10664,14 @@ class TileCacher(object):
         idx = self._to_tile_id(row, col, map_type, zoom)
 
         log.debug(f"Get_tile: {idx}")
+        _lock_t0 = time.monotonic()
         with self.tc_lock:
+            _wait_ms = (time.monotonic() - _lock_t0) * 1000.0
+            if _wait_ms > 10.0:
+                log.warning(
+                    f"tc_lock_wait op=_open_tile wait_ms={_wait_ms:.1f} "
+                    f"tid={threading.get_ident()} idx={idx}"
+                )
             tile = self.tiles.get(idx)
             if not tile:
                 self.misses += 1

@@ -14,6 +14,7 @@ Connection State:
 """
 
 import binascii
+import os
 import time
 import struct
 import socket
@@ -444,15 +445,120 @@ class DatarefTracker(object):
             return self.sun_pitch
 
     def start(self):
-        """Start the UDP listening thread."""
+        """Start the dataref tracking thread.
+
+        In the parent process (AO_RUN_MODE != "mount_worker"), runs the UDP
+        RREF subscriber loop. In a worker process, runs the shared_store
+        follower loop instead — workers never subscribe via UDP, eliminating
+        the multi-subscriber thrash that knocks out subscriptions on X-Plane.
+        """
         if self.running:
             return
-        log.info("Starting UDP listening thread")
+        is_worker = os.environ.get("AO_RUN_MODE") == "mount_worker"
+        if is_worker:
+            log.info(f"PIPELINE_TRACE datareftrack starting in WORKER mode "
+                     f"(shared_store follower) pid={os.getpid()}")
+            target = self._shared_store_follower_loop
+        else:
+            log.info(f"PIPELINE_TRACE datareftrack starting in PARENT mode "
+                     f"(UDP subscriber) pid={os.getpid()}")
+            target = self._dataref_tracker_udp_listen
         self._shutdown_flag.clear()
         self.running = True
-        self.t = threading.Thread(target=self._dataref_tracker_udp_listen)
+        self.t = threading.Thread(target=target, name="DatarefTracker")
         self.t.daemon = True  # Ensure thread doesn't prevent exit
         self.t.start()
+
+    def _shared_store_follower_loop(self):
+        """Worker mode: poll the shared store for aircraft position.
+
+        Parent publishes ac_lat/ac_lon/etc. + ac_lat_ts every time it receives
+        a fresh dataref packet. We pull from there at 2Hz. If the timestamp
+        is older than STALE_THRESHOLD_SEC, we mark the tracker as not valid
+        so prefetchers idle (rather than acting on stale position).
+        """
+        # Lazy import to avoid circular import at module load time
+        try:
+            from autoortho import aostats
+        except ImportError:
+            import aostats
+
+        log.info(f"PIPELINE_TRACE datareftrack WORKER follower started pid={os.getpid()}")
+        POLL_SEC = 0.5
+        STALE_THRESHOLD_SEC = 5.0
+        _last_heartbeat = time.monotonic()
+        _polls = 0
+        while self.running and not self._shutdown_flag.is_set():
+            try:
+                ts = aostats.get_stat('ac_lat_ts')
+                valid_flag = aostats.get_stat('ac_data_valid')
+                now_wall = time.time()
+                fresh = (
+                    isinstance(ts, (int, float)) and ts > 0
+                    and (now_wall - float(ts)) < STALE_THRESHOLD_SEC
+                    and valid_flag
+                )
+                if fresh:
+                    lat = aostats.get_stat('ac_lat')
+                    lon = aostats.get_stat('ac_lon')
+                    alt = aostats.get_stat('ac_alt')
+                    hdg = aostats.get_stat('ac_hdg')
+                    spd = aostats.get_stat('ac_spd')
+                    local_time = aostats.get_stat('ac_local_time_sec')
+                    pressure_alt = aostats.get_stat('ac_pressure_alt')
+                    sun_pitch = aostats.get_stat('ac_sun_pitch')
+
+                    with self._lock:
+                        was_connected = self.connected
+                        if isinstance(lat, (int, float)):
+                            self.lat = float(lat)
+                        if isinstance(lon, (int, float)):
+                            self.lon = float(lon)
+                        if isinstance(alt, (int, float)):
+                            self.alt = float(alt)
+                        if isinstance(hdg, (int, float)):
+                            self.hdg = float(hdg)
+                        if isinstance(spd, (int, float)):
+                            self.spd = float(spd)
+                        if isinstance(local_time, (int, float)) and local_time > 0:
+                            self.local_time_sec = float(local_time)
+                        if isinstance(pressure_alt, (int, float)):
+                            self.pressure_alt = float(pressure_alt)
+                        if isinstance(sun_pitch, (int, float)) and sun_pitch > -990:
+                            self.sun_pitch = float(sun_pitch)
+                        self.connected = True
+                        self.data_valid = True
+                        self.has_ever_connected = True
+                    if not was_connected:
+                        log.info(f"PIPELINE_TRACE datareftrack WORKER follower "
+                                 f"connected via shared_store pid={os.getpid()}")
+                else:
+                    with self._lock:
+                        was_connected = self.connected
+                        self.connected = False
+                        self.data_valid = False
+                    if was_connected:
+                        log.info(f"PIPELINE_TRACE datareftrack WORKER follower "
+                                 f"stale/missing data, marked disconnected "
+                                 f"pid={os.getpid()}")
+
+                _polls += 1
+                now_mono = time.monotonic()
+                if now_mono - _last_heartbeat >= 30.0:
+                    log.info(
+                        f"PIPELINE_TRACE datareftrack_follower_heartbeat "
+                        f"pid={os.getpid()} polls={_polls} "
+                        f"connected={self.connected} data_valid={self.data_valid}"
+                    )
+                    _last_heartbeat = now_mono
+            except Exception as e:
+                log.debug(f"datareftrack follower error: {e}")
+
+            # Sleep with shutdown awareness
+            self._shutdown_flag.wait(timeout=POLL_SEC)
+
+        log.info(f"PIPELINE_TRACE datareftrack WORKER follower exiting "
+                 f"pid={os.getpid()}")
 
     def stop(self):
         """Stop the UDP listening thread and unsubscribe from datarefs."""
@@ -540,15 +646,48 @@ class DatarefTracker(object):
     # clear/reset the socket and try again after a short wait.
     def _dataref_tracker_udp_listen(self):
         """Main UDP listening loop (runs in separate thread)."""
-        log.info("UDP listening thread started and listening!")
+        log.info(f"PIPELINE_TRACE datareftrack UDP listening thread started pid={os.getpid()} "
+                 f"target={UDP_IP}:{CFG.flightdata.xplane_udp_port} timeout={self.UDP_TIMEOUT_SEC}s")
 
         # Subscribe to dataref updates at the default rate
-        self._request_datarefs(subscribe=True)
+        try:
+            self._request_datarefs(subscribe=True)
+            log.info(f"PIPELINE_TRACE datareftrack subscribe sent pid={os.getpid()}")
+        except Exception as e:
+            log.warning(f"PIPELINE_TRACE datareftrack subscribe FAILED pid={os.getpid()}: {e}")
+
+        # Instrumentation counters
+        _drt_timeouts = 0
+        _drt_packets = 0
+        _drt_decode_fails = 0
+        _drt_last_heartbeat = time.monotonic()
+        _drt_logged_first_packet = False
 
         while self.running and not self._shutdown_flag.is_set():
+            # Heartbeat every 30s showing connection state
+            _now = time.monotonic()
+            if _now - _drt_last_heartbeat >= 30.0:
+                log.info(
+                    f"PIPELINE_TRACE datareftrack_heartbeat pid={os.getpid()} "
+                    f"connected={self.connected} data_valid={self.data_valid} "
+                    f"packets={_drt_packets} timeouts={_drt_timeouts} decode_fails={_drt_decode_fails} "
+                    f"target={UDP_IP}:{CFG.flightdata.xplane_udp_port}"
+                )
+                _drt_last_heartbeat = _now
+
             try:
                 data, addr = self.sock.recvfrom(self.RECV_BUFFER_SIZE)
-            except Exception:
+                if not _drt_logged_first_packet:
+                    log.info(f"PIPELINE_TRACE datareftrack FIRST PACKET received from {addr} "
+                             f"bytes={len(data)} pid={os.getpid()}")
+                    _drt_logged_first_packet = True
+                _drt_packets += 1
+            except Exception as _e:
+                _drt_timeouts += 1
+                # Log first 3 timeouts at WARN, then drop to debug
+                if _drt_timeouts <= 3:
+                    log.warning(f"PIPELINE_TRACE datareftrack recvfrom #{_drt_timeouts}: "
+                                f"{type(_e).__name__}: {_e} pid={os.getpid()}")
                 # All exceptions including ConnectionResetError and
                 # socket.timeout are handled in the same way.
                 # This can happen when X-Plane is not running yet or
@@ -563,6 +702,17 @@ class DatarefTracker(object):
                         self.flight_averager.clear()
                     self.connected = False
                     self.data_valid = False
+
+                # Tell workers (via shared_store) that data is no longer valid,
+                # so they don't act on stale position.
+                try:
+                    try:
+                        from autoortho import aostats as _aostats
+                    except ImportError:
+                        import aostats as _aostats
+                    _aostats.set_stat('ac_data_valid', 0)
+                except Exception:
+                    pass
 
                 # Check if we're shutting down before recreating socket
                 if self._shutdown_flag.is_set():
@@ -633,7 +783,8 @@ class DatarefTracker(object):
                         if sun_pitch is not None:
                             self.sun_pitch = sun_pitch
                         self.data_valid = True
-                        
+                        publish_to_store = True
+
                         # Feed the flight averager (alt is in meters, convert to feet)
                         self.flight_averager.add_sample(
                             lat=lat,
@@ -644,10 +795,37 @@ class DatarefTracker(object):
                         )
                     else:
                         self.data_valid = False
+                        publish_to_store = False
                 else:
                     # Not enough values - log and mark invalid
                     log.debug(f"Incomplete packet: got {len(values)}, need 5+")
                     self.data_valid = False
+                    publish_to_store = False
+
+            # Publish to shared_store (parent → workers) OUTSIDE the lock to
+            # avoid holding the per-instance lock across an RPC call.
+            # Workers running in shared_store-follower mode read these keys.
+            if publish_to_store:
+                try:
+                    try:
+                        from autoortho import aostats as _aostats
+                    except ImportError:
+                        import aostats as _aostats
+                    _aostats.set_stat('ac_lat', float(lat))
+                    _aostats.set_stat('ac_lon', float(lon))
+                    _aostats.set_stat('ac_alt', float(alt))
+                    _aostats.set_stat('ac_hdg', float(hdg))
+                    _aostats.set_stat('ac_spd', float(spd))
+                    if local_time is not None:
+                        _aostats.set_stat('ac_local_time_sec', float(local_time))
+                    if pressure_alt is not None:
+                        _aostats.set_stat('ac_pressure_alt', float(pressure_alt))
+                    if sun_pitch is not None:
+                        _aostats.set_stat('ac_sun_pitch', float(sun_pitch))
+                    _aostats.set_stat('ac_lat_ts', time.time())
+                    _aostats.set_stat('ac_data_valid', 1)
+                except Exception as _e:
+                    log.debug(f"datareftrack: failed to publish to shared_store: {_e}")
 
             # Debug logging (uncomment if needed)
             # log.info(

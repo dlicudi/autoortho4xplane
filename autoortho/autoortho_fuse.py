@@ -351,6 +351,21 @@ class AutoOrtho(Operations):
         # path (os.lseek + os.read) without touching Python memory at all.
         self._disk_dds_fhs: set = set()
 
+        # INSTRUMENTATION: per-minute summary of FUSE read perf.
+        # Counters are updated from many threads; the lock is only held briefly
+        # in the read() finally block and the summary thread.
+        self._perf_lock = threading.Lock()
+        self._perf_window_start = time.monotonic()
+        self._perf_reads_total = 0
+        self._perf_reads_slow_16ms = 0
+        self._perf_reads_slow_50ms = 0
+        self._perf_reads_slow_100ms = 0
+        self._perf_reads_slow_500ms = 0
+        self._perf_elapsed_sum_ms = 0.0
+        self._perf_elapsed_max_ms = 0.0
+        self._perf_by_class = {}  # class -> [count, slow_count, sum_ms]
+        self._perf_summary_started = False
+
         self.use_ns = kwargs.get("use_ns", False)
         
         # Initialize time exclusion manager with dataref tracker
@@ -358,6 +373,16 @@ class AutoOrtho(Operations):
             from autoortho.datareftrack import dt as datareftracker
         except ImportError:
             from datareftrack import dt as datareftracker
+        # Ensure the tracker is started in this process.  In worker mode the
+        # patched DatarefTracker.start() launches a shared_store follower
+        # thread instead of a UDP subscriber, so this is safe (and required
+        # — without it, workers see connected=False forever and the
+        # prefetcher never runs).  start() is idempotent (no-op if already
+        # running) so calling it here from the parent path is also safe.
+        try:
+            datareftracker.start()
+        except Exception as _e:
+            log.warning(f"datareftracker.start() failed: {_e}")
         time_exclusion_manager.set_dataref_tracker(datareftracker)
 
     # Helpers
@@ -1128,6 +1153,19 @@ class AutoOrtho(Operations):
 
     #@locked
     def open(self, path, flags):
+        _open_t0 = time.monotonic()
+        _open_classification = ['unknown']  # list = mutable from inner scope
+        try:
+            return self._open_impl(path, flags, _open_classification)
+        finally:
+            _elapsed_ms = (time.monotonic() - _open_t0) * 1000.0
+            if _elapsed_ms > 16.0:
+                log.warning(
+                    f"FUSE_OPEN slow class={_open_classification[0]} "
+                    f"elapsed_ms={_elapsed_ms:.1f} tid={threading.get_ident()} path={path}"
+                )
+
+    def _open_impl(self, path, flags, _class):
 
         log.debug(f"OPEN: {path} {flags}")
         full_path = self._full_path(path)
@@ -1135,6 +1173,7 @@ class AutoOrtho(Operations):
 
         # Handle DSF files with time exclusion redirect
         if self.dsf_re.match(path):
+            _class[0] = 'dsf'
             _uid, _gid, _pid = fuse_get_context()
             # Check if DSF should be redirected to global scenery
             redirect_path = time_exclusion_manager.get_redirect_path(path)
@@ -1153,12 +1192,12 @@ class AutoOrtho(Operations):
                 except OSError as e:
                     log.warning(f"OPEN: Failed to open redirected DSF {redirect_path}: {e}, falling back to ORTHO mode")
                     # Fall through to open the original file
-            
+
             # Normal mode - serve AutoOrtho ortho scenery
             log.info(f"OPEN: DSF [{path}] by pid={_pid} opened in ORTHO mode (AutoOrtho scenery)")
             # Register this DSF as being in use (prevents redirect during active use)
             time_exclusion_manager.register_dsf_open(path)
-        
+
         dds_match = self.dds_re.match(path)
         if dds_match:
             row, col, maptype, zoom = dds_match.groups()
@@ -1178,6 +1217,7 @@ class AutoOrtho(Operations):
             # with no Python tile object in memory — same as Ortho4XP behaviour.
             disk_path = self._get_disk_dds_path(row, col, maptype, zoom)
             if disk_path is not None:
+                _class[0] = 'dds_disk_passthrough'
                 try:
                     fh = os.open(disk_path, flags | os.O_RDONLY) if system_type != 'windows' else os.open(disk_path, flags | os.O_RDONLY | os.O_BINARY)
                     self._disk_dds_fhs.add(fh)
@@ -1189,6 +1229,7 @@ class AutoOrtho(Operations):
                     log.debug(f"OPEN: disk-passthrough failed for {disk_path}: {e}, falling back to TileCacher")
             # --- End disk-passthrough fast path ---
 
+            _class[0] = 'dds_tile'
             t = self.tc._open_tile(row, col, maptype, zoom)
             try:
                 self._set_dds_size_cached(row, col, maptype, zoom, t.dds.total_size)
@@ -1198,8 +1239,10 @@ class AutoOrtho(Operations):
             return 0
 
         if path.endswith('AOISWORKING'):
+            _class[0] = 'aoisworking'
             return 0
 
+        _class[0] = 'file_passthrough'
         if system_type == 'windows':
             return os.open(full_path, flags | os.O_BINARY)
         return os.open(full_path, flags)
@@ -1214,93 +1257,195 @@ class AutoOrtho(Operations):
     #@profile
     #@lru_cache
     def read(self, path, length, offset, fh):
-        log.debug(f"READ: {path} {offset} {length} {fh}")
-        # Disk-passthrough DDS fds fall through to the regular passthrough below
-        if fh in self._disk_dds_fhs:
+        # INSTRUMENTATION: per-read timing — see report at end of method
+        _read_t0 = time.monotonic()
+        _read_classification = 'unknown'
+        _tile_lock_wait_ms = 0.0
+        _tile_get_ms = 0.0
+        try:
+            log.debug(f"READ: {path} {offset} {length} {fh}")
+            # Disk-passthrough DDS fds fall through to the regular passthrough below
+            if fh in self._disk_dds_fhs:
+                _read_classification = 'disk_passthrough'
+                with self.fh_locks.setdefault(fh, threading.Lock()):
+                    os.lseek(fh, offset, os.SEEK_SET)
+                    try:
+                        return os.read(fh, length)
+                    except OSError as e:
+                        raise FuseOSError(e.errno)
+            m = self.dds_re.match(path)
+            if m:
+                _read_classification = 'tile'
+                row, col, maptype, zoom = m.groups()
+                row = int(row)
+                col = int(col)
+                zoom = int(zoom)
+                maptype = self._resolve_dds_maptype(maptype)
+                if getortho.is_shutdown_requested():
+                    log.info(f"Shutdown in progress, returning fallback data for {path}")
+                    return _generate_fallback_dds_bytes(offset, length)
+                key = self._tile_key(row, col, maptype, zoom)
+                lock = self._tile_locks[key]
+
+                # Calculate build_timeout dynamically based on tile_time_budget
+                # This ensures the FUSE lock timeout is always >= the tile build time
+                # Formula: tile_time_budget + fallback_timeout (if enabled) + 15s buffer
+                #
+                # The buffer accounts for:
+                # - DDS read/write operations after tile is built
+                # - Any processing overhead
+                # - Margin of safety to prevent premature lock timeout
+                build_timeout = self._calculate_build_timeout()
+
+                _lock_t0 = time.monotonic()
+                acquired = lock.acquire(timeout=build_timeout)
+                _tile_lock_wait_ms = (time.monotonic() - _lock_t0) * 1000.0
+                if not acquired:
+                    # CRITICAL FIX: Instead of raising EIO (which causes CTD on Windows
+                    # due to EXCEPTION_IN_PAGE_ERROR), return fallback placeholder data.
+                    # X-Plane will show a gray/missing texture, but won't crash.
+                    log.error(f"Tile build lock timeout for {key} after {build_timeout}s - returning fallback data")
+
+                    # ═══════════════════════════════════════════════════════════════
+                    # ENHANCED DIAGNOSTICS: Log tile state to help debug lock stalls
+                    # ═══════════════════════════════════════════════════════════════
+                    try:
+                        t = self.tc.tiles.get(self.tc._to_tile_id(row, col, maptype, zoom))
+                        if t:
+                            diag_refs = getattr(t, 'refs', 'N/A')
+                            diag_ready = t.ready.is_set() if hasattr(t, 'ready') else 'N/A'
+                            diag_dds = t.dds is not None if hasattr(t, 'dds') else 'N/A'
+                            diag_chunks = len(t.chunks) if hasattr(t, 'chunks') else 'N/A'
+                            diag_budget = None
+                            if hasattr(t, '_tile_time_budget') and t._tile_time_budget:
+                                budget = t._tile_time_budget
+                                diag_budget = f"elapsed={budget.elapsed:.1f}s, exhausted={budget.exhausted}"
+
+                            log.error(f"  DIAGNOSTIC: tile={t}, refs={diag_refs}, ready={diag_ready}, "
+                                     f"has_dds={diag_dds}, chunk_zooms={diag_chunks}, budget={diag_budget}")
+                        else:
+                            log.error(f"  DIAGNOSTIC: Tile not found in cache (may have been evicted)")
+                    except Exception as diag_err:
+                        log.error(f"  DIAGNOSTIC: Failed to gather tile state: {diag_err}")
+                    # ═══════════════════════════════════════════════════════════════
+
+                    return _generate_fallback_dds_bytes(offset, length)
+
+                try:
+                    _tile_t0 = time.monotonic()
+                    t = self.tc._get_tile(row, col, maptype, zoom)
+                    _tile_get_ms = (time.monotonic() - _tile_t0) * 1000.0
+                    data = t.read_dds_bytes(offset, length)
+                    if data is None:
+                        log.error(f"Tile read returned None for {key} - returning fallback data")
+                        return _generate_fallback_dds_bytes(offset, length)
+                    return data
+                except FuseOSError:
+                    log.error(f"FUSE error for tile {key} - returning fallback data to prevent CTD")
+                    return _generate_fallback_dds_bytes(offset, length)
+                except Exception as e:
+                    log.error(f"Tile read/build failed for {key} - returning fallback data to prevent CTD")
+                    log.exception("cause:", exc_info=e)
+                    return _generate_fallback_dds_bytes(offset, length)
+                finally:
+                    lock.release()
+
+            # Regular file passthrough
+            _read_classification = 'file_passthrough'
             with self.fh_locks.setdefault(fh, threading.Lock()):
                 os.lseek(fh, offset, os.SEEK_SET)
                 try:
                     return os.read(fh, length)
                 except OSError as e:
                     raise FuseOSError(e.errno)
-        m = self.dds_re.match(path)
-        if m:
-            row, col, maptype, zoom = m.groups()
-            row = int(row)
-            col = int(col)
-            zoom = int(zoom)
-            maptype = self._resolve_dds_maptype(maptype)
-            if getortho.is_shutdown_requested():
-                log.info(f"Shutdown in progress, returning fallback data for {path}")
-                return _generate_fallback_dds_bytes(offset, length)
-            key = self._tile_key(row, col, maptype, zoom)
-            lock = self._tile_locks[key]
-            
-            # Calculate build_timeout dynamically based on tile_time_budget
-            # This ensures the FUSE lock timeout is always >= the tile build time
-            # Formula: tile_time_budget + fallback_timeout (if enabled) + 15s buffer
-            #
-            # The buffer accounts for:
-            # - DDS read/write operations after tile is built
-            # - Any processing overhead
-            # - Margin of safety to prevent premature lock timeout
-            build_timeout = self._calculate_build_timeout()
-
-            if not lock.acquire(timeout=build_timeout):
-                # CRITICAL FIX: Instead of raising EIO (which causes CTD on Windows
-                # due to EXCEPTION_IN_PAGE_ERROR), return fallback placeholder data.
-                # X-Plane will show a gray/missing texture, but won't crash.
-                log.error(f"Tile build lock timeout for {key} after {build_timeout}s - returning fallback data")
-
-                # ═══════════════════════════════════════════════════════════════
-                # ENHANCED DIAGNOSTICS: Log tile state to help debug lock stalls
-                # ═══════════════════════════════════════════════════════════════
-                try:
-                    t = self.tc.tiles.get(self.tc._to_tile_id(row, col, maptype, zoom))
-                    if t:
-                        diag_refs = getattr(t, 'refs', 'N/A')
-                        diag_ready = t.ready.is_set() if hasattr(t, 'ready') else 'N/A'
-                        diag_dds = t.dds is not None if hasattr(t, 'dds') else 'N/A'
-                        diag_chunks = len(t.chunks) if hasattr(t, 'chunks') else 'N/A'
-                        diag_budget = None
-                        if hasattr(t, '_tile_time_budget') and t._tile_time_budget:
-                            budget = t._tile_time_budget
-                            diag_budget = f"elapsed={budget.elapsed:.1f}s, exhausted={budget.exhausted}"
-
-                        log.error(f"  DIAGNOSTIC: tile={t}, refs={diag_refs}, ready={diag_ready}, "
-                                 f"has_dds={diag_dds}, chunk_zooms={diag_chunks}, budget={diag_budget}")
-                    else:
-                        log.error(f"  DIAGNOSTIC: Tile not found in cache (may have been evicted)")
-                except Exception as diag_err:
-                    log.error(f"  DIAGNOSTIC: Failed to gather tile state: {diag_err}")
-                # ═══════════════════════════════════════════════════════════════
-
-                return _generate_fallback_dds_bytes(offset, length)
-
+        finally:
+            _elapsed_ms = (time.monotonic() - _read_t0) * 1000.0
+            # Threshold: 1 frame at 60fps = 16.7ms.  Log everything above that.
+            if _elapsed_ms > 16.0:
+                log.warning(
+                    f"FUSE_READ slow class={_read_classification} "
+                    f"elapsed_ms={_elapsed_ms:.1f} tile_lock_wait_ms={_tile_lock_wait_ms:.1f} "
+                    f"tile_get_ms={_tile_get_ms:.1f} size={length} offset={offset} "
+                    f"tid={threading.get_ident()} fh={fh} path={path}"
+                )
+            # Aggregate into per-minute summary counters
             try:
-                t = self.tc._get_tile(row, col, maptype, zoom)
-                data = t.read_dds_bytes(offset, length)
-                if data is None:
-                    log.error(f"Tile read returned None for {key} - returning fallback data")
-                    return _generate_fallback_dds_bytes(offset, length)
-                return data
-            except FuseOSError:
-                log.error(f"FUSE error for tile {key} - returning fallback data to prevent CTD")
-                return _generate_fallback_dds_bytes(offset, length)
+                with self._perf_lock:
+                    self._perf_reads_total += 1
+                    self._perf_elapsed_sum_ms += _elapsed_ms
+                    if _elapsed_ms > self._perf_elapsed_max_ms:
+                        self._perf_elapsed_max_ms = _elapsed_ms
+                    if _elapsed_ms > 16.0:
+                        self._perf_reads_slow_16ms += 1
+                    if _elapsed_ms > 50.0:
+                        self._perf_reads_slow_50ms += 1
+                    if _elapsed_ms > 100.0:
+                        self._perf_reads_slow_100ms += 1
+                    if _elapsed_ms > 500.0:
+                        self._perf_reads_slow_500ms += 1
+                    bucket = self._perf_by_class.get(_read_classification)
+                    if bucket is None:
+                        bucket = [0, 0, 0.0]
+                        self._perf_by_class[_read_classification] = bucket
+                    bucket[0] += 1
+                    if _elapsed_ms > 16.0:
+                        bucket[1] += 1
+                    bucket[2] += _elapsed_ms
+                    if not self._perf_summary_started:
+                        self._perf_summary_started = True
+                        threading.Thread(
+                            target=self._perf_summary_loop,
+                            name='FUSE_PERF_SUMMARY',
+                            daemon=True,
+                        ).start()
+            except Exception:
+                pass
+
+    def _perf_summary_loop(self):
+        """Emit a one-line FUSE_PERF_SUMMARY at WARN every 60s.
+
+        Reads/clears the counters atomically under _perf_lock.
+        """
+        while True:
+            time.sleep(60.0)
+            try:
+                with self._perf_lock:
+                    now = time.monotonic()
+                    window_s = max(0.001, now - self._perf_window_start)
+                    total = self._perf_reads_total
+                    if total == 0:
+                        # No reads — skip the line but reset the window anyway
+                        self._perf_window_start = now
+                        continue
+                    avg_ms = self._perf_elapsed_sum_ms / total
+                    max_ms = self._perf_elapsed_max_ms
+                    by_class_parts = []
+                    for cls, b in sorted(self._perf_by_class.items()):
+                        cls_avg = b[2] / max(1, b[0])
+                        by_class_parts.append(
+                            f"{cls}={b[0]}({b[1]}slow,{cls_avg:.1f}ms_avg)"
+                        )
+                    log.warning(
+                        f"FUSE_PERF_SUMMARY window={window_s:.0f}s reads={total} "
+                        f"slow_16ms={self._perf_reads_slow_16ms} "
+                        f"slow_50ms={self._perf_reads_slow_50ms} "
+                        f"slow_100ms={self._perf_reads_slow_100ms} "
+                        f"slow_500ms={self._perf_reads_slow_500ms} "
+                        f"avg_ms={avg_ms:.1f} max_ms={max_ms:.1f} "
+                        f"by_class=[{','.join(by_class_parts)}]"
+                    )
+                    # Reset window
+                    self._perf_window_start = now
+                    self._perf_reads_total = 0
+                    self._perf_reads_slow_16ms = 0
+                    self._perf_reads_slow_50ms = 0
+                    self._perf_reads_slow_100ms = 0
+                    self._perf_reads_slow_500ms = 0
+                    self._perf_elapsed_sum_ms = 0.0
+                    self._perf_elapsed_max_ms = 0.0
+                    self._perf_by_class.clear()
             except Exception as e:
-                log.error(f"Tile read/build failed for {key} - returning fallback data to prevent CTD")
-                log.exception("cause:", exc_info=e)
-                return _generate_fallback_dds_bytes(offset, length)
-            finally:
-                lock.release()
-
-        # Regular file passthrough
-        with self.fh_locks.setdefault(fh, threading.Lock()):
-            os.lseek(fh, offset, os.SEEK_SET)
-            try:
-                return os.read(fh, length)
-            except OSError as e:
-                raise FuseOSError(e.errno)
+                log.debug(f"FUSE_PERF_SUMMARY error: {e}")
 
     # X-Plane never writes to files in the FUSE mount
     def _write(self, path, buf, offset, fh):
