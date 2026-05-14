@@ -360,21 +360,41 @@ AODECODE_API void aodecode_pool_stats_ex(
 /*============================================================================
  * Persistent TurboJPEG Decoder Pool
  *============================================================================
- * Maintains a pool of persistent TurboJPEG decoder handles, one per OpenMP
- * thread. This eliminates the overhead of creating/destroying handles in
- * each parallel decode loop (~0.15ms per thread per call).
+ * Maintains a persistent TurboJPEG decoder handle PER POSIX THREAD using
+ * thread-local storage.  This eliminates the overhead of creating/destroying
+ * handles in each parallel decode loop (~0.15ms per thread per call).
  *
- * Thread Safety:
- * - Initialization uses mutex for thread-safe lazy init
- * - Each thread accesses only its own slot (indexed by omp_get_thread_num())
- * - Cleanup should only be called during shutdown
+ * Why per-POSIX-thread, not per-OMP-thread-number:
+ *   The previous implementation indexed a shared global array by
+ *   omp_get_thread_num().  That value is only unique WITHIN one OpenMP
+ *   parallel team — when multiple parallel regions run concurrently (e.g.
+ *   from independent POSIX caller threads each entering their own
+ *   #pragma omp parallel inside aodds_builder_finalize_to_file), each
+ *   team has its own "thread 0", "thread 1", etc.  Both teams' thread 0
+ *   would grab g_persistent_decoders[0] and concurrently call
+ *   tjDecompress2() on the SAME libjpeg-turbo handle, corrupting its
+ *   internal state and producing SIGBUS at tjDecompress2+40.
+ *
+ *   Thread-local storage gives each actual POSIX thread its own decoder,
+ *   eliminating the sharing entirely.
+ *
+ * Trade-off:
+ *   Decoders are not freed on thread exit (TLS destructors for non-trivial
+ *   C types require pthread_key_create with a destructor).  In practice
+ *   OMP worker threads persist for the lifetime of the process so this is
+ *   a no-op leak that the OS reclaims at process exit.
  */
 
-/* Persistent TurboJPEG decoder handles - one per OpenMP thread */
-static tjhandle g_persistent_decoders[MAX_OMP_THREADS] = {NULL};
+#if defined(_MSC_VER)
+#define AO_THREAD_LOCAL __declspec(thread)
+#else
+#define AO_THREAD_LOCAL __thread
+#endif
+
+static AO_THREAD_LOCAL tjhandle t_persistent_decoder = NULL;
 static int g_decoders_initialized = 0;
 
-/* Mutex for thread-safe initialization */
+/* Mutex retained for the init-flag toggle in aodecode_init_persistent_decoders */
 #ifdef AOPIPELINE_WINDOWS
 static CRITICAL_SECTION g_decoder_cs;
 static int g_decoder_cs_initialized = 0;
@@ -394,70 +414,47 @@ static pthread_mutex_t g_decoder_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 /**
- * Get or create a persistent decoder for the current thread.
- * 
- * Returns the persistent decoder if available, or creates a new one
- * if this is the first call from this thread.
- * 
- * Falls back to creating a non-persistent handle if thread ID is out
- * of range - caller must check and destroy these with is_persistent_decoder().
+ * Get or create a persistent decoder for the current POSIX thread.
+ *
+ * Each POSIX thread (whether it's an OMP worker in team A or team B, or a
+ * direct Python worker) gets its own libjpeg-turbo handle via TLS.  No
+ * sharing of handles across threads, no race conditions.
  */
 static tjhandle get_thread_decoder(void) {
-#if AOPIPELINE_HAS_OPENMP
-    int tid = omp_get_thread_num();
-    if (tid >= 0 && tid < MAX_OMP_THREADS) {
-        if (!g_persistent_decoders[tid]) {
-            /* Double-checked locking for thread-safe lazy init */
-            DECODER_LOCK();
-            if (!g_persistent_decoders[tid]) {
-                g_persistent_decoders[tid] = tjInitDecompress();
-            }
-            DECODER_UNLOCK();
-        }
-        return g_persistent_decoders[tid];
+    if (!t_persistent_decoder) {
+        t_persistent_decoder = tjInitDecompress();
     }
-#endif
-    /* Fallback for non-OpenMP or thread ID overflow - caller must destroy */
-    return tjInitDecompress();
+    return t_persistent_decoder;
 }
 
 /**
  * Check if a decoder handle is from the persistent pool.
- * 
- * Returns 1 if the handle is persistent (don't destroy it),
- * 0 if it was created as a fallback (caller should destroy).
+ *
+ * With TLS, every handle returned by get_thread_decoder() on the current
+ * thread is persistent and matches this thread's TLS slot.  Callers always
+ * pair get_thread_decoder() and is_persistent_decoder() on the same thread,
+ * so this returns 1 for the local TLS handle.  Handles from other threads
+ * (or NULL) return 0, but such cross-thread checks are not part of the
+ * intended API.
  */
 static int is_persistent_decoder(tjhandle tjh) {
-    if (!tjh) return 0;
-#if AOPIPELINE_HAS_OPENMP
-    for (int i = 0; i < MAX_OMP_THREADS; i++) {
-        if (g_persistent_decoders[i] == tjh) return 1;
-    }
-#endif
-    return 0;
+    return tjh != NULL && tjh == t_persistent_decoder;
 }
 
 AODECODE_API void aodecode_init_persistent_decoders(void) {
     if (g_decoders_initialized) return;
-    
+
     DECODER_LOCK();
     if (!g_decoders_initialized) {
 #if AOPIPELINE_HAS_OPENMP
-        /* Initialize in parallel to create one handle per thread */
+        /* Warm up TLS for each OMP worker so the first real decode doesn't
+         * pay the tjInitDecompress() cost.  Each thread sets its own TLS. */
         #pragma omp parallel
         {
-            int tid = omp_get_thread_num();
-            if (tid >= 0 && tid < MAX_OMP_THREADS) {
-                if (!g_persistent_decoders[tid]) {
-                    g_persistent_decoders[tid] = tjInitDecompress();
-                }
-            }
+            get_thread_decoder();
         }
 #else
-        /* Single-threaded: just init one decoder */
-        if (!g_persistent_decoders[0]) {
-            g_persistent_decoders[0] = tjInitDecompress();
-        }
+        get_thread_decoder();
 #endif
         g_decoders_initialized = 1;
     }
@@ -465,12 +462,14 @@ AODECODE_API void aodecode_init_persistent_decoders(void) {
 }
 
 AODECODE_API void aodecode_cleanup_persistent_decoders(void) {
+    /* With TLS handles we cannot enumerate decoders owned by other threads.
+     * The calling thread's handle (if any) is freed here; the rest leak
+     * until process exit, where the OS reclaims them.  This is the
+     * deliberate trade-off for thread-safety under concurrent OMP regions. */
     DECODER_LOCK();
-    for (int i = 0; i < MAX_OMP_THREADS; i++) {
-        if (g_persistent_decoders[i]) {
-            tjDestroy(g_persistent_decoders[i]);
-            g_persistent_decoders[i] = NULL;
-        }
+    if (t_persistent_decoder) {
+        tjDestroy(t_persistent_decoder);
+        t_persistent_decoder = NULL;
     }
     g_decoders_initialized = 0;
     DECODER_UNLOCK();

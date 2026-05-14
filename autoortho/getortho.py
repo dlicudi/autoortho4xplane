@@ -3677,6 +3677,30 @@ class BackgroundDDSBuilder:
         self._builds_failed = 0
         self._active_builds = 0
         self._active_lock = threading.Lock()
+        # INSTRUMENTATION: tile_id -> (start_monotonic, thread_id) for any
+        # currently-running build.  Used by the build watchdog to detect
+        # hangs / very long builds.
+        self._active_builds_meta: Dict[str, Tuple[float, int]] = {}
+        # INSTRUMENTATION: tile_id -> stage name (set by each build phase
+        # so the watchdog can report where a hung build is stuck).
+        self._build_stages: Dict[str, str] = {}
+        # Tracks tile_ids we've already warned about for this build to avoid
+        # spamming logs every watchdog tick.
+        self._warned_long_builds: set = set()
+
+    def _set_build_stage(self, tile_id, stage: str) -> None:
+        """Record the current pipeline stage for a tile being built.
+
+        Called from the build hot path; takes the active lock briefly to
+        keep _build_stages consistent with _active_builds_meta.
+        """
+        if tile_id is None:
+            return
+        try:
+            with self._active_lock:
+                self._build_stages[tile_id] = stage
+        except Exception:
+            pass
     
     def start(self) -> None:
         """Start the background builder."""
@@ -3821,6 +3845,26 @@ class BackgroundDDSBuilder:
                 )
                 _last_heartbeat = _now
 
+                # WATCHDOG: warn about any build that has been running >30s.
+                # If this fires, the streaming chunk-wait loop is almost
+                # certainly hung waiting for chunks that will never arrive,
+                # which prevents the build slot from freeing.
+                _now_mono = time.monotonic()
+                stuck = []
+                with self._active_lock:
+                    for tid_str, (start_t, _tid_num) in self._active_builds_meta.items():
+                        age = _now_mono - start_t
+                        if age > 30.0 and tid_str not in self._warned_long_builds:
+                            stage = self._build_stages.get(tid_str, "<unset>")
+                            stuck.append((tid_str, age, _tid_num, stage))
+                            self._warned_long_builds.add(tid_str)
+                for tid_str, age, _tid_num, stage in stuck:
+                    log.warning(
+                        f"PIPELINE_TRACE build_stuck pid={os.getpid()} "
+                        f"tile={tid_str} thread={_tid_num} age_s={age:.1f} "
+                        f"stage='{stage}'"
+                    )
+
             # Yield all resources to live tile reads when X-Plane is active
             if is_live_building():
                 continue
@@ -3863,6 +3907,16 @@ class BackgroundDDSBuilder:
     def _build_tile_wrapper(self, priority, tile) -> None:
         """Wrapper for _build_tile_dds that handles exceptions and stats."""
         deferred = False
+        # INSTRUMENTATION: track build start so the watchdog can detect hangs.
+        _build_t0 = time.monotonic()
+        _tile_id_for_meta = getattr(tile, 'id', None)
+        _tid = threading.get_ident()
+        if _tile_id_for_meta is not None:
+            with self._active_lock:
+                # If the same tile_id is rebuilt while still tracked, key
+                # collision is fine — the second wrapper will overwrite the
+                # first.  Watchdog still reports a stuck build correctly.
+                self._active_builds_meta[_tile_id_for_meta] = (_build_t0, _tid)
         try:
             if is_shutdown_requested():
                 bump('prebuilt_dds_skip_shutdown')
@@ -3887,6 +3941,21 @@ class BackgroundDDSBuilder:
                     tile._clear_mm0_promotion_pin()
                 except Exception:
                     pass
+            # INSTRUMENTATION: emit build end + duration, drop metadata.
+            _dur_ms = (time.monotonic() - _build_t0) * 1000.0
+            if _tile_id_for_meta is not None:
+                with self._active_lock:
+                    self._active_builds_meta.pop(_tile_id_for_meta, None)
+                    self._build_stages.pop(_tile_id_for_meta, None)
+                    self._warned_long_builds.discard(_tile_id_for_meta)
+            # Only log long builds at INFO to avoid log spam on the common
+            # fast path.  Builds over 5s are unusual and worth seeing.
+            if _dur_ms > 5000:
+                log.warning(
+                    f"PIPELINE_TRACE build_end pid={os.getpid()} tid={_tid} "
+                    f"tile={_tile_id_for_meta} dur_ms={_dur_ms:.0f} "
+                    f"(slow)"
+                )
             with self._active_lock:
                 self._active_builds -= 1
             self._work_event.set()  # Signal coordinator a slot freed up
@@ -3966,7 +4035,8 @@ class BackgroundDDSBuilder:
             'format': dxt_format,
             'missing_color': missing_color
         }
-        
+
+        self._set_build_stage(tile_id, "acquire_streaming_builder")
         builder = builder_pool.acquire(config=config, timeout=30.0)
         if not builder:
             log.warning(f"BackgroundDDSBuilder: Failed to acquire streaming builder for {tile_id}")
@@ -4009,34 +4079,59 @@ class BackgroundDDSBuilder:
             # ZERO-COPY: Batch add chunks using nocopy mode
             # C stores pointers directly, we keep references in jpeg_refs_for_nocopy
             if ready_chunks:
+                self._set_build_stage(tile_id, f"add_chunks_batch_nocopy(n={len(ready_chunks)})")
                 builder.add_chunks_batch_nocopy(ready_chunks, jpeg_refs_for_nocopy)
+            self._set_build_stage(tile_id, f"process_pending_chunks(n={len(pending_indices)})")
             
             # Phase 2: Process remaining chunks with transition handling
             # Key difference from live: NO initial time budget, but may get one on transition
-            for i in pending_indices:
+            # INSTRUMENTATION: log slow chunk waits so we can see where builds hang.
+            _slow_chunk_count = 0
+            for _pending_idx_pos, i in enumerate(pending_indices):
                 chunk = chunks[i]
                 _defer_background_build_if_live(tile)
-                
+
                 # === TRANSITION CHECK ===
                 # If tile became live, use its time budget for remaining work
                 time_budget = tile._tile_time_budget if tile._is_live else None
-                
+
                 if tile._is_live and time_budget and time_budget.exhausted:
                     builder.mark_missing(i)
                     prefetch_mm0_missing.append(i)
                     continue
-                
+
                 # Wait for chunk - but check for live transition periodically
+                _chunk_wait_t0 = time.monotonic()
+                _chunk_warned = False
                 while not chunk.ready.is_set():
                     # Short wait to allow transition detection
                     chunk.ready.wait(timeout=0.1)
                     _defer_background_build_if_live(tile)
-                    
+
                     # Check for live transition
                     if tile._is_live:
                         time_budget = tile._tile_time_budget
                         if time_budget and time_budget.exhausted:
                             break  # Budget exhausted, move on
+
+                    # INSTRUMENTATION: warn once per chunk that has been
+                    # waiting >10s.  This is the smoking-gun signal for the
+                    # build-hang we're chasing.
+                    _wait_age = time.monotonic() - _chunk_wait_t0
+                    if not _chunk_warned and _wait_age > 10.0:
+                        _chunk_warned = True
+                        _slow_chunk_count += 1
+                        log.warning(
+                            f"PIPELINE_TRACE chunk_wait_slow pid={os.getpid()} "
+                            f"tile={tile_id} chunk_idx={i} "
+                            f"chunks_done={_pending_idx_pos}/{len(pending_indices)} "
+                            f"chunk_ready={chunk.ready.is_set()} "
+                            f"chunk_in_flight={getattr(chunk, 'in_flight', '?')} "
+                            f"chunk_in_queue={getattr(chunk, 'in_queue', '?')} "
+                            f"chunk_perm_fail={getattr(chunk, 'permanent_failure', '?')} "
+                            f"chunk_attempt={getattr(chunk, 'attempt', '?')} "
+                            f"age_s={_wait_age:.1f}"
+                        )
                 
                 # Determine fallback budget (None if prefetching, from tile if live)
                 fb_budget = None
@@ -4084,15 +4179,18 @@ class BackgroundDDSBuilder:
             # Finalize directly to disk via DynamicDDSCache staging path
             if self._dds_cache is not None:
                 _defer_background_build_if_live(tile)
+                self._set_build_stage(tile_id, "get_staging_path")
                 staging_path = self._dds_cache.get_staging_path(tile_id, tile.max_zoom, tile)
                 if not staging_path:
                     return False
+                self._set_build_stage(tile_id, "native_build_context+finalize_to_file")
                 with _native_build_context() as threads:
                     success, bytes_written = builder.finalize_to_file(
                         staging_path, max_threads=threads
                     )
-                
+
                 if success and bytes_written >= 128:
+                    self._set_build_stage(tile_id, "store_from_file")
                     self._dds_cache.store_from_file(
                         tile_id, tile.max_zoom, staging_path, tile,
                         mm0_missing_indices=prefetch_mm0_missing or None,
@@ -4151,7 +4249,8 @@ class BackgroundDDSBuilder:
         mipmap_images = []  # Track images for cleanup
         lock_acquired = False
         _defer_background_build_if_live(tile)
-        
+        self._set_build_stage(tile_id, "_build_tile_dds:entry")
+
         # ═══════════════════════════════════════════════════════════════════════
         # TRY STREAMING BUILDER FIRST (if enabled)
         # ═══════════════════════════════════════════════════════════════════════
@@ -4161,10 +4260,12 @@ class BackgroundDDSBuilder:
         # - No time budget for prefetch (takes as long as needed for quality)
         # ═══════════════════════════════════════════════════════════════════════
         if getattr(CFG.autoortho, 'streaming_builder_enabled', True):
+            self._set_build_stage(tile_id, "try_streaming_prefetch_build")
             if self._try_streaming_prefetch_build(tile, tile_id, build_start):
                 return
             _defer_background_build_if_live(tile)
-        
+            self._set_build_stage(tile_id, "streaming_returned_false")
+
         # ═══════════════════════════════════════════════════════════════════════
         # TRY OPTIMAL HYBRID DDS BUILDING FIRST
         # ═══════════════════════════════════════════════════════════════════════
@@ -4232,11 +4333,13 @@ class BackgroundDDSBuilder:
 
                                 if valid_count > 0:
                                     _defer_background_build_if_live(tile)
+                                    self._set_build_stage(tile_id, "hybrid_direct:get_staging_path")
                                     staging_path = self._dds_cache.get_staging_path(
                                         tile_id, tile.max_zoom, tile)
                                     if not staging_path:
                                         return
-                                    
+
+                                    self._set_build_stage(tile_id, "hybrid_direct:native_build_from_jpegs_to_file")
                                     with _native_build_context() as threads:
                                         result = native_dds.build_from_jpegs_to_file(
                                             jpeg_datas,
@@ -4271,6 +4374,7 @@ class BackgroundDDSBuilder:
                         # Used when direct-to-disk unavailable or fails
                         # ═══════════════════════════════════════════════════════════════
                         try:
+                            self._set_build_stage(tile_id, "hybrid_buffer:_build_dds_hybrid")
                             dds_bytes = _build_dds_hybrid(
                                 chunks=chunks_for_hybrid,
                                 dxt_format=dxt_format,
@@ -4317,11 +4421,13 @@ class BackgroundDDSBuilder:
                     hasattr(native_dds, 'build_tile_to_file')):
                     try:
                         _defer_background_build_if_live(tile)
+                        self._set_build_stage(tile_id, "native_direct:get_staging_path")
                         staging_path = self._dds_cache.get_staging_path(
                             tile_id, tile.max_zoom, tile)
                         if not staging_path:
                             return
 
+                        self._set_build_stage(tile_id, "native_direct:build_tile_to_file")
                         with _native_build_context():
                             result = native_dds.build_tile_to_file(
                                 cache_dir=tile.cache_dir,
@@ -4377,9 +4483,10 @@ class BackgroundDDSBuilder:
                     bump('prefetch_pool_unavailable')
                     return
                 _defer_background_build_if_live(tile)
-                
+
                 # BLOCKING ACQUIRE: Wait for buffer (low priority - back of queue)
                 # Prefetch tiles yield to live tiles automatically via priority queue
+                self._set_build_stage(tile_id, "native_buffered:pool_acquire(timeout=60s)")
                 wait_start = time.monotonic()
                 try:
                     buffer, buffer_id = pool.acquire(timeout=60.0, priority=PRIORITY_PREFETCH)
@@ -4393,6 +4500,7 @@ class BackgroundDDSBuilder:
                 
                 try:
                     _defer_background_build_if_live(tile)
+                    self._set_build_stage(tile_id, "native_buffered:build_tile_to_buffer")
                     with _native_build_context():
                         result = native_dds.build_tile_to_buffer(
                             buffer,
@@ -4441,6 +4549,7 @@ class BackgroundDDSBuilder:
         
         try:
             _defer_background_build_if_live(tile)
+            self._set_build_stage(tile_id, "python_fallback:entry")
             # ═══════════════════════════════════════════════════════════════════
             # LOCK CONTENTION AVOIDANCE
             # ═══════════════════════════════════════════════════════════════════

@@ -1082,14 +1082,23 @@ def _calculate_decode_memory_limit() -> int:
     """
     Calculate memory limit for overflow decode buffers.
 
-    The fixed pool handles normal bursts. Overflow exists for short spikes but
-    is capped tightly so prefetch/decode work cannot consume a large fraction
-    of the process memory budget.
+    Each RGBA buffer is ~256 KB (256x256x4).  A single streaming build can
+    hold up to ~256 buffers concurrently when most chunks need fallbacks
+    (one buffer per fallback chunk, held for the lifetime of the build).
+    With multiple concurrent builds plus the OpenMP fan-out inside
+    finalize_to_file, demand can briefly exceed the fixed pool.
+
+    The previous 128 MB cap was reached in practice by 2 concurrent builds
+    on tiles with many fallback chunks, causing aodecode_acquire_buffer to
+    block on the pool's condition variable while each build was already
+    holding its own fallback buffers — a classic resource-starvation
+    deadlock.  Raising the cap to 1 GB gives ~4000 overflow buffer slots,
+    which comfortably absorbs the worst-case demand we've observed.
 
     Returns:
         Memory limit in bytes
     """
-    return 128 * 1024 * 1024
+    return 1024 * 1024 * 1024
 
 
 def get_default_decode_pool() -> Optional[AoDecode.BufferPool]:
