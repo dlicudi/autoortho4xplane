@@ -2633,10 +2633,6 @@ class SpatialPrefetcher:
 
         Falls back to velocity-based prefetching if aircraft deviates from route.
         """
-        # Yield all resources to live tile reads when X-Plane is active
-        if is_live_building():
-            return
-
         # Check if tile_cacher is available
         if self._tile_cacher is None:
             return
