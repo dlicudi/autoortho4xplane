@@ -2,6 +2,7 @@ import os
 import sys
 import logging
 import shutil
+import subprocess
 from pathlib import Path
 
 log = logging.getLogger(__name__)
@@ -40,11 +41,63 @@ def safe_ismount(path) -> bool:
 _IGNORE_FILES = {".DS_Store", ".metadata_never_index"}
 _AO_PLACEHOLDER_ITEMS = {"Earth nav data", "terrain", "textures", ".AO_PLACEHOLDER"}
 
+def _kill_stale_workers(mountpoint):
+    """Kill any orphan AO worker processes that have mountpoint in their argv."""
+    import signal as _signal
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", mountpoint],
+            capture_output=True, text=True,
+        )
+        pids = [int(p) for p in result.stdout.split() if p.strip().isdigit()]
+        own_pid = os.getpid()
+        for pid in pids:
+            if pid == own_pid:
+                continue
+            try:
+                os.kill(pid, _signal.SIGTERM)
+                log.info(f"Sent SIGTERM to stale worker pid {pid} for {mountpoint}")
+            except ProcessLookupError:
+                pass
+            except Exception as e:
+                log.warning(f"Failed to signal stale worker pid {pid}: {e}")
+    except Exception as e:
+        log.debug(f"_kill_stale_workers: pgrep failed: {e}")
+
+
+def _force_unmount(mountpoint):
+    """Kill stale workers and issue a platform-specific unmount. Does not raise."""
+    _kill_stale_workers(mountpoint)
+    try:
+        if sys.platform == 'darwin':
+            subprocess.run(
+                ["diskutil", "unmount", "force", mountpoint],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        elif shutil.which("fusermount"):
+            subprocess.run(
+                ["fusermount", "-u", "-z", mountpoint],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        else:
+            subprocess.run(
+                ["umount", "-l", mountpoint],
+                check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+    except Exception as e:
+        log.warning(f"_force_unmount: {mountpoint}: {e}")
+
+
 def cleanup_mountpoint(mountpoint):
     placeholder_path = os.path.join(mountpoint, ".AO_PLACEHOLDER")
-    if os.path.lexists(mountpoint):
+    if safe_ismount(mountpoint):
         log.info(f"Cleaning up mountpoint: {mountpoint}")
-        os.rmdir(mountpoint)
+        _force_unmount(mountpoint)
+    if os.path.lexists(mountpoint) and not safe_ismount(mountpoint):
+        try:
+            os.rmdir(mountpoint)
+        except OSError:
+            pass
     if safe_ismount(mountpoint):
         log.debug(f"Skipping cleanup: still mounted: {mountpoint}")
     else:
