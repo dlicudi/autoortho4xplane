@@ -10541,6 +10541,7 @@ class TileCacher(object):
     
     def _save_tile_to_passthrough(self, t):
         """Write a fully-built tile's DDS to the passthrough cache directory."""
+        tmp_path = None
         try:
             if dynamic_dds_cache is None or not dynamic_dds_cache._enabled:
                 return
@@ -10582,7 +10583,7 @@ class TileCacher(object):
             pt_path = os.path.join(passthrough_root, rel)
             if os.path.exists(pt_path):
                 return
-            tmp_path = pt_path + f'.tmp.{os.getpid()}'
+            tmp_path = pt_path + f'.tmp.{os.getpid()}.{threading.get_ident()}'
             os.makedirs(os.path.dirname(pt_path), exist_ok=True)
             t.dds.write(tmp_path)
 
@@ -10598,10 +10599,11 @@ class TileCacher(object):
             log.debug(f"Saved live-built tile {t.id} to passthrough cache")
         except Exception as e:
             log.debug(f"Failed to save tile to passthrough: {e}")
-            try:
-                os.unlink(pt_path + f'.tmp.{os.getpid()}')
-            except OSError:
-                pass
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def _close_tile(self, row, col, map_type, zoom):
         tile_id = self._to_tile_id(row, col, map_type, zoom)

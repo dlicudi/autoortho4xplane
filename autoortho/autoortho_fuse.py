@@ -868,7 +868,7 @@ class AutoOrtho(Operations):
             import zstandard as _zstd
         except ImportError:
             return None
-        tmp_path = pt_path + f'.tmp.{os.getpid()}'
+        tmp_path = pt_path + f'.tmp.{os.getpid()}.{threading.get_ident()}'
         try:
             with open(compressed_path, 'rb') as _f:
                 raw = _f.read()
