@@ -17,15 +17,85 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stdarg.h>
+#include <stdlib.h>
 #include <turbojpeg.h>
 
 #ifdef AOPIPELINE_WINDOWS
 #include <windows.h>
 #include <io.h>  /* For _get_osfhandle, _fileno */
+#include <process.h> /* _getpid */
+#define ao_getpid() ((int)_getpid())
+#define ao_thread_id() ((unsigned long)GetCurrentThreadId())
 #else
 #include <dlfcn.h>
 #include <sys/time.h>
+#include <unistd.h>      /* getpid */
+#include <pthread.h>     /* pthread_self */
+#define ao_getpid() ((int)getpid())
+#define ao_thread_id() ((unsigned long)pthread_self())
 #endif
+
+/* ============================================================================
+ * Crash-debug stage tracing for aodds_builder_finalize_to_file.
+ *
+ * Writes per-stage markers to ~/.autoortho-data/logs/aodds_trace.log so that
+ * when the worker process crashes inside the native finalize path, the last
+ * line in this file pinpoints which stage was running at the crash site.
+ *
+ * This is intentionally heavyweight (line-buffered, mutex-serialised) so
+ * that the trace is consistent across concurrent builds.  Strip once the
+ * remaining concurrent-finalize race is identified and fixed.
+ * ============================================================================ */
+static FILE* g_aodds_trace_fp = NULL;
+#ifdef AOPIPELINE_WINDOWS
+static CRITICAL_SECTION g_aodds_trace_cs;
+static int g_aodds_trace_cs_init = 0;
+#define AODDS_TRACE_LOCK() do { \
+    if (!g_aodds_trace_cs_init) { InitializeCriticalSection(&g_aodds_trace_cs); g_aodds_trace_cs_init = 1; } \
+    EnterCriticalSection(&g_aodds_trace_cs); \
+} while(0)
+#define AODDS_TRACE_UNLOCK() LeaveCriticalSection(&g_aodds_trace_cs)
+#else
+static pthread_mutex_t g_aodds_trace_mutex = PTHREAD_MUTEX_INITIALIZER;
+#define AODDS_TRACE_LOCK() pthread_mutex_lock(&g_aodds_trace_mutex)
+#define AODDS_TRACE_UNLOCK() pthread_mutex_unlock(&g_aodds_trace_mutex)
+#endif
+
+static void aodds_trace_open_if_needed(void) {
+    if (g_aodds_trace_fp) return;
+    const char* home = getenv("HOME");
+    if (!home) {
+#ifdef AOPIPELINE_WINDOWS
+        home = getenv("USERPROFILE");
+#endif
+    }
+    if (!home) return;
+    char path[1024];
+    snprintf(path, sizeof(path),
+             "%s/.autoortho-data/logs/aodds_trace.log", home);
+    FILE* fp = fopen(path, "a");
+    if (fp) {
+        setvbuf(fp, NULL, _IOLBF, 0);
+        g_aodds_trace_fp = fp;
+    }
+}
+
+static void aodds_trace_emit(const char* fmt, ...) {
+    AODDS_TRACE_LOCK();
+    aodds_trace_open_if_needed();
+    if (g_aodds_trace_fp) {
+        fprintf(g_aodds_trace_fp, "AODDS_TRACE pid=%d tid=%lu ",
+                ao_getpid(), ao_thread_id());
+        va_list ap;
+        va_start(ap, fmt);
+        vfprintf(g_aodds_trace_fp, fmt, ap);
+        va_end(ap);
+        fputc('\n', g_aodds_trace_fp);
+        fflush(g_aodds_trace_fp);
+    }
+    AODDS_TRACE_UNLOCK();
+}
 
 /* ============================================================================
  * SIMD Detection and Headers
@@ -4116,11 +4186,14 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
     if (!builder || !output_path || !bytes_written) {
         return 0;
     }
-    
+
     int32_t chunks_per_side = builder->config.chunks_per_side;
     int32_t tile_size = chunks_per_side * CHUNK_SIZE;
     int32_t mipmap_count = aodds_calc_mipmap_count(tile_size, tile_size);
-    
+
+    aodds_trace_emit("finalize ENTER builder=%p output=%s tile_size=%d mipmap_count=%d max_threads=%d",
+                     (void*)builder, output_path, tile_size, mipmap_count, max_threads);
+
     /* Allocate tile image if not already */
     if (!builder->tile_allocated) {
         builder->tile_image.width = tile_size;
@@ -4129,11 +4202,13 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
         builder->tile_image.channels = 4;
         builder->tile_image.data = (uint8_t*)malloc(tile_size * tile_size * 4);
         if (!builder->tile_image.data) {
+            aodds_trace_emit("finalize FAIL tile_image_malloc builder=%p", (void*)builder);
             return 0;
         }
         builder->tile_allocated = 1;
     }
-    
+    aodds_trace_emit("finalize TILE_IMG_READY builder=%p data=%p", (void*)builder, (void*)builder->tile_image.data);
+
     /* ═══════════════════════════════════════════════════════════════════════
      * PARALLEL DECODE: Decode all pending JPEGs at once using OpenMP
      * OpenMP efficiently handles loops with early-continues, so no need to
@@ -4141,6 +4216,9 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
      * ═══════════════════════════════════════════════════════════════════════ */
     int32_t decode_success_count = 0;
     int32_t decode_fail_count = 0;
+
+    aodds_trace_emit("finalize PRE_PARALLEL_DECODE builder=%p chunk_count=%d max_threads=%d",
+                     (void*)builder, builder->chunk_count, max_threads);
 
 #if AOPIPELINE_HAS_OPENMP
     /* Parallel decode all pending JPEGs - OpenMP handles empty iterations efficiently */
@@ -4186,37 +4264,51 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
     builder->status.chunks_decoded += decode_success_count;
     builder->status.chunks_failed += decode_fail_count;
     builder->status.chunks_missing += decode_fail_count;
-    
+
+    aodds_trace_emit("finalize POST_PARALLEL_DECODE builder=%p decoded=%d failed=%d",
+                     (void*)builder, decode_success_count, decode_fail_count);
+
     /* Fill and compose in a single pass */
+    aodds_trace_emit("finalize PRE_FILL_COMPOSE builder=%p", (void*)builder);
     aodds_fill_and_compose(builder->chunks, chunks_per_side, &builder->tile_image,
                            builder->config.missing_r, builder->config.missing_g, builder->config.missing_b);
-    
+    aodds_trace_emit("finalize POST_FILL_COMPOSE builder=%p", (void*)builder);
+
     /* Create temp file path */
     char temp_path[4096];
     snprintf(temp_path, sizeof(temp_path), "%s.tmp", output_path);
-    
+
     /* Open temp file */
+    aodds_trace_emit("finalize PRE_FOPEN builder=%p temp=%s", (void*)builder, temp_path);
     FILE* fp = fopen(temp_path, "wb");
     if (!fp) {
+        aodds_trace_emit("finalize FAIL fopen builder=%p temp=%s", (void*)builder, temp_path);
         return 0;
     }
-    
+    aodds_trace_emit("finalize POST_FOPEN builder=%p fp=%p", (void*)builder, (void*)fp);
+
     /* Optimized I/O: 256KB buffer + file pre-allocation */
     WRITE_BUFFER_LOCK();
     static TLS_VAR char dds_write_buffer3[AODDS_WRITE_BUFFER_SIZE];
+    aodds_trace_emit("finalize PRE_SETVBUF builder=%p fp=%p buf=%p", (void*)builder, (void*)fp, (void*)dds_write_buffer3);
     setvbuf(fp, dds_write_buffer3, _IOFBF, sizeof(dds_write_buffer3));
+    aodds_trace_emit("finalize PRE_PREALLOC builder=%p fp=%p", (void*)builder, (void*)fp);
     preallocate_file_dds(fp, calc_dds_file_size(tile_size, mipmap_count, builder->config.format));
-    
+    aodds_trace_emit("finalize POST_PREALLOC builder=%p fp=%p", (void*)builder, (void*)fp);
+
     /* Write DDS header */
     uint8_t header[DDS_HEADER_SIZE];
     aodds_write_header(header, tile_size, tile_size, mipmap_count, builder->config.format);
-    
+
+    aodds_trace_emit("finalize PRE_HEADER_WRITE builder=%p fp=%p", (void*)builder, (void*)fp);
     if (fwrite(header, 1, DDS_HEADER_SIZE, fp) != DDS_HEADER_SIZE) {
+        aodds_trace_emit("finalize FAIL header_write builder=%p fp=%p", (void*)builder, (void*)fp);
         fclose(fp);
         WRITE_BUFFER_UNLOCK();
         remove(temp_path);
         return 0;
     }
+    aodds_trace_emit("finalize POST_HEADER_WRITE builder=%p fp=%p", (void*)builder, (void*)fp);
     
     uint32_t total_written = DDS_HEADER_SIZE;
     
@@ -4269,22 +4361,32 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
     aodecode_image_t next = {0};
     int success = 1;
     int use_buf_a = 1;
-    
+
+    aodds_trace_emit("finalize MIPMAP_LOOP_START builder=%p mipmap_count=%d compress_buffer=%p",
+                     (void*)builder, mipmap_count, (void*)compress_buffer);
+
     for (int32_t mip = 0; mip < mipmap_count && success; mip++) {
+        aodds_trace_emit("finalize PRE_COMPRESS builder=%p mip=%d w=%d h=%d data=%p",
+                         (void*)builder, mip, current.width, current.height, (void*)current.data);
         uint32_t compressed_size = aodds_compress(&current, builder->config.format, compress_buffer);
-        
+        aodds_trace_emit("finalize POST_COMPRESS builder=%p mip=%d compressed_size=%u",
+                         (void*)builder, mip, compressed_size);
+
+        aodds_trace_emit("finalize PRE_FWRITE builder=%p mip=%d fp=%p", (void*)builder, mip, (void*)fp);
         if (fwrite(compress_buffer, 1, compressed_size, fp) != compressed_size) {
+            aodds_trace_emit("finalize FAIL fwrite builder=%p mip=%d", (void*)builder, mip);
             success = 0;
             break;
         }
+        aodds_trace_emit("finalize POST_FWRITE builder=%p mip=%d", (void*)builder, mip);
         total_written += compressed_size;
-        
+
         if (mip < mipmap_count - 1 && current.width > 4) {
             next.width = current.width / 2;
             next.height = current.height / 2;
             next.stride = next.width * 4;
             next.channels = 4;
-            
+
             if (use_buf_a && mip_buf_a) {
                 next.data = mip_buf_a;
             } else if (!use_buf_a && mip_buf_b) {
@@ -4292,33 +4394,46 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
             } else {
                 next.data = (uint8_t*)malloc(next.width * next.height * 4);
             }
-            
+
             if (next.data) {
+                aodds_trace_emit("finalize PRE_REDUCE builder=%p mip=%d next_w=%d next_h=%d next_data=%p",
+                                 (void*)builder, mip, next.width, next.height, (void*)next.data);
                 aodds_reduce_half(&current, &next);
+                aodds_trace_emit("finalize POST_REDUCE builder=%p mip=%d", (void*)builder, mip);
                 current = next;
                 memset(&next, 0, sizeof(next));
                 use_buf_a = !use_buf_a;
             } else {
+                aodds_trace_emit("finalize FAIL next_data_alloc builder=%p mip=%d", (void*)builder, mip);
                 success = 0;
             }
         }
     }
-    
+
+    aodds_trace_emit("finalize MIPMAP_LOOP_DONE builder=%p success=%d total_written=%u",
+                     (void*)builder, success, total_written);
+
     /* No cleanup needed - buffers are persistent in builder struct */
+    aodds_trace_emit("finalize PRE_FCLOSE builder=%p fp=%p", (void*)builder, (void*)fp);
     fclose(fp);
+    aodds_trace_emit("finalize POST_FCLOSE builder=%p", (void*)builder);
     WRITE_BUFFER_UNLOCK();
-    
+
     if (!success) {
+        aodds_trace_emit("finalize FAIL pre_rename builder=%p", (void*)builder);
         remove(temp_path);
         return 0;
     }
-    
+
     /* Atomic rename */
+    aodds_trace_emit("finalize PRE_RENAME builder=%p", (void*)builder);
     if (!atomic_rename(temp_path, output_path)) {
+        aodds_trace_emit("finalize FAIL atomic_rename builder=%p", (void*)builder);
         remove(temp_path);
         return 0;
     }
-    
+    aodds_trace_emit("finalize EXIT_OK builder=%p total_written=%u", (void*)builder, total_written);
+
     *bytes_written = total_written;
     return 1;
 }
