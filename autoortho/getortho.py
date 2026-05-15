@@ -973,8 +973,16 @@ class _native_build_context:
 
 
 def _defer_background_build_if_live(tile=None):
-    if is_live_building() and not getattr(tile, '_is_live', False):
-        raise _BackgroundBuildDeferred("live read active")
+    # No-op since the TLS fix in aodecode.c made concurrent native builds
+    # safe (commit 59edf38 + canonical-dylib install fix on 2026-05-15).
+    # The previous behaviour aborted predictive DDS work whenever a live
+    # FUSE read was in progress, which under sustained fast flight meant
+    # predictive DDS effectively never ran -- exactly when it was needed.
+    # The `_thread_budget_for(active)` allocator and the decode-pool
+    # AOCOND_WAIT already throttle CPU and memory contention from
+    # concurrent builds, so this third coarse-grained gate is redundant.
+    # Kept as a no-op stub so the existing call sites don't need touching.
+    return
 
 
 def _get_progressive_executor(max_workers=None):
