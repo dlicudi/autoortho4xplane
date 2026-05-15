@@ -3845,16 +3845,18 @@ class BackgroundDDSBuilder:
                 )
                 _last_heartbeat = _now
 
-                # WATCHDOG: warn about any build that has been running >30s.
-                # If this fires, the streaming chunk-wait loop is almost
-                # certainly hung waiting for chunks that will never arrive,
-                # which prevents the build slot from freeing.
+                # WATCHDOG: warn about any build that has been running >90s.
+                # Threshold chosen to avoid false positives on legitimately
+                # slow builds (mountainous areas with hundreds of fallback
+                # chunks routinely take 30-60s).  At 90s a build is genuinely
+                # suspect, likely waiting on a buffer or chunk that won't
+                # arrive.
                 _now_mono = time.monotonic()
                 stuck = []
                 with self._active_lock:
                     for tid_str, (start_t, _tid_num) in self._active_builds_meta.items():
                         age = _now_mono - start_t
-                        if age > 30.0 and tid_str not in self._warned_long_builds:
+                        if age > 90.0 and tid_str not in self._warned_long_builds:
                             stage = self._build_stages.get(tid_str, "<unset>")
                             stuck.append((tid_str, age, _tid_num, stage))
                             self._warned_long_builds.add(tid_str)
@@ -4145,30 +4147,39 @@ class BackgroundDDSBuilder:
                         # Decode failed - try fallback
                         chunk_col = tile.col + (i % tile.chunks_per_row)
                         chunk_row = tile.row + (i // tile.chunks_per_row)
-                        
+
                         fallback_rgba = resolver.resolve(
                             chunk_col, chunk_row, tile.max_zoom,
                             target_mipmap=0,
                             time_budget=fb_budget
                         )
-                        
+
                         if fallback_rgba:
                             builder.add_fallback_image(i, fallback_rgba)
                             prefetch_mm0_fallback.append(i)
                         else:
                             builder.mark_missing(i)
                             prefetch_mm0_missing.append(i)
+                elif getattr(chunk, 'no_imagery', False):
+                    # Server confirmed there is no high-zoom imagery for this
+                    # chunk (e.g. Bing placeholder PNG).  Skip the fallback
+                    # resolver entirely — no point allocating a 256 KB RGBA
+                    # buffer to upscale missing imagery to a fallback.  The
+                    # builder will fill this position with missing_color.
+                    builder.mark_missing(i)
+                    prefetch_mm0_missing.append(i)
+                    bump('chunk_no_imagery_marked_missing')
                 else:
                     # Chunk failed to download - apply full fallback chain
                     chunk_col = tile.col + (i % tile.chunks_per_row)
                     chunk_row = tile.row + (i // tile.chunks_per_row)
-                    
+
                     fallback_rgba = resolver.resolve(
                         chunk_col, chunk_row, tile.max_zoom,
                         target_mipmap=0,
                         time_budget=fb_budget
                     )
-                    
+
                     if fallback_rgba:
                         builder.add_fallback_image(i, fallback_rgba)
                         prefetch_mm0_fallback.append(i)
@@ -5379,6 +5390,14 @@ class Chunk(object):
         self.failure_reason = None
         self.retry_count = 0
 
+        # "No imagery" tracking: set when the server returns a placeholder
+        # image (e.g. Bing's 1033-byte "no imagery here" PNG) for an area
+        # without high-zoom coverage.  Build paths should treat such chunks
+        # as missing immediately rather than running the fallback resolver
+        # (which allocates a 256 KB RGBA buffer per fallback and can
+        # consume gigabytes when many chunks come back this way).
+        self.no_imagery = False
+
         # Coalescing flags to prevent duplicate submissions
         self.in_queue = False
         self.in_flight = False
@@ -5735,10 +5754,49 @@ class Chunk(object):
                 log.debug(f"Data for {self} is JPEG")
                 self.data = data
             else:
-                log.debug(f"Invalid JPEG for {self} (HTTP {resp.status_code} "
-                          f"content-type={resp.headers.get('content-type', '?')} "
-                          f"size={len(data) if data else 0})")
+                # Categorise the non-JPEG response so we can see what the
+                # server is actually returning when we get 200 OK but not
+                # a JPEG.  Common culprits: rate-limit HTML, empty bodies,
+                # PNG "missing tile" placeholders, gzip-wrapped responses.
+                ct = (resp.headers.get('content-type') or '').lower()
+                sz = len(data) if data else 0
+                head = bytes(data[:8]) if data else b''
+                if sz == 0:
+                    cat = 'empty'
+                elif ct.startswith('text/') or ct.startswith('application/json'):
+                    cat = 'html_or_json'
+                elif head[:8] == b'\x89PNG\r\n\x1a\n':
+                    cat = 'png'
+                elif head[:4] in (b'GIF8', b'RIFF') or head[:2] == b'BM':
+                    cat = 'other_image'
+                elif head[:2] == b'\x1f\x8b':
+                    cat = 'gzip'  # server forgot to set content-encoding
+                else:
+                    cat = 'unknown'
                 bump('chunk_invalid_jpeg')
+                bump(f'chunk_invalid_jpeg_{cat}')
+                log.debug(f"Invalid JPEG for {self} cat={cat} "
+                          f"http={resp.status_code} ct={ct} size={sz} "
+                          f"head={head.hex()}")
+                # Sample one example per category at WARN so we see what
+                # we're getting without flooding the log.
+                _key = f'_invalid_jpeg_sampled_{cat}'
+                if not getattr(self.__class__, _key, False):
+                    setattr(self.__class__, _key, True)
+                    log.warning(
+                        f"PIPELINE_TRACE chunk_invalid_jpeg_sample cat={cat} "
+                        f"http={resp.status_code} ct={ct} size={sz} "
+                        f"head={head.hex()} url={self.url}"
+                    )
+                # Mark "no imagery" so build paths skip the fallback
+                # resolver (saves 256 KB per chunk).  Conservative: only
+                # set this for the small-PNG case which we've observed is
+                # specifically the imagery-server placeholder.  Other
+                # non-JPEG categories (HTML, gzip, unknown) might be
+                # transient/recoverable and should still try fallbacks.
+                if cat == 'png' and sz < 8192:
+                    self.no_imagery = True
+                    bump('chunk_no_imagery')
                 self.data = b''
 
             bump('bytes_dl', len(self.data))
@@ -6724,13 +6782,21 @@ class Tile(object):
             streaming_mm0_fallback = []
             newly_ready = []
             failed_indices = []
+            no_imagery_indices = []
             for i in pending_indices:
                 chunk = chunks[i]
                 if chunk.ready.is_set() and chunk.data:
                     newly_ready.append((i, chunk.data))
+                elif getattr(chunk, 'no_imagery', False):
+                    # Server explicitly returned a "no imagery" placeholder
+                    # (e.g. Bing 1033-byte PNG).  Skip the fallback resolver
+                    # and mark missing directly — avoids 256 KB RGBA buffer
+                    # allocation per chunk and the resolver's disk lookups
+                    # for an area that has no high-zoom imagery anyway.
+                    no_imagery_indices.append(i)
                 else:
                     failed_indices.append(i)
-            
+
             if newly_ready:
                 final_ready_chunks.extend(newly_ready)
             
@@ -6804,12 +6870,20 @@ class Tile(object):
                     else:
                         builder.mark_missing(idx)
                         streaming_mm0_missing.append(idx)
-                
+
                 # Mark unresolved chunks as missing
                 for i in failed_indices:
                     if i not in resolved_indices:
                         builder.mark_missing(i)
                         streaming_mm0_missing.append(i)
+
+            # Mark "no imagery" chunks as missing (we skipped the resolver
+            # for these to save the 256 KB RGBA allocation per chunk).
+            if no_imagery_indices:
+                for i in no_imagery_indices:
+                    builder.mark_missing(i)
+                    streaming_mm0_missing.append(i)
+                bump('chunk_no_imagery_marked_missing', len(no_imagery_indices))
             
             # Finalize: acquire DDS buffer and build
             pool = _get_dds_buffer_pool()
