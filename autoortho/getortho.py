@@ -931,8 +931,27 @@ class _native_build_context:
             _active_native_thread_count += self._threads
             if _active_native_thread_count > _peak_native_thread_count:
                 _peak_native_thread_count = _active_native_thread_count
+            peak_threads = _peak_native_thread_count
+            total_threads = _active_native_thread_count
+        # WARN when more than one native build is in flight: this is the
+        # condition that historically corrupted the shared libjpeg-turbo
+        # decoder pool (pre-TLS).  If predictive DDS still crashes the C
+        # library after the __thread fix, the last WARN line before the
+        # crash tells us exactly how many builds were racing and on which
+        # POSIX threads.
         if active > 1:
-            log.debug(f"Concurrent native builds: {active} active")
+            log.warning(
+                f"NATIVE_BUILD_ENTER concurrent active={active} "
+                f"my_threads={self._threads} total_omp_threads={total_threads} "
+                f"peak_omp_threads={peak_threads} tid={threading.get_ident()}"
+            )
+        else:
+            log.debug(
+                f"NATIVE_BUILD_ENTER active=1 my_threads={self._threads} "
+                f"tid={threading.get_ident()}"
+            )
+        self._enter_tid = threading.get_ident()
+        self._enter_ts = time.monotonic()
         return self._threads
 
     def __exit__(self, *exc):
@@ -940,6 +959,16 @@ class _native_build_context:
         with _active_native_builds_lock:
             _active_native_builds -= 1
             _active_native_thread_count -= self._threads
+            remaining = _active_native_builds
+        duration_ms = (time.monotonic() - self._enter_ts) * 1000.0
+        # WARN on long builds (>2s) regardless of concurrency — useful when
+        # the crash never fires but builds simply hang in native code.
+        if duration_ms > 2000.0:
+            log.warning(
+                f"NATIVE_BUILD_EXIT slow duration_ms={duration_ms:.0f} "
+                f"remaining_active={remaining} tid={self._enter_tid} "
+                f"exc={'yes' if exc[0] else 'no'}"
+            )
         return False
 
 

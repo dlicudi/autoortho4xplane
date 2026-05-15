@@ -17,6 +17,7 @@ import sys
 import signal
 import logging
 import traceback
+import faulthandler
 from datetime import datetime
 
 # Handle imports for both frozen (PyInstaller) and direct Python execution
@@ -30,6 +31,12 @@ log = logging.getLogger(__name__)
 
 # Track if crash handler is installed
 _crash_handler_installed = False
+
+# Keep the faulthandler log file open for the lifetime of the process.
+# faulthandler requires the file to remain open until disable() is called,
+# otherwise its SIGBUS/SIGSEGV handler tries to write to a closed fd and
+# the thread-stack dump is lost.
+_faulthandler_file = None
 
 
 def _get_crash_log_path():
@@ -106,6 +113,32 @@ def _signal_handler(signum, frame):
     # Re-raise the signal with default handler to generate core dump
     signal.signal(signum, signal.SIG_DFL)
     os.kill(os.getpid(), signum)
+
+
+def _enable_faulthandler():
+    """Enable faulthandler with a dedicated log file.
+
+    Writes per-thread Python tracebacks on SIGSEGV/SIGBUS/SIGABRT/SIGFPE/
+    SIGILL.  chain=True makes faulthandler call the previously installed
+    handler (our _signal_handler) afterwards, so we keep the existing
+    crash_*.log output.
+    """
+    global _faulthandler_file
+    try:
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        path = os.path.join(LOGS_DIR, "faulthandler.log")
+        # Append so we keep traces across restarts; faulthandler writes
+        # a clear header on each dump.
+        _faulthandler_file = open(path, "a", buffering=1)
+        _faulthandler_file.write(
+            f"\n=== faulthandler enabled at {datetime.now().isoformat()} "
+            f"pid={os.getpid()} ===\n"
+        )
+        _faulthandler_file.flush()
+        faulthandler.enable(file=_faulthandler_file, all_threads=True)
+        log.info(f"faulthandler enabled, dumping to {path}")
+    except Exception as e:
+        log.warning(f"Failed to enable faulthandler: {e}")
 
 
 def _install_unix_handlers():
@@ -222,10 +255,10 @@ def install_crash_handler(skip_signal_handlers: bool = False):
         return True
     
     log.info("Installing crash handlers...")
-    
+
     # Always install Python exception hook
     _install_exception_hook()
-    
+
     # Install platform-specific signal handlers (unless skipped)
     if skip_signal_handlers:
         log.info("Skipping signal handlers (skip_signal_handlers=True)")
@@ -235,7 +268,16 @@ def install_crash_handler(skip_signal_handlers: bool = False):
         _install_windows_handlers()
     else:
         log.warning(f"Unknown platform {sys.platform}, limited crash handling")
-    
+
+    # Enable faulthandler last so its signal handlers chain into the
+    # _signal_handler installed above.  When SIGBUS/SIGSEGV fires inside
+    # native code (e.g. libjpeg-turbo on a corrupted tjhandle) faulthandler
+    # dumps the Python stack of every live thread to a dedicated file
+    # before the process dies.  Without this the crash log only shows the
+    # main-thread state, which tells us nothing about which worker thread
+    # was actually running native code.
+    _enable_faulthandler()
+
     _crash_handler_installed = True
     log.info("Crash handler installation complete")
     
