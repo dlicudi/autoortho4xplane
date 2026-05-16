@@ -300,33 +300,27 @@ class DDS(Structure):
         self.position = 0
         
         curbytes = 128
-        # Mipmap chain floor is 4×4 — the smallest meaningful BC1/BC3 block.
-        # Going below that produces blocks where most of the 4×4 cell is
-        # padding, and the native C builder (aodds_calc_mipmap_count) also
-        # stops at 4×4.  Keeping both sides aligned at 4×4 means files on
-        # disk match what _calculate_dds_size reports via FUSE getattr.
-        # X-Plane reads mipMapCount from the DDS header and is content with
-        # the 4×4 floor — C-produced files have been doing this all along
-        # without truncation warnings.
-        while (width >= 4) and (height >= 4):
+        while (width >= 1) and (height >= 1):
             mipmap = MipMap()
             mipmap.idx = self.mipMapCount
             mipmap.startpos = curbytes
             curbytes += max(1, (width*height >> 4)) * self.blocksize
             mipmap.length = curbytes - mipmap.startpos
-            mipmap.endpos = mipmap.startpos + mipmap.length
+            mipmap.endpos = mipmap.startpos + mipmap.length 
             self.mipmap_list.append(mipmap)
             width = width >> 1
             height = height >> 1
             self.mipMapCount+=1
-
+            
+        # Size of all mipmaps: sum([pow(2,x)*pow(2,x) for x in range(12,1,-1) ])
+        #self.pitchOrLinearSize = curbytes 
         self.total_size = curbytes
         self.dump_header()
 
-        # With the 4×4 floor, every entry in mipmap_list is a real BC1/BC3
-        # block-sized level.  smallest_mm = the last index; gen_mipmaps
-        # generates all levels (no fallback-only tail).
-        self.smallest_mm = max(0, len(self.mipmap_list) - 1)
+        # The smallest effective MM we can have is a size 4x4 block.  However
+        # XPlane expects MM down to theoretical 1x1.  Therefore the smallest
+        # real MM is the len of our list - 3
+        self.smallest_mm = len(self.mipmap_list) - 3
 
         for m in self.mipmap_list:
             log.debug(m)

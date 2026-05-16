@@ -34,16 +34,10 @@ log = logging.getLogger(__name__)
 # Current DDM schema version. Bump when the metadata format changes
 # in a backwards-incompatible way.
 # v2 -> v3: added "populated_mipmaps" for incremental DDS persistence
-DDM_VERSION = 5  # v5: mipmap chain stops at 4×4 (BC1 block minimum), matching
-                 # the native C builder.  v4 and earlier used a 1×1 floor in
-                 # pydds, producing files 16 bytes larger than what the C
-                 # builder writes, causing 100% size-mismatch on disk
-                 # passthrough decompression of natively-built cache entries.
-                 # v4: DDS dims follow layout_zoom (FUSE-promised), not build
-                 # zoom.  v3 and earlier wrote w/h at build dim; their cached
-                 # bytes are smaller than the new DDS layout and serving them
-                 # produces the "appears to be truncated" X-Plane warning.
-                 # Marked stale on load.
+DDM_VERSION = 4  # v4: DDS dims follow layout_zoom (FUSE-promised), not build zoom.
+                 # v3 and earlier wrote w/h at build dim; their cached bytes are
+                 # smaller than the new DDS layout and serving them produces the
+                 # "appears to be truncated" X-Plane warning.  Marked stale on load.
 
 
 def cleanup_source_jpegs(cache_dir: str, col: int, row: int,
@@ -1806,8 +1800,7 @@ class DynamicDDSCache:
                                 blocksize = 16 if fmt == 'BC3' else 8
                                 expected = 128  # DDS header
                                 cw, ch = w, h
-                                # 4×4 floor — matches pydds + native C builder.
-                                while cw >= 4 and ch >= 4:
+                                while cw >= 1 and ch >= 1:
                                     expected += max(1, (cw * ch >> 4)) * blocksize
                                     cw >>= 1
                                     ch >>= 1
