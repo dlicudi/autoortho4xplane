@@ -34,10 +34,16 @@ log = logging.getLogger(__name__)
 # Current DDM schema version. Bump when the metadata format changes
 # in a backwards-incompatible way.
 # v2 -> v3: added "populated_mipmaps" for incremental DDS persistence
-DDM_VERSION = 4  # v4: DDS dims follow layout_zoom (FUSE-promised), not build zoom.
-                 # v3 and earlier wrote w/h at build dim; their cached bytes are
-                 # smaller than the new DDS layout and serving them produces the
-                 # "appears to be truncated" X-Plane warning.  Marked stale on load.
+DDM_VERSION = 6  # v6: invalidates v5 files written by a reverted broken commit
+                 # (52a3b52) that aligned pydds to a 4×4 mipmap floor.  That
+                 # change produced green tiles in flight and was reverted.  Any
+                 # v5 files on disk have 11-mipmap-count headers that no longer
+                 # match the restored 13-mipmap pydds expectation.
+                 # v4: DDS dims follow layout_zoom (FUSE-promised), not build
+                 # zoom.  v3 and earlier wrote w/h at build dim; their cached
+                 # bytes are smaller than the new DDS layout and serving them
+                 # produces the "appears to be truncated" X-Plane warning.
+                 # Marked stale on load.
 
 
 def cleanup_source_jpegs(cache_dir: str, col: int, row: int,
