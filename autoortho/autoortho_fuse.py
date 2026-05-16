@@ -1127,8 +1127,11 @@ class AutoOrtho(Operations):
             return self._open_impl(path, flags, _open_classification)
         finally:
             _elapsed_ms = (time.monotonic() - _open_t0) * 1000.0
+            # Per-event slow markers are diagnostic-only.  Keep them in the
+            # log at DEBUG; the FUSE_PERF_SUMMARY emitted every 60s is the
+            # WARN-level signal for sustained slowness.
             if _elapsed_ms > 16.0:
-                log.warning(
+                log.debug(
                     f"FUSE_OPEN slow class={_open_classification[0]} "
                     f"elapsed_ms={_elapsed_ms:.1f} tid={threading.get_ident()} path={path}"
                 )
@@ -1328,9 +1331,10 @@ class AutoOrtho(Operations):
                     raise FuseOSError(e.errno)
         finally:
             _elapsed_ms = (time.monotonic() - _read_t0) * 1000.0
-            # Threshold: 1 frame at 60fps = 16.7ms.  Log everything above that.
+            # Per-event slow markers are diagnostic.  Logged at DEBUG;
+            # FUSE_PERF_SUMMARY (60s aggregate) is the WARN-level signal.
             if _elapsed_ms > 16.0:
-                log.warning(
+                log.debug(
                     f"FUSE_READ slow class={_read_classification} "
                     f"elapsed_ms={_elapsed_ms:.1f} tile_lock_wait_ms={_tile_lock_wait_ms:.1f} "
                     f"tile_get_ms={_tile_get_ms:.1f} size={length} offset={offset} "

@@ -933,14 +933,12 @@ class _native_build_context:
                 _peak_native_thread_count = _active_native_thread_count
             peak_threads = _peak_native_thread_count
             total_threads = _active_native_thread_count
-        # WARN when more than one native build is in flight: this is the
-        # condition that historically corrupted the shared libjpeg-turbo
-        # decoder pool (pre-TLS).  If predictive DDS still crashes the C
-        # library after the __thread fix, the last WARN line before the
-        # crash tells us exactly how many builds were racing and on which
-        # POSIX threads.
+        # DEBUG-level concurrency record.  Originally WARN to catch the
+        # pre-TLS libjpeg-turbo race; that race is fixed by __thread in
+        # decoder pool, so concurrent native builds are now expected.
+        # Demoted to DEBUG to keep WARN logs focused on real issues.
         if active > 1:
-            log.warning(
+            log.debug(
                 f"NATIVE_BUILD_ENTER concurrent active={active} "
                 f"my_threads={self._threads} total_omp_threads={total_threads} "
                 f"peak_omp_threads={peak_threads} tid={threading.get_ident()}"
@@ -8043,11 +8041,12 @@ class Tile(object):
         data = self.dds.read(length)
         _seek_ms = (time.monotonic() - _seek_t0) * 1000.0
 
-        # WARN-level breakdown when the read was slow.  Threshold chosen to
-        # match the FUSE_READ slow threshold (16ms = 1 frame at 60fps).
+        # Diagnostic breakdown when the read was slow.  DEBUG-level so it
+        # doesn't drown actual warnings; FUSE_PERF_SUMMARY's 60s aggregate
+        # is the WARN-level signal for sustained slowness.
         _total_ms = _fetch_ms + _seek_ms
         if _total_ms > 16.0:
-            log.warning(
+            log.debug(
                 f"READ_DDS_BYTES slow branch={_branch} mm_idx={mm_idx} "
                 f"mm_retrieved_before={_mm_retrieved_before} "
                 f"fetch_ms={_fetch_ms:.1f} seek_read_ms={_seek_ms:.1f} "
@@ -11091,8 +11090,11 @@ class TileCacher(object):
         _lock_t0 = time.monotonic()
         with self.tc_lock:
             _wait_ms = (time.monotonic() - _lock_t0) * 1000.0
-            if _wait_ms > 10.0:
-                log.warning(
+            # Diagnostic-only lock-contention marker.  Bumped to DEBUG with
+            # a higher threshold (100ms) so genuine pathological contention
+            # still hits the log without flooding it on normal scenery load.
+            if _wait_ms > 100.0:
+                log.debug(
                     f"tc_lock_wait op=_get_tile wait_ms={_wait_ms:.1f} "
                     f"tid={threading.get_ident()} idx={idx}"
                 )
@@ -11112,8 +11114,9 @@ class TileCacher(object):
         _lock_t0 = time.monotonic()
         with self.tc_lock:
             _wait_ms = (time.monotonic() - _lock_t0) * 1000.0
-            if _wait_ms > 10.0:
-                log.warning(
+            # See _get_tile: DEBUG-level with 100ms threshold.
+            if _wait_ms > 100.0:
+                log.debug(
                     f"tc_lock_wait op=_open_tile wait_ms={_wait_ms:.1f} "
                     f"tid={threading.get_ident()} idx={idx}"
                 )
