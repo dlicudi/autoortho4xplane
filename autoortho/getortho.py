@@ -10187,7 +10187,12 @@ class Tile(object):
                 try:
                     if self.dds.mipmap_list and self.dds.mipmap_list[0].retrieved:
                         if self.bytes_read < self.dds.mipmap_list[0].length:
-                            log.warning(f"TILE: {self} retrieved mipmap 0, but only read {self.bytes_read}. Lowest offset: {self.lowest_offset}")
+                            # INFO — informational only.  Means mm0 was built
+                            # but X-Plane never sampled it (distant tile served
+                            # from small mipmaps only).  Not actionable for the
+                            # user; useful as a "wasted-build" signal during
+                            # prefetch-tuning sessions.
+                            log.info(f"TILE: {self} retrieved mipmap 0, but only read {self.bytes_read}. Lowest offset: {self.lowest_offset}")
                         else:
                             log.debug(f"TILE: {self} retrieved mipmap 0, full read of mipmap! {self.bytes_read}.")
                 except (AttributeError, IndexError):
