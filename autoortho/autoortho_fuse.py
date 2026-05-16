@@ -567,11 +567,13 @@ class AutoOrtho(Operations):
             dds_width = layout_chunks_per_row * 256
             dds_height = layout_chunks_per_col * 256
 
-            # Mirror pydds.DDS.__init__ mipmap summation.
+            # Mirror pydds.DDS.__init__ mipmap summation.  Floor at 4×4 —
+            # the smallest BC1/BC3 block — matching what the native C
+            # builder (aodds_calc_mipmap_count) and pydds both produce.
             blocksize = 16 if CFG.pydds.format == 'BC3' else 8
             curbytes = 128  # DDS header
             cw, ch = dds_width, dds_height
-            while cw >= 1 and ch >= 1:
+            while cw >= 4 and ch >= 4:
                 curbytes += max(1, (cw * ch >> 4)) * blocksize
                 cw >>= 1
                 ch >>= 1
@@ -827,7 +829,8 @@ class AutoOrtho(Operations):
                     _ddm_bs = 16 if _ddm_fmt == 'BC3' else 8
                     _ddm_size = 128
                     _cw, _ch = _ddm_w, _ddm_h
-                    while _cw >= 1 and _ch >= 1:
+                    # 4×4 floor — matches pydds + native C builder.
+                    while _cw >= 4 and _ch >= 4:
                         _ddm_size += max(1, (_cw * _ch >> 4)) * _ddm_bs
                         _cw >>= 1
                         _ch >>= 1
