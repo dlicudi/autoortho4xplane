@@ -7876,29 +7876,41 @@ class Tile(object):
         from the same source in a single pass.  Cost is dominated by the
         mm0 BC1 compress; subsequent mipmaps are cheap.
 
+        Concurrency: holds ``self._lock`` for the entire helper.
+        ``Tile.close()`` is expected to acquire the same lock before
+        freeing ``self.imgs`` and ``self.dds`` — without this, an evicting
+        thread can free the AoImage buffer mid-``crop_and_upscale``
+        (segfault in ``aoimage_crop_and_upscale``).
+
         Idempotent: short-circuits when all mipmaps are already retrieved.
         Returns True on success (or already-built), False if mm0 image
         wasn't producible (caller should fall through to slower paths).
         """
-        if self.dds is None:
-            return False
-        # Already built?
-        if all(mm.retrieved for mm in self.dds.mipmap_list[: self.max_mipmap + 1]):
-            return True
-        # Source image at build zoom — chunks exist at this level by construction.
-        img0 = self.get_img(0, startrow=0, endrow=None,
-                            maxwait=self.get_maxwait(), time_budget=time_budget)
-        if img0 is None:
-            log.debug(f"_build_all_mipmaps_from_mm0: mm0 image not available for {self}")
-            return False
-        img0_layout = self._upscale_to_layout(img0, 0)
-        with self._dds_write_lock:
-            self.ready.clear()
-            try:
-                # maxmipmaps=99 -> "all", pydds caps at smallest_mm internally.
-                self.dds.gen_mipmaps(img0_layout, startmipmap=0, maxmipmaps=99)
-            finally:
-                self.ready.set()
+        with self._lock:
+            if self.dds is None or self._closed:
+                return False
+            # Already built?
+            if all(mm.retrieved for mm in self.dds.mipmap_list[: self.max_mipmap + 1]):
+                return True
+            # Source image at build zoom — chunks exist at this level by construction.
+            img0 = self.get_img(0, startrow=0, endrow=None,
+                                maxwait=self.get_maxwait(), time_budget=time_budget)
+            if img0 is None:
+                log.debug(f"_build_all_mipmaps_from_mm0: mm0 image not available for {self}")
+                return False
+            # Re-check after I/O: tile may have been marked for close.
+            if self.dds is None or self._closed or getattr(img0, '_freed', False):
+                return False
+            img0_layout = self._upscale_to_layout(img0, 0)
+            if self.dds is None or self._closed:
+                return False
+            with self._dds_write_lock:
+                self.ready.clear()
+                try:
+                    # maxmipmaps=99 -> "all", pydds caps at smallest_mm internally.
+                    self.dds.gen_mipmaps(img0_layout, startmipmap=0, maxmipmaps=99)
+                finally:
+                    self.ready.set()
         bump('build_all_mipmaps_from_mm0')
         log.debug(f"_build_all_mipmaps_from_mm0: built mm0..mm{self.max_mipmap} for {self}")
         return True
@@ -7917,11 +7929,18 @@ class Tile(object):
         BC1 compression.  Result is a blurry-but-coherent mipmap that
         gradually sharpens as the build is rerun at higher build zooms.
 
-        Pass-through when ``img`` already matches the target size or
-        ``self.dds`` is unavailable.
+        Concurrency: holds ``self._lock`` for the C call.  Without it,
+        ``Tile.close()`` can free the AoImage's underlying buffer mid-
+        ``aoimage_crop_and_upscale`` and segfault inside the C function.
+        RLock means callers that already hold the lock recurse safely.
+
+        Pass-through when ``img`` already matches the target size, is
+        already freed, or ``self.dds`` is unavailable.
         """
         try:
-            if self.dds is None or img is None:
+            if self.dds is None or img is None or self._closed:
+                return img
+            if getattr(img, '_freed', False):
                 return img
             target_w = max(1, self.dds.width >> mipmap)
             target_h = max(1, self.dds.height >> mipmap)
@@ -7934,7 +7953,11 @@ class Tile(object):
             if scale < 2 or (scale & (scale - 1)) != 0:
                 # crop_and_upscale only supports power-of-two scales.
                 return img
-            upscaled = img.crop_and_upscale(0, 0, src_w, src_h, scale)
+            with self._lock:
+                # Re-check after lock acquisition — close() may have run.
+                if self._closed or getattr(img, '_freed', False):
+                    return img
+                upscaled = img.crop_and_upscale(0, 0, src_w, src_h, scale)
             bump('compose_upscale_to_layout')
             log.debug(
                 f"compose upscale: {self} mipmap={mipmap} "
@@ -10151,100 +10174,107 @@ class Tile(object):
             log.warning(f"TILE: Trying to close, but has refs: {self.refs}")
             return
 
-        # Log mipmap retrieval status (safely check dds first)
-        # Skip for prepopulated tiles - X-Plane may only need small mipmaps
-        if self.dds is not None and not self._prepopulated:
+        # Take the tile lock for the destructive cleanup phase.  This is
+        # the SAME lock that build paths (_build_all_mipmaps_from_mm0, etc.)
+        # acquire — without it, an in-flight C call on an AoImage in
+        # self.imgs can race with our im.close() below and segfault inside
+        # aoimage_crop_and_upscale on freed memory.  RLock allows safe
+        # re-entry if close() is reached transitively.
+        with self._lock:
+            # Log mipmap retrieval status (safely check dds first)
+            # Skip for prepopulated tiles - X-Plane may only need small mipmaps
+            if self.dds is not None and not self._prepopulated:
+                try:
+                    if self.dds.mipmap_list and self.dds.mipmap_list[0].retrieved:
+                        if self.bytes_read < self.dds.mipmap_list[0].length:
+                            log.warning(f"TILE: {self} retrieved mipmap 0, but only read {self.bytes_read}. Lowest offset: {self.lowest_offset}")
+                        else:
+                            log.debug(f"TILE: {self} retrieved mipmap 0, full read of mipmap! {self.bytes_read}.")
+                except (AttributeError, IndexError):
+                    pass  # DDS structure incomplete, continue with cleanup
+
+            # ------------------------------------------------------------------
+            # Memory-reclamation additions
+            # ------------------------------------------------------------------
+
+            # 1) Free any cached AoImage instances (RGBA pixel buffers)
             try:
-                if self.dds.mipmap_list and self.dds.mipmap_list[0].retrieved:
-                    if self.bytes_read < self.dds.mipmap_list[0].length:
-                        log.warning(f"TILE: {self} retrieved mipmap 0, but only read {self.bytes_read}. Lowest offset: {self.lowest_offset}")
+                for img_data in list(self.imgs.values()):
+                    # Handle both tuple format (new) and plain image (old)
+                    if isinstance(img_data, tuple):
+                        im = img_data[0]  # Extract image from tuple
                     else:
-                        log.debug(f"TILE: {self} retrieved mipmap 0, full read of mipmap! {self.bytes_read}.")
-            except (AttributeError, IndexError):
-                pass  # DDS structure incomplete, continue with cleanup
+                        im = img_data
 
-        # ------------------------------------------------------------------
-        # Memory-reclamation additions
-        # ------------------------------------------------------------------
-
-        # 1) Free any cached AoImage instances (RGBA pixel buffers)
-        try:
-            for img_data in list(self.imgs.values()):
-                # Handle both tuple format (new) and plain image (old)
-                if isinstance(img_data, tuple):
-                    im = img_data[0]  # Extract image from tuple
-                else:
-                    im = img_data
-                
-                if im is not None and hasattr(im, "close"):
-                    try:
-                        im.close()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        finally:
-            self.imgs.clear()
-            self._imgs_order = []  # Clear LRU tracking list
-
-        # 2) Release DDS mip-map ByteIO buffers so the underlying bytes
-        #    are no longer referenced from Python.
-        if self.dds is not None:
-            try:
-                # Use DDS.close() method for proper cleanup
-                self.dds.close()
+                    if im is not None and hasattr(im, "close"):
+                        try:
+                            im.close()
+                        except Exception:
+                            pass
             except Exception:
                 pass
-            # Drop the DDS object reference itself
-            self.dds = None
+            finally:
+                self.imgs.clear()
+                self._imgs_order = []  # Clear LRU tracking list
 
-        # 3) Close all chunks
-        try:
-            for chunks in self.chunks.values():
-                for chunk in chunks:
-                    try:
-                        chunk.close()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        self.chunks = {}
-        
-        # 4) Close all fallback chunks in the shared pool
-        try:
-            with self._fallback_pool_lock:
-                for chunk in self._fallback_chunk_pool.values():
-                    try:
-                        chunk.close()
-                    except Exception:
-                        pass
-                self._fallback_chunk_pool.clear()
-        except Exception:
-            pass
-        
-        # 5) Free batch-to-streaming JPEG data cache
-        # _last_collected_jpegs can hold ~25MB of JPEG bytes per tile.
-        # Without clearing, this data stays attached to the tile object
-        # and can't be GC'd if any external reference keeps the tile alive
-        # (e.g. TileCompletionTracker, BackgroundDDSBuilder queue).
-        self._last_collected_jpegs = None
-        self._last_collected_ratio = None
-        self._last_collected_missing = None
+            # 2) Release DDS mip-map ByteIO buffers so the underlying bytes
+            #    are no longer referenced from Python.
+            if self.dds is not None:
+                try:
+                    # Use DDS.close() method for proper cleanup
+                    self.dds.close()
+                except Exception:
+                    pass
+                # Drop the DDS object reference itself
+                self.dds = None
 
-        # 6) Reset state flags for potential tile reuse
-        self._lazy_build_attempted = False
-        self._aopipeline_attempted = False
-        self._tile_time_budget = None
-        self.first_request_time = None
-        self._completion_reported = False
-        self._is_live = False
-        self._dds_populated_mipmaps = None
-        self._live_transition_event = None
-        self._active_streaming_builder = None
+            # 3) Close all chunks
+            try:
+                for chunks in self.chunks.values():
+                    for chunk in chunks:
+                        try:
+                            chunk.close()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            self.chunks = {}
 
-        # 7) Mark tile as closed so external holders (e.g.
-        # BackgroundDDSBuilder) can skip building from stale data
-        self._closed = True
+            # 4) Close all fallback chunks in the shared pool
+            try:
+                with self._fallback_pool_lock:
+                    for chunk in self._fallback_chunk_pool.values():
+                        try:
+                            chunk.close()
+                        except Exception:
+                            pass
+                    self._fallback_chunk_pool.clear()
+            except Exception:
+                pass
+
+            # 5) Free batch-to-streaming JPEG data cache
+            # _last_collected_jpegs can hold ~25MB of JPEG bytes per tile.
+            # Without clearing, this data stays attached to the tile object
+            # and can't be GC'd if any external reference keeps the tile alive
+            # (e.g. TileCompletionTracker, BackgroundDDSBuilder queue).
+            self._last_collected_jpegs = None
+            self._last_collected_ratio = None
+            self._last_collected_missing = None
+
+            # 6) Reset state flags for potential tile reuse
+            self._lazy_build_attempted = False
+            self._aopipeline_attempted = False
+            self._tile_time_budget = None
+            self.first_request_time = None
+            self._completion_reported = False
+            self._is_live = False
+            self._dds_populated_mipmaps = None
+            self._live_transition_event = None
+            self._active_streaming_builder = None
+
+            # 7) Mark tile as closed so external holders (e.g.
+            # BackgroundDDSBuilder) can skip building from stale data
+            self._closed = True
 
 
 def _release_memory_to_os():
