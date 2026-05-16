@@ -19,6 +19,8 @@
 #include <math.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <turbojpeg.h>
 
 #ifdef AOPIPELINE_WINDOWS
@@ -4300,15 +4302,18 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
     uint8_t header[DDS_HEADER_SIZE];
     aodds_write_header(header, tile_size, tile_size, mipmap_count, builder->config.format);
 
-    aodds_trace_emit("finalize PRE_HEADER_WRITE builder=%p fp=%p", (void*)builder, (void*)fp);
-    if (fwrite(header, 1, DDS_HEADER_SIZE, fp) != DDS_HEADER_SIZE) {
+    aodds_trace_emit("finalize PRE_HEADER_WRITE builder=%p fp=%p size=%d", (void*)builder, (void*)fp, (int)DDS_HEADER_SIZE);
+    errno = 0;
+    size_t hdr_written = fwrite(header, 1, DDS_HEADER_SIZE, fp);
+    aodds_trace_emit("finalize POST_HEADER_WRITE builder=%p fp=%p requested=%d written=%zu errno=%d ferror=%d",
+                     (void*)builder, (void*)fp, (int)DDS_HEADER_SIZE, hdr_written, errno, ferror(fp));
+    if (hdr_written != DDS_HEADER_SIZE) {
         aodds_trace_emit("finalize FAIL header_write builder=%p fp=%p", (void*)builder, (void*)fp);
         fclose(fp);
         WRITE_BUFFER_UNLOCK();
         remove(temp_path);
         return 0;
     }
-    aodds_trace_emit("finalize POST_HEADER_WRITE builder=%p fp=%p", (void*)builder, (void*)fp);
     
     uint32_t total_written = DDS_HEADER_SIZE;
     
@@ -4372,13 +4377,16 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
         aodds_trace_emit("finalize POST_COMPRESS builder=%p mip=%d compressed_size=%u",
                          (void*)builder, mip, compressed_size);
 
-        aodds_trace_emit("finalize PRE_FWRITE builder=%p mip=%d fp=%p", (void*)builder, mip, (void*)fp);
-        if (fwrite(compress_buffer, 1, compressed_size, fp) != compressed_size) {
+        aodds_trace_emit("finalize PRE_FWRITE builder=%p mip=%d fp=%p size=%u", (void*)builder, mip, (void*)fp, compressed_size);
+        errno = 0;
+        size_t mip_written = fwrite(compress_buffer, 1, compressed_size, fp);
+        aodds_trace_emit("finalize POST_FWRITE builder=%p mip=%d requested=%u written=%zu errno=%d ferror=%d",
+                         (void*)builder, mip, compressed_size, mip_written, errno, ferror(fp));
+        if (mip_written != compressed_size) {
             aodds_trace_emit("finalize FAIL fwrite builder=%p mip=%d", (void*)builder, mip);
             success = 0;
             break;
         }
-        aodds_trace_emit("finalize POST_FWRITE builder=%p mip=%d", (void*)builder, mip);
         total_written += compressed_size;
 
         if (mip < mipmap_count - 1 && current.width > 4) {
@@ -4415,8 +4423,9 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
 
     /* No cleanup needed - buffers are persistent in builder struct */
     aodds_trace_emit("finalize PRE_FCLOSE builder=%p fp=%p", (void*)builder, (void*)fp);
-    fclose(fp);
-    aodds_trace_emit("finalize POST_FCLOSE builder=%p", (void*)builder);
+    errno = 0;
+    int fclose_rc = fclose(fp);
+    aodds_trace_emit("finalize POST_FCLOSE builder=%p rc=%d errno=%d", (void*)builder, fclose_rc, errno);
     WRITE_BUFFER_UNLOCK();
 
     if (!success) {
@@ -4425,13 +4434,28 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
         return 0;
     }
 
-    /* Atomic rename */
-    aodds_trace_emit("finalize PRE_RENAME builder=%p", (void*)builder);
+    /* Stat temp file after fclose, before rename — is what we wrote on disk? */
+    struct stat temp_st;
+    memset(&temp_st, 0, sizeof(temp_st));
+    errno = 0;
+    int temp_stat_rc = stat(temp_path, &temp_st);
+    aodds_trace_emit("finalize PRE_RENAME builder=%p temp=%s temp_size=%lld stat_rc=%d stat_errno=%d expected=%u",
+                     (void*)builder, temp_path, (long long)temp_st.st_size, temp_stat_rc, errno, total_written);
+
     if (!atomic_rename(temp_path, output_path)) {
         aodds_trace_emit("finalize FAIL atomic_rename builder=%p", (void*)builder);
         remove(temp_path);
         return 0;
     }
+
+    /* Stat final file after rename — what does X-Plane actually see? */
+    struct stat final_st;
+    memset(&final_st, 0, sizeof(final_st));
+    errno = 0;
+    int final_stat_rc = stat(output_path, &final_st);
+    aodds_trace_emit("finalize POST_RENAME builder=%p final=%s final_size=%lld stat_rc=%d stat_errno=%d",
+                     (void*)builder, output_path, (long long)final_st.st_size, final_stat_rc, errno);
+
     aodds_trace_emit("finalize EXIT_OK builder=%p total_written=%u", (void*)builder, total_written);
 
     *bytes_written = total_written;
