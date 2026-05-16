@@ -4002,18 +4002,32 @@ class BackgroundDDSBuilder:
     def _try_streaming_prefetch_build(self, tile, tile_id: str, build_start: float) -> bool:
         """
         Build DDS for prefetch using streaming builder with fallback support.
-        
+
         Key difference from live: NO TIME BUDGET.
         Takes as long as needed to apply all fallbacks for quality.
-        
+
         Args:
             tile: Tile to build
             tile_id: Tile ID string
             build_start: Monotonic time when build started
-        
+
         Returns:
             True if build succeeded, False to fall back to other methods
         """
+        # If dynamic-zoom downgraded the build below layout_zoom, the native
+        # streaming builder would produce a DDS at build dims that's smaller
+        # than what FUSE getattr promises X-Plane.  Fall back to the
+        # Python-side _build_tile_dds path, which sizes its temp DDS to
+        # layout dims and upscales the build image.  This gate disappears
+        # once the native side learns about layout_zoom (follow-up step).
+        if getattr(tile, 'max_zoom', None) is not None and \
+           getattr(tile, 'layout_zoom', None) is not None and \
+           tile.max_zoom < tile.layout_zoom:
+            bump('streaming_prefetch_skip_layout_mismatch')
+            log.debug(f"BackgroundDDSBuilder: {tile_id} skipping streaming builder "
+                      f"(build ZL{tile.max_zoom} < layout ZL{tile.layout_zoom})")
+            return False
+
         # Handle imports for both frozen (PyInstaller) and direct Python execution
         try:
             from autoortho.aopipeline.AoDDS import get_default_builder_pool
@@ -4329,7 +4343,20 @@ class BackgroundDDSBuilder:
         # ═══════════════════════════════════════════════════════════════════════
         pipeline_mode = get_pipeline_mode()
         _defer_background_build_if_live(tile)
-        
+
+        # When dynamic-zoom downgraded build < layout, every native path
+        # produces a DDS at build dims — smaller than the layout-dim
+        # contract FUSE getattr promises X-Plane.  Force the Python path
+        # so the layout-aware temp_dds fallback (uses ``tile.dds`` width
+        # + ``_upscale_to_layout``) runs and we cache the correctly sized
+        # bytes.  Removed once aodds.c learns about layout dims.
+        if getattr(tile, 'max_zoom', None) is not None and \
+           getattr(tile, 'layout_zoom', None) is not None and \
+           tile.max_zoom < tile.layout_zoom:
+            if pipeline_mode != PIPELINE_MODE_PYTHON:
+                bump('background_build_force_python_layout_mismatch')
+                pipeline_mode = PIPELINE_MODE_PYTHON
+
         # Skip native attempts if explicitly in python mode
         if pipeline_mode != PIPELINE_MODE_PYTHON:
             native_dds = _get_native_dds()
