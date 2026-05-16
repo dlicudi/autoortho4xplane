@@ -539,77 +539,45 @@ class AutoOrtho(Operations):
 
     @lru_cache(maxsize=1024)
     def _calculate_dds_size(self, zoom):
-        """Calculate the actual DDS file size based on tile parameters and current configuration.
-        
-        IMPORTANT: In dynamic zoom mode, the actual tile zoom can vary based on altitude prediction.
-        To avoid truncated texture issues, we calculate size for the maximum configured
-        zoom level this tile type can use, still capped to the X-Plane limit of
-        tile zoom + 1.  This ensures FUSE reports a size >= the actual DDS size
-        without inflating X-Plane's VRAM budget beyond what the config can produce.
+        """DDS file size reported by FUSE getattr.
+
+        Single source of truth for output dimensions is
+        ``TileCacher.compute_layout_zoom``; this function turns its result
+        into a byte count using the same mipmap-summation pydds uses.  By
+        construction, what we report here matches what ``Tile.__init__``
+        actually builds — so the "appears to be truncated" warning class
+        is gone whether or not dynamic zoom downgrades the build.
         """
         try:
-            # Convert parameters to the format expected by the tile system
             zoom = int(zoom)
-            
-            # Check if dynamic zoom mode is enabled
-            max_zoom_mode = str(CFG.autoortho.max_zoom_mode).lower()
-            
-            if max_zoom_mode == "dynamic":
-                # Dynamic mode chooses the tile's real zoom later, during open(),
-                # based on predicted altitude.  During getattr(), report the
-                # maximum zoom the configured quality steps can actually return
-                # for this tile type, not the theoretical zoom + 1 for every tile.
-                max_regular, max_airport = self.tc.dynamic_zoom_manager.get_max_zoom_levels()
-                if zoom == 18 and not CFG.autoortho.using_custom_tiles:
-                    uncapped_target_zoom = max_airport
-                else:
-                    uncapped_target_zoom = max_regular
-                max_zoom = min(zoom + 1, uncapped_target_zoom)
+            layout_zoom = self.tc.compute_layout_zoom(zoom)
+
+            # Map layout_zoom to chunks-per-row using the same rule as Tile
+            # (width=16 default chunk grid, capped to X-Plane's +1 supersample).
+            width = 16
+            height = 16
+            layout_diff = zoom - int(layout_zoom)
+            if layout_diff >= 0:
+                layout_chunks_per_row = max(1, width >> layout_diff)
+                layout_chunks_per_col = max(1, height >> layout_diff)
             else:
-                # Fixed mode - use the configured target zoom levels
-                if CFG.autoortho.using_custom_tiles:
-                    uncapped_target_zoom = self.tc.target_zoom_level
-                else:
-                    uncapped_target_zoom = self.tc.target_zoom_level_near_airports if zoom == 18 else self.tc.target_zoom_level
-                max_zoom = min(zoom + 1, uncapped_target_zoom)
-            
-            # Replicate tile dimension calculation logic from Tile.__init__
-            width = 16  # Default tile width in chunks
-            height = 16  # Default tile height in chunks
-            
-            tilezoom_diff = zoom - int(max_zoom)
-            
-            if tilezoom_diff >= 0:
-                chunks_per_row = width >> tilezoom_diff
-                chunks_per_col = height >> tilezoom_diff
-            else:
-                chunks_per_row = width << (-tilezoom_diff)
-                chunks_per_col = height << (-tilezoom_diff)
-            
-            # Calculate DDS dimensions in pixels
-            dds_width = chunks_per_row * 256
-            dds_height = chunks_per_col * 256
-            
-            # Replicate DDS size calculation logic from pydds.DDS.__init__
-            if CFG.pydds.format == 'BC3':
-                blocksize = 16
-            else:
-                blocksize = 8
-            
-            # Calculate total size including all mipmaps
-            curbytes = 128  # DDS header size
-            current_width = dds_width
-            current_height = dds_height
-            
-            while (current_width >= 1) and (current_height >= 1):
-                mipmap_size = max(1, (current_width * current_height >> 4)) * blocksize
-                curbytes += mipmap_size
-                current_width = current_width >> 1
-                current_height = current_height >> 1
-            
+                layout_chunks_per_row = width << (-layout_diff)
+                layout_chunks_per_col = height << (-layout_diff)
+
+            dds_width = layout_chunks_per_row * 256
+            dds_height = layout_chunks_per_col * 256
+
+            # Mirror pydds.DDS.__init__ mipmap summation.
+            blocksize = 16 if CFG.pydds.format == 'BC3' else 8
+            curbytes = 128  # DDS header
+            cw, ch = dds_width, dds_height
+            while cw >= 1 and ch >= 1:
+                curbytes += max(1, (cw * ch >> 4)) * blocksize
+                cw >>= 1
+                ch >>= 1
+
             log.debug(f"Calculated DDS size for zoom {zoom}: {curbytes} bytes "
-                     f"(dimensions: {dds_width}x{dds_height}, max_zoom: {max_zoom}, tilezoom_diff: {tilezoom_diff})")
-            
+                     f"(layout {dds_width}x{dds_height}, layout_zoom={layout_zoom})")
             return curbytes
             
         except Exception as e:

@@ -4691,16 +4691,22 @@ class BackgroundDDSBuilder:
                 return
             
             mipmap_images.append(img0)
-            width, height = img0.size
-            
-            # Step 3: Create DDS and compress mipmap 0
+
+            # Step 3: Create temp DDS at LAYOUT dimensions (matches tile.dds,
+            # which is sized for what FUSE getattr promises X-Plane).  The
+            # build images are at build-zoom dims; we upscale to layout
+            # before BC1 compression so the output bytes match what
+            # _calculate_dds_size will report.
             use_ispc = CFG.pydds.compressor.upper() == "ISPC"
             dxt_format = CFG.pydds.format
-            
+
+            width = tile.dds.width if tile.dds is not None else img0.size[0]
+            height = tile.dds.height if tile.dds is not None else img0.size[1]
             temp_dds = pydds.DDS(width, height, ispc=use_ispc, dxt_format=dxt_format)
-            
-            # Compress mipmap 0 only (not generating lower mipmaps from it)
-            temp_dds.gen_mipmaps(img0, startmipmap=0, maxmipmaps=1)
+
+            # Compress mipmap 0 only (not generating lower mipmaps from it).
+            img0_for_mm0 = tile._upscale_to_layout(img0, 0)
+            temp_dds.gen_mipmaps(img0_for_mm0, startmipmap=0, maxmipmaps=1)
             
             # Step 4: Build each subsequent mipmap from its native chunks
             # This matches on-demand behavior where X-Plane might request
@@ -4717,11 +4723,12 @@ class BackgroundDDSBuilder:
                                   fallback_level_override=fallback_override)
 
                 if img is None:
-                    # Fall back to generating remaining mipmaps by downscaling
+                    # Fall back to generating remaining mipmaps by downscaling.
+                    # We pass img0 (upscaled to layout); pydds.gen_mipmaps will
+                    # internally reduce_2 down to each subsequent mipmap.
                     log.debug(f"BackgroundDDSBuilder: {tile_id} - mipmap {mipmap} get_img failed, "
                              f"will generate by downscaling")
-                    # Generate remaining mipmaps from what we have
-                    temp_dds.gen_mipmaps(img0, startmipmap=mipmap, maxmipmaps=99)
+                    temp_dds.gen_mipmaps(img0_for_mm0, startmipmap=mipmap, maxmipmaps=99)
                     break
 
                 # If the native image is entirely missing_color the lower-zoom
@@ -4735,8 +4742,10 @@ class BackgroundDDSBuilder:
 
                 mipmap_images.append(img)
 
-                # Compress just this mipmap from native image
-                temp_dds.gen_mipmaps(img, startmipmap=mipmap, maxmipmaps=1)
+                # Compress just this mipmap from native image, upscaled to
+                # the layout-mipmap dim if the build came in smaller.
+                img_for_mm = tile._upscale_to_layout(img, mipmap)
+                temp_dds.gen_mipmaps(img_for_mm, startmipmap=mipmap, maxmipmaps=1)
 
             # Step 5: Read out the complete DDS as bytes
             _defer_background_build_if_live(tile)
@@ -5956,11 +5965,16 @@ class Tile(object):
     _FALLBACK_POOL_MAX_SIZE = 100
 
     def __init__(self, col, row, maptype, zoom, min_zoom=0, priority=0,
-            cache_dir=None, max_zoom=None):
+            cache_dir=None, max_zoom=None, layout_zoom=None):
         self.row = int(row)
         self.col = int(col)
         self.maptype = maptype
         self.tilename_zoom = int(zoom)
+        # DDS LAYOUT zoom — drives output dimensions.  Caller (TileCacher)
+        # should supply this via compute_layout_zoom() so getattr and the
+        # DDS object agree.  When None (legacy callers / tests), fall back
+        # to the filename zoom so we never under-promise to X-Plane.
+        self.layout_zoom = int(layout_zoom) if layout_zoom is not None else self.tilename_zoom
         self.chunks = {}
         self.ready = threading.Event()
         self._lock = threading.RLock()
@@ -6087,30 +6101,47 @@ class Tile(object):
         # TODO VRAM usage optimization only getting the max ZL of the zone instead of the default max zoom
         # This is very time consuming while loading flight, left commented out for now
         # self.actual_max_zoom = self._detect_available_max_zoom()
+        # BUILD GRID: which chunks to fetch at max_zoom (the build zoom).
+        # Stays tied to tilezoom_diff so existing chunk download / native
+        # build / fallback-cascade pipelines see the same values as before.
         self.tilezoom_diff = self.tilename_zoom - self.max_zoom
 
-        if self.tilezoom_diff >= 0:
+        if self.tilezoom_diff < -1:
+            raise ValueError(f"Tilezoom_diff is {self.tilezoom_diff} which is less than -1, which is not supported by X-Plane.")
 
+        if self.tilezoom_diff >= 0:
             self.chunks_per_row = self.width >> self.tilezoom_diff
             self.chunks_per_col = self.height >> self.tilezoom_diff
         else:
             self.chunks_per_row = self.width << (-self.tilezoom_diff)
             self.chunks_per_col = self.height << (-self.tilezoom_diff)
 
-
-        if self.tilezoom_diff < 0:
-            if self.tilezoom_diff < -1:
-                raise ValueError(f"Tilezoom_diff is {self.tilezoom_diff} which is less than -1, which is not supported by X-Plane.")
-            self.max_mipmap = 5 # Enforce a maximum of 5 mipmaps (8192 -> 256 max)
-        else:
-            self.max_mipmap = 4 # Enforce a maximum of 4 mipmaps (4096 -> 256 max)
-
         self.chunks_per_row = max(1, self.chunks_per_row)
         self.chunks_per_col = max(1, self.chunks_per_col)
 
-        dds_width = self.chunks_per_row * 256
-        dds_height = self.chunks_per_col * 256
-        log.debug(f"Creating DDS at original size: {dds_width}x{dds_height} (ZL{self.max_zoom})")
+        # DDS LAYOUT: output dimensions X-Plane reads.  Driven solely by
+        # layout_zoom, which is stable per filename for the whole session.
+        # Compose pipeline upscales build output when build zoom < layout
+        # zoom (see get_img / aodds_fill_and_compose).
+        self.layout_zoom_diff = self.tilename_zoom - self.layout_zoom
+        if self.layout_zoom_diff < -1:
+            raise ValueError(f"layout_zoom_diff is {self.layout_zoom_diff} which is less than -1, which is not supported by X-Plane.")
+
+        if self.layout_zoom_diff >= 0:
+            layout_chunks_per_row = max(1, self.width >> self.layout_zoom_diff)
+            layout_chunks_per_col = max(1, self.height >> self.layout_zoom_diff)
+            self.max_mipmap = 4  # 4096 -> 256 max
+        else:
+            layout_chunks_per_row = self.width << (-self.layout_zoom_diff)
+            layout_chunks_per_col = self.height << (-self.layout_zoom_diff)
+            self.max_mipmap = 5  # 8192 -> 256 max
+
+        dds_width = layout_chunks_per_row * 256
+        dds_height = layout_chunks_per_col * 256
+        log.debug(f"Creating DDS at layout size: {dds_width}x{dds_height} "
+                  f"(filename ZL{self.tilename_zoom}, layout ZL{self.layout_zoom}, "
+                  f"build ZL{self.max_zoom}, build grid "
+                  f"{self.chunks_per_row}x{self.chunks_per_col})")
             
         self.dds = pydds.DDS(dds_width, dds_height, ispc=use_ispc,
                 dxt_format=CFG.pydds.format)
@@ -7700,7 +7731,14 @@ class Tile(object):
         # For mipmap 0, try native partial build first (10-20x faster).
         # This builds only the specific rows needed rather than the full mipmap.
         # Falls back to Python path if native build fails or is unavailable.
-        if mipmap == 0:
+        #
+        # SKIP the native path when ``max_zoom < layout_zoom`` — the C build
+        # writes at build dims directly into the DDS buffer, which leaves
+        # the larger layout mm0 slot partially filled.  The Python fallback
+        # path runs the compose-side upscale (``_upscale_to_layout``) so the
+        # output matches the layout-promised dimensions.  Native pipeline
+        # learns about layout_zoom in a follow-up step.
+        if mipmap == 0 and self.max_zoom >= self.layout_zoom:
             native_dds = _get_native_dds()
             if (native_dds is not None and
                 hasattr(native_dds, 'build_partial_mipmap') and
@@ -7710,6 +7748,8 @@ class Tile(object):
                 # (ready.set() already called inside _try_native_partial_mipmap_build)
                 return True
             bump('partial_build_python_fallback')
+        elif mipmap == 0:
+            bump('partial_build_python_fallback_layout_mismatch')
 
         # ═══════════════════════════════════════════════════════════════════
         # PYTHON FALLBACK PATH
@@ -7737,6 +7777,10 @@ class Tile(object):
             compress_len = length - 128
         else:
             compress_len = 0
+
+        # Upscale to layout mipmap size when dynamic-zoom downgraded the
+        # build below layout_zoom — keeps mm slot fully populated.
+        new_im = self._upscale_to_layout(new_im, mipmap)
 
         with self._dds_write_lock:
             self.ready.clear()
@@ -7774,6 +7818,49 @@ class Tile(object):
                 pass
 
         return True
+
+    def _upscale_to_layout(self, img, mipmap):
+        """Upscale a composed build image to the layout mipmap size if smaller.
+
+        When dynamic zoom downgrades ``max_zoom`` below ``layout_zoom``, the
+        composed source image arrives at the smaller build-zoom dimensions.
+        Compressing it as-is into the larger DDS mipmap slot produces a
+        short / wrong-strided buffer (root cause of the white-tile bug).
+
+        We use the existing ``aoimage_crop_and_upscale`` primitive — a fast
+        C path that the per-chunk cascade fallback already relies on — to
+        bring the image up to exactly ``self.dds.width >> mipmap`` before
+        BC1 compression.  Result is a blurry-but-coherent mipmap that
+        gradually sharpens as the build is rerun at higher build zooms.
+
+        Pass-through when ``img`` already matches the target size or
+        ``self.dds`` is unavailable.
+        """
+        try:
+            if self.dds is None or img is None:
+                return img
+            target_w = max(1, self.dds.width >> mipmap)
+            target_h = max(1, self.dds.height >> mipmap)
+            src_w, src_h = img.size
+            if src_w >= target_w and src_h >= target_h:
+                return img
+            scale_w = target_w // max(1, src_w)
+            scale_h = target_h // max(1, src_h)
+            scale = min(scale_w, scale_h)
+            if scale < 2 or (scale & (scale - 1)) != 0:
+                # crop_and_upscale only supports power-of-two scales.
+                return img
+            upscaled = img.crop_and_upscale(0, 0, src_w, src_h, scale)
+            bump('compose_upscale_to_layout')
+            log.debug(
+                f"compose upscale: {self} mipmap={mipmap} "
+                f"{src_w}x{src_h} -> {src_w*scale}x{src_h*scale} (target {target_w}x{target_h})"
+            )
+            return upscaled
+        except Exception as e:
+            log.warning(f"compose upscale failed for {self} mipmap={mipmap}: {e}; "
+                        f"using build-size image (may render short)")
+            return img
 
     def read_dds_bytes(self, offset, length):
         log.debug(f"READ DDS BYTES: {offset} {length}")
@@ -9855,6 +9942,10 @@ class Tile(object):
             log.debug("GET_MIPMAP: No updates, so no image generated")
             return True
 
+        # Upscale to layout mipmap size when dynamic-zoom downgraded the
+        # build below layout_zoom — keeps mm slot fully populated.
+        new_im = self._upscale_to_layout(new_im, mipmap)
+
         # DDS WRITE — short critical section (~10-50ms)
         compress_start_time = time.monotonic()
         with self._dds_write_lock:
@@ -10186,7 +10277,47 @@ class TileCacher(object):
             # Windows doesn't handle FS cache the same way so enable here.
             self.enable_cache = True
             self.cache_tile_lim = 50
-    
+
+    def compute_layout_zoom(self, tilename_zoom: int) -> int:
+        """Single source of truth for a tile's DDS output dimensions.
+
+        Both ``Tile.__init__`` (which sizes the DDS object) and
+        ``autoortho_fuse._calculate_dds_size`` (which answers FUSE getattr)
+        consult this function so what X-Plane is told matches what AO
+        actually produces.  Drift between those two is the root cause of
+        the "appears to be truncated" warnings on downgraded tiles.
+
+        Determined by static config + filename zoom only — never altitude or
+        runtime state.  Stable per filename for the whole session: a Tile's
+        DDS layout will never change mid-flight, so file sizes never grow
+        under X-Plane.  Dynamic-zoom decisions live in ``Tile.max_zoom``
+        (the BUILD zoom), which can be ≤ the layout zoom; when smaller, the
+        compose pipeline upscales to fill.
+
+        Returns:
+            Zoom level whose dimensions the DDS should be laid out for.
+            Always ≥ ``tilename_zoom`` (X-Plane reads the filename and
+            expects at least that resolution); capped at
+            ``tilename_zoom + 1`` (X-Plane's supersample limit).
+        """
+        tilename_zoom = int(tilename_zoom)
+        if self.max_zoom_mode == "dynamic":
+            max_regular, max_airport = self.dynamic_zoom_manager.get_max_zoom_levels()
+            if tilename_zoom == 18 and not CFG.autoortho.using_custom_tiles:
+                target = max_airport
+            else:
+                target = max_regular
+        else:
+            if CFG.autoortho.using_custom_tiles:
+                target = self.target_zoom_level
+            elif tilename_zoom == 18:
+                target = self.target_zoom_level_near_airports
+            else:
+                target = self.target_zoom_level
+        # Floor at filename zoom (never go below what X-Plane expects from
+        # the filename); cap at +1 for supersample headroom.
+        return max(tilename_zoom, min(tilename_zoom + 1, int(target)))
+
     def _compute_dynamic_zoom(self, row: int, col: int, tile_zoom: int) -> int:
         """
         Compute dynamic zoom level based on predicted altitude at tile.
@@ -10899,10 +11030,11 @@ class TileCacher(object):
                 # Use target zoom level - supports both fixed and dynamic modes
                 # Pass row/col for dynamic zoom computation based on predicted altitude
                 tile = Tile(
-                    col, row, map_type, zoom, 
+                    col, row, map_type, zoom,
                     cache_dir=self.cache_dir,
                     min_zoom=self.min_zoom,
                     max_zoom=self._get_target_zoom_level(zoom, row=row, col=col),
+                    layout_zoom=self.compute_layout_zoom(zoom),
                 )
                 self.tiles[idx] = tile
                 # New tile becomes MRU
