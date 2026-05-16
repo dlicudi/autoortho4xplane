@@ -7710,6 +7710,22 @@ class Tile(object):
             log.debug(f"We already have mipmap {mipmap} for {self}")
             return True
 
+        # ═══════════════════════════════════════════════════════════════════
+        # DYNAMIC-ZOOM DOWNGRADE: build mm0..mmN from one upscaled source
+        # ═══════════════════════════════════════════════════════════════════
+        # When max_zoom < layout_zoom, chunks at intermediate zooms (the
+        # natural sources for mm1, mm2, ...) were never downloaded.  The
+        # per-mipmap build path returns None for those, leaving mm slots
+        # empty — pydds fills them with missing_color on read (green
+        # terrain).  Instead, build mm0 from the available build-zoom
+        # chunks (upscaled to layout) and let pydds.gen_mipmaps derive
+        # all subsequent mipmaps from it in a single pass.
+        if self.max_zoom < self.layout_zoom:
+            if self._build_all_mipmaps_from_mm0(time_budget=time_budget):
+                return True
+            # mm0 image not yet available — fall through to legacy path
+            # so the chunk-collection logic can still progress this read.
+
         mm = self.dds.mipmap_list[mipmap]
         if length >= mm.length:
             self.get_mipmap(mipmap, time_budget=time_budget)
@@ -7844,6 +7860,49 @@ class Tile(object):
             except Exception:
                 pass
 
+        return True
+
+    def _build_all_mipmaps_from_mm0(self, time_budget=None) -> bool:
+        """Build mm0 (upscaled to layout) then derive mm1..mmN by downsampling.
+
+        Used when ``build_zoom < layout_zoom``: chunks at intermediate zooms
+        (max_zoom-1, max_zoom-2, ...) were never downloaded, so the natural
+        per-mipmap build path would return ``None`` for those mipmaps and
+        leave the DDS slots empty — rendered as missing_color (green
+        terrain).
+
+        Strategy: fetch the mm0 source at build_zoom (always available
+        since that's the build grid), upscale to layout dimensions via
+        ``_upscale_to_layout``, then ``gen_mipmaps(..., maxmipmaps=99)`` —
+        pydds' internal ``reduce_2`` chain produces every smaller mipmap
+        from the same source in a single pass.  Cost is dominated by the
+        mm0 BC1 compress; subsequent mipmaps are cheap.
+
+        Idempotent: short-circuits when all mipmaps are already retrieved.
+        Returns True on success (or already-built), False if mm0 image
+        wasn't producible (caller should fall through to slower paths).
+        """
+        if self.dds is None:
+            return False
+        # Already built?
+        if all(mm.retrieved for mm in self.dds.mipmap_list[: self.max_mipmap + 1]):
+            return True
+        # Source image at build zoom — chunks exist at this level by construction.
+        img0 = self.get_img(0, startrow=0, endrow=None,
+                            maxwait=self.get_maxwait(), time_budget=time_budget)
+        if img0 is None:
+            log.debug(f"_build_all_mipmaps_from_mm0: mm0 image not available for {self}")
+            return False
+        img0_layout = self._upscale_to_layout(img0, 0)
+        with self._dds_write_lock:
+            self.ready.clear()
+            try:
+                # maxmipmaps=99 -> "all", pydds caps at smallest_mm internally.
+                self.dds.gen_mipmaps(img0_layout, startmipmap=0, maxmipmaps=99)
+            finally:
+                self.ready.set()
+        bump('build_all_mipmaps_from_mm0')
+        log.debug(f"_build_all_mipmaps_from_mm0: built mm0..mm{self.max_mipmap} for {self}")
         return True
 
     def _upscale_to_layout(self, img, mipmap):
@@ -9931,6 +9990,14 @@ class Tile(object):
         tile_creation_start = time.monotonic()
 
         log.debug(f"GET_MIPMAP: {self}")
+
+        # Dynamic-zoom downgrade: build mm0..mmN from one upscaled source.
+        # See _build_all_mipmaps_from_mm0 for rationale.
+        if self.max_zoom < self.layout_zoom:
+            if self._build_all_mipmaps_from_mm0(time_budget=time_budget):
+                return True
+            # mm0 image not yet available — fall through to legacy path
+            # so the chunk-collection logic can still progress this read.
 
         # === BUDGET TIMING ===
         # The budget is passed in from read_dds_bytes() - each read() gets its own budget.
