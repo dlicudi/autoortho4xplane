@@ -34,7 +34,10 @@ log = logging.getLogger(__name__)
 # Current DDM schema version. Bump when the metadata format changes
 # in a backwards-incompatible way.
 # v2 -> v3: added "populated_mipmaps" for incremental DDS persistence
-DDM_VERSION = 3
+DDM_VERSION = 4  # v4: DDS dims follow layout_zoom (FUSE-promised), not build zoom.
+                 # v3 and earlier wrote w/h at build dim; their cached bytes are
+                 # smaller than the new DDS layout and serving them produces the
+                 # "appears to be truncated" X-Plane warning.  Marked stale on load.
 
 
 def cleanup_source_jpegs(cache_dir: str, col: int, row: int,
@@ -346,6 +349,15 @@ class DynamicDDSCache:
             from autoortho.aoconfig import CFG
         except ImportError:
             from aoconfig import CFG  # type: ignore[no-redef]
+
+        # Rule 0: DDM schema version.  v<4 entries were written when DDS dims
+        # followed the build zoom instead of layout_zoom; their cached bytes
+        # don't match the new DDS layout.
+        meta_v = meta.get("v", 0)
+        if meta_v < DDM_VERSION:
+            log.debug(f"DDS stale: DDM version {meta_v} < current {DDM_VERSION} "
+                      f"(layout-zoom change requires rebuild)")
+            return True
 
         # Rule 1: DXT format changed
         current_fmt = CFG.pydds.format.upper()
