@@ -4772,6 +4772,27 @@ class BackgroundDDSBuilder:
                 img_for_mm = tile._upscale_to_layout(img, mipmap)
                 temp_dds.gen_mipmaps(img_for_mm, startmipmap=mipmap, maxmipmaps=1)
 
+            # Step 4b: Fill any remaining unpopulated mipmaps in [0, smallest_mm]
+            # by downsampling from img0_for_mm0.  Without this, the build loop
+            # above only populates mm0..mm[max_mipmap] — any mm in
+            # [max_mipmap+1, smallest_mm] is left with databuffer=None, and
+            # pydds.read returns missing_color BC1 blocks for those offsets.
+            # That produces green-at-distance when X-Plane samples below
+            # max_mipmap.  Downsampling from img0 yields real (lower-quality
+            # but correct) data instead.
+            first_unpop = None
+            for mm in temp_dds.mipmap_list[:temp_dds.smallest_mm + 1]:
+                if not mm.retrieved or mm.databuffer is None:
+                    first_unpop = mm.idx
+                    break
+            if first_unpop is not None:
+                try:
+                    temp_dds.gen_mipmaps(img0_for_mm0, startmipmap=first_unpop, maxmipmaps=99)
+                    bump('prebuilt_dds_downsample_filled')
+                except Exception as e:
+                    log.debug(f"BackgroundDDSBuilder: {tile_id} fill-by-downsample "
+                              f"failed for mm[{first_unpop}..]: {e}")
+
             # Step 5: Read out the complete DDS as bytes
             _defer_background_build_if_live(tile)
             dds_bytes = temp_dds.read(temp_dds.total_size)
@@ -4784,7 +4805,22 @@ class BackgroundDDSBuilder:
             # Step 6: Store in DDS cache
             # Skip if any native mipmap image was entirely missing_color — that
             # would store green blobs in mip1+ while the DDM reports all-clear.
-            if self._dds_cache is not None and not any_higher_mip_uniform:
+            #
+            # Also skip if any mipmap in [0, smallest_mm] is unpopulated.  pydds.read
+            # returns get_fallback_bytes (missing_color BC1 blocks) for unpopulated
+            # mipmap offsets — those bytes land in dds_bytes and would be persisted
+            # with a DDM claiming complete coverage, producing green at distance.
+            unpopulated = []
+            if temp_dds.mipmap_list:
+                for mm in temp_dds.mipmap_list[:temp_dds.smallest_mm + 1]:
+                    if not mm.retrieved or mm.databuffer is None:
+                        unpopulated.append(mm.idx)
+            if unpopulated:
+                log.warning(f"BackgroundDDSBuilder: {tile_id} has unpopulated mipmaps "
+                            f"{unpopulated} after build — skipping cache store to "
+                            f"prevent missing_color persistence")
+                bump('prebuilt_dds_skipped_unpopulated')
+            elif self._dds_cache is not None and not any_higher_mip_uniform:
                 try:
                     mm0_chunks = tile.chunks.get(tile.max_zoom, [])
                     python_mm0_missing = [i for i, c in enumerate(mm0_chunks)
@@ -10111,22 +10147,37 @@ class Tile(object):
             _partially_cached = getattr(self, '_dds_populated_mipmaps', None) is not None
             if dynamic_dds_cache is not None and (not self._prepopulated or _partially_cached):
                 try:
-                    self.dds.seek(0)
-                    dds_bytes = self.dds.read(self.dds.total_size)
-                    if dds_bytes and len(dds_bytes) >= 128:
-                        mm0_missing = None
-                        with self._lock:
-                            mm0_chunks = self.chunks.get(self.max_zoom, [])
-                        if mm0_chunks:
-                            missing = [i for i, c in enumerate(mm0_chunks)
-                                       if not (c.ready.is_set() and c.data)]
-                            if missing:
-                                mm0_missing = missing
-                                log.debug(f"GET_MIPMAP: Progressive store for {self.id} "
-                                          f"recording {len(missing)} missing chunks for healing")
-                        dynamic_dds_cache.store(
-                            self.id, self.max_zoom, dds_bytes, self,
-                            mm0_missing_indices=mm0_missing)
+                    # Guard: skip cache store if any mipmap in [0, smallest_mm] is
+                    # unpopulated.  pydds.read returns get_fallback_bytes (missing_color
+                    # BC1 blocks) for unpopulated mipmaps — persisting those bytes with
+                    # a DDM claiming complete coverage produces green at distance.
+                    unpopulated = []
+                    if self.dds.mipmap_list:
+                        for mm in self.dds.mipmap_list[:self.dds.smallest_mm + 1]:
+                            if not mm.retrieved or mm.databuffer is None:
+                                unpopulated.append(mm.idx)
+                    if unpopulated:
+                        log.warning(f"GET_MIPMAP: Progressive store for {self.id} "
+                                    f"skipped — unpopulated mipmaps {unpopulated} "
+                                    f"would persist missing_color blocks")
+                        bump('progressive_store_skipped_unpopulated')
+                    else:
+                        self.dds.seek(0)
+                        dds_bytes = self.dds.read(self.dds.total_size)
+                        if dds_bytes and len(dds_bytes) >= 128:
+                            mm0_missing = None
+                            with self._lock:
+                                mm0_chunks = self.chunks.get(self.max_zoom, [])
+                            if mm0_chunks:
+                                missing = [i for i, c in enumerate(mm0_chunks)
+                                           if not (c.ready.is_set() and c.data)]
+                                if missing:
+                                    mm0_missing = missing
+                                    log.debug(f"GET_MIPMAP: Progressive store for {self.id} "
+                                              f"recording {len(missing)} missing chunks for healing")
+                            dynamic_dds_cache.store(
+                                self.id, self.max_zoom, dds_bytes, self,
+                                mm0_missing_indices=mm0_missing)
                 except Exception:
                     pass
 
