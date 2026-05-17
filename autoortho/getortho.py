@@ -829,7 +829,18 @@ _active_native_builds_lock = threading.Lock()
 # 2026-05-17 in fixed-z16 cruise: all 6 region coordinators stuck at
 # active_builds=4/4 with completed= frozen and decode_pool_overflow_mb
 # pinned at the cap.  K=2 caps peak burst at ~128 MB, well under the cap.
-_finalize_to_file_sem = threading.Semaphore(2)
+#
+# 2026-05-17 UPDATE: split into separate BG and LIVE semaphores.  Previously
+# both paths shared a single Semaphore(2), causing live X-Plane FUSE reads
+# (via Tile._try_streaming_aopipeline_build) to queue behind background
+# prefetch builds.  Symptom: 10-second VERY_SLOW reads on extend_mm{n}_to_mm{n+1}
+# branches → X-Plane main thread blocked → CockpitDecks websocket choked
+# despite the MacBook not being saturated.  Live now has its own K=2 budget
+# that BG cannot steal, while BG keeps its own K=2 budget — total peak burst
+# capped at K=4 across both paths (still well under pool cap with malloc'd
+# fallback images).
+_finalize_to_file_sem = threading.Semaphore(2)      # BG prefetch only
+_finalize_to_buffer_sem = threading.Semaphore(2)    # Live X-Plane reads only
 
 # ---------------------------------------------------------------------------
 # Native build path inflight tracking
@@ -7149,10 +7160,11 @@ class Tile(object):
             
             try:
                 with _native_build_context() as threads:
-                    # Same parallel-decode burst as finalize_to_file — wrap with
-                    # the shared semaphore so live + background builders share
-                    # one budget against the decode pool.
-                    with _finalize_to_file_sem:
+                    # Same parallel-decode burst as finalize_to_file — wrap
+                    # with the LIVE semaphore so live X-Plane reads never
+                    # queue behind background prefetch builds.  Separate K=2
+                    # budget from BG's _finalize_to_file_sem.
+                    with _finalize_to_buffer_sem:
                         with _native_path_count('streaming_finalize_to_buffer'):
                             result = builder.finalize(buffer, max_threads=threads)
                 if result.success and result.bytes_written >= 128:
