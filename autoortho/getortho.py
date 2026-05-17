@@ -6579,9 +6579,9 @@ class Tile(object):
             if cached_data:
                 for chunk in need_cache_read:
                     if chunk.cache_path in cached_data:
+                        # set_cached_data bumps chunk_hit internally.
                         chunk.set_cached_data(cached_data[chunk.cache_path])
                         available_count += 1
-                        bump('chunk_hit')
 
         return available_count / total_chunks
 
@@ -6666,11 +6666,10 @@ class Tile(object):
                     chunk = chunks[i]
                     if chunk.cache_path in cached_data:
                         data = cached_data[chunk.cache_path]
-                        # Update chunk state (same as get_cache() would do)
+                        # set_cached_data bumps chunk_hit internally.
                         chunk.set_cached_data(data)
                         jpeg_datas[i] = data
                         available_count += 1
-                        bump('chunk_hit')
 
                 log.debug(f"_collect_chunk_jpegs: Secondary batch cache read - "
                          f"{len(cached_data)}/{len(cache_paths)} hits")
@@ -9858,10 +9857,10 @@ class Tile(object):
                     chunk = chunks[i]
                     if chunk.cache_path in cached_data:
                         data = cached_data[chunk.cache_path]
+                        # set_cached_data bumps chunk_hit internally.
                         chunk.set_cached_data(data)
                         jpeg_datas[i] = data
                         ready_count += 1
-                        bump('chunk_hit')
                 
                 log.debug(f"_try_native_mipmap_build: Batch cache read - "
                          f"{len(cached_data)}/{len(cache_paths)} hits for mipmap {mipmap}")
