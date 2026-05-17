@@ -695,13 +695,14 @@ def _build_dds_hybrid(chunks: list, dxt_format: str,
         
         try:
             with _native_build_context() as threads:
-                result = native.build_from_jpegs_to_buffer(
-                    buffer,
-                    jpeg_datas,
-                    format=dxt_format,
-                    missing_color=missing_color,
-                    max_threads=threads
-                )
+                with _native_path_count('live_hybrid_to_buffer'):
+                    result = native.build_from_jpegs_to_buffer(
+                        buffer,
+                        jpeg_datas,
+                        format=dxt_format,
+                        missing_color=missing_color,
+                        max_threads=threads
+                    )
 
             if result.success and result.bytes_written >= 128:
                 dds_bytes = result.to_bytes()
@@ -819,6 +820,82 @@ _active_native_builds = 0
 _active_native_thread_count = 0
 _peak_native_thread_count = 0
 _active_native_builds_lock = threading.Lock()
+
+# Bound the streaming builder's finalize_to_file burst.  Inside finalize,
+# all 256 chunks decode in parallel (OpenMP) and each grabs a ~256 KB
+# buffer from the decode pool.  With many concurrent finalizes the pool
+# (~1 GB cap) saturates and finalizes block waiting for buffers WHILE
+# STILL HOLDING earlier-acquired buffers — soft deadlock observed on
+# 2026-05-17 in fixed-z16 cruise: all 6 region coordinators stuck at
+# active_builds=4/4 with completed= frozen and decode_pool_overflow_mb
+# pinned at the cap.  K=2 caps peak burst at ~128 MB, well under the cap.
+_finalize_to_file_sem = threading.Semaphore(2)
+
+# ---------------------------------------------------------------------------
+# Native build path inflight tracking
+#
+# Diagnostic instrumentation added 2026-05-17 to identify which native build
+# paths are holding decode-pool buffers during saturation.  The decode pool
+# can hit its cap (1 GB by default) and produce build_stuck warnings even
+# with the K=2 finalize semaphore in place — meaning some unwrapped path is
+# also acquiring buffers.  This dict tracks concurrent in-flight count per
+# call site.  Published in STATS and snapshotted in build_stuck warnings.
+#
+# Tags correspond to specific native build call sites — see _native_path_count
+# helper docstring for the mapping.
+_native_path_inflight = {
+    'streaming_finalize_to_file': 0,    # BackgroundDDSBuilder line 4258
+    'streaming_finalize_to_buffer': 0,  # Tile._try_streaming_aopipeline_build
+    'bg_hybrid_to_file': 0,             # BackgroundDDSBuilder hybrid_direct
+    'bg_native_to_file': 0,             # BackgroundDDSBuilder native_direct
+    'bg_native_to_buffer': 0,           # BackgroundDDSBuilder native_buffered
+    'live_hybrid_to_buffer': 0,         # _build_dds_hybrid (live)
+    'live_aopipeline': 0,               # _try_aopipeline_build (live)
+    # Builder lifetime — incremented after acquire, decremented before release.
+    # Decode-pool chunk buffers persist in builder->chunks[] until release()
+    # calls aodds_builder_reset.  If these counters are much higher than the
+    # corresponding *_finalize_* counters, buffers are held in the post-finalize
+    # pre-release window — explaining decode pool saturation despite K=2 sem.
+    'streaming_builder_held_bg': 0,     # BackgroundDDSBuilder acquire→release
+    'streaming_builder_held_live': 0,   # Tile._try_streaming_aopipeline_build acquire→release
+}
+_native_path_lock = threading.Lock()
+
+
+class _native_path_count:
+    """Context manager that increments/decrements an inflight counter.
+
+    Usage:
+        with _native_path_count('streaming_finalize_to_file'):
+            result = builder.finalize_to_file(...)
+
+    Tags must match keys in _native_path_inflight.  Unknown tags are
+    silently dropped (defensive — no crash on typo).
+    """
+    __slots__ = ('_tag',)
+
+    def __init__(self, tag: str):
+        self._tag = tag
+
+    def __enter__(self):
+        with _native_path_lock:
+            if self._tag in _native_path_inflight:
+                _native_path_inflight[self._tag] += 1
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        with _native_path_lock:
+            if self._tag in _native_path_inflight:
+                _native_path_inflight[self._tag] = max(
+                    0, _native_path_inflight[self._tag] - 1
+                )
+        return False
+
+
+def _native_path_inflight_snapshot() -> dict:
+    """Thread-safe copy of the current inflight counter dict."""
+    with _native_path_lock:
+        return dict(_native_path_inflight)
 
 
 def _native_thread_load() -> tuple:
@@ -3896,10 +3973,17 @@ class BackgroundDDSBuilder:
                             stuck.append((tid_str, age, _tid_num, stage))
                             self._warned_long_builds.add(tid_str)
                 for tid_str, age, _tid_num, stage in stuck:
+                    # Snapshot of native-path inflight at the moment of the
+                    # warning so we can correlate stuck builds with the paths
+                    # actively holding decode-pool buffers.
+                    inflight = _native_path_inflight_snapshot()
+                    inflight_str = " ".join(
+                        f"{k}={v}" for k, v in inflight.items() if v > 0
+                    ) or "all_zero"
                     log.warning(
                         f"PIPELINE_TRACE build_stuck pid={os.getpid()} "
                         f"tile={tid_str} thread={_tid_num} age_s={age:.1f} "
-                        f"stage='{stage}'"
+                        f"stage='{stage}' native_inflight=[{inflight_str}]"
                     )
 
             # Yield all resources to live tile reads when X-Plane is active
@@ -4093,6 +4177,12 @@ class BackgroundDDSBuilder:
             log.warning(f"BackgroundDDSBuilder: Failed to acquire streaming builder for {tile_id}")
             return False
 
+        # Diagnostic: track time from acquire to release.  Decremented in the
+        # finally block below — buffers in builder->chunks[] are held until
+        # builder.release() runs aodds_builder_reset.
+        with _native_path_lock:
+            _native_path_inflight['streaming_builder_held_bg'] += 1
+
         # Setup transition tracking
         tile._live_transition_event = threading.Event()
         tile._active_streaming_builder = builder
@@ -4245,9 +4335,13 @@ class BackgroundDDSBuilder:
                     return False
                 self._set_build_stage(tile_id, "native_build_context+finalize_to_file")
                 with _native_build_context() as threads:
-                    success, bytes_written = builder.finalize_to_file(
-                        staging_path, max_threads=threads
-                    )
+                    # Semaphore bounds peak parallel-decode demand at finalize.
+                    # See _finalize_to_file_sem definition for rationale.
+                    with _finalize_to_file_sem:
+                        with _native_path_count('streaming_finalize_to_file'):
+                            success, bytes_written = builder.finalize_to_file(
+                                staging_path, max_threads=threads
+                            )
 
                 if success and bytes_written >= 128:
                     self._set_build_stage(tile_id, "store_from_file")
@@ -4282,6 +4376,10 @@ class BackgroundDDSBuilder:
             tile._active_streaming_builder = None
             tile._live_transition_event = None
             builder.release()
+            # Decrement builder-held counter (incremented after acquire above)
+            with _native_path_lock:
+                _native_path_inflight['streaming_builder_held_bg'] = max(
+                    0, _native_path_inflight['streaming_builder_held_bg'] - 1)
 
     def _build_tile_dds(self, tile) -> None:
         """
@@ -4414,13 +4512,14 @@ class BackgroundDDSBuilder:
 
                                     self._set_build_stage(tile_id, "hybrid_direct:native_build_from_jpegs_to_file")
                                     with _native_build_context() as threads:
-                                        result = native_dds.build_from_jpegs_to_file(
-                                            jpeg_datas,
-                                            staging_path,
-                                            format=dxt_format,
-                                            missing_color=missing_color,
-                                            max_threads=threads
-                                        )
+                                        with _native_path_count('bg_hybrid_to_file'):
+                                            result = native_dds.build_from_jpegs_to_file(
+                                                jpeg_datas,
+                                                staging_path,
+                                                format=dxt_format,
+                                                missing_color=missing_color,
+                                                max_threads=threads
+                                            )
 
                                     if result.success and result.bytes_written >= 128:
                                         self._dds_cache.store_from_file(
@@ -4502,17 +4601,18 @@ class BackgroundDDSBuilder:
 
                         self._set_build_stage(tile_id, "native_direct:build_tile_to_file")
                         with _native_build_context():
-                            result = native_dds.build_tile_to_file(
-                                cache_dir=tile.cache_dir,
-                                row=tile.row,
-                                col=tile.col,
-                                maptype=tile.maptype,
-                                zoom=tile.max_zoom,
-                                output_path=staging_path,
-                                chunks_per_side=tile.chunks_per_row,
-                                format=dxt_format,
-                                missing_color=missing_color
-                            )
+                            with _native_path_count('bg_native_to_file'):
+                                result = native_dds.build_tile_to_file(
+                                    cache_dir=tile.cache_dir,
+                                    row=tile.row,
+                                    col=tile.col,
+                                    maptype=tile.maptype,
+                                    zoom=tile.max_zoom,
+                                    output_path=staging_path,
+                                    chunks_per_side=tile.chunks_per_row,
+                                    format=dxt_format,
+                                    missing_color=missing_color
+                                )
 
                         if result.success and result.bytes_written >= 128:
                             # Check which chunks were missing from cache (filled with missing_color by native build)
@@ -4575,17 +4675,18 @@ class BackgroundDDSBuilder:
                     _defer_background_build_if_live(tile)
                     self._set_build_stage(tile_id, "native_buffered:build_tile_to_buffer")
                     with _native_build_context():
-                        result = native_dds.build_tile_to_buffer(
-                            buffer,
-                            cache_dir=tile.cache_dir,
-                            row=tile.row,
-                            col=tile.col,
-                            maptype=tile.maptype,
-                            zoom=tile.max_zoom,
-                            chunks_per_side=tile.chunks_per_row,
-                            format=dxt_format,
-                            missing_color=missing_color
-                        )
+                        with _native_path_count('bg_native_to_buffer'):
+                            result = native_dds.build_tile_to_buffer(
+                                buffer,
+                                cache_dir=tile.cache_dir,
+                                row=tile.row,
+                                col=tile.col,
+                                maptype=tile.maptype,
+                                zoom=tile.max_zoom,
+                                chunks_per_side=tile.chunks_per_row,
+                                format=dxt_format,
+                                missing_color=missing_color
+                            )
                     
                     if result.success and result.bytes_written >= 128:
                         dds_bytes = result.to_bytes()
@@ -6697,13 +6798,14 @@ class Tile(object):
             # STEP 4: Build DDS with native aopipeline
             # ═══════════════════════════════════════════════════════════════
             with _native_build_context() as threads:
-                result = native_dds.build_from_jpegs_to_buffer(
-                    buffer,
-                    jpeg_datas,
-                    format=dxt_format,
-                    missing_color=missing_color,
-                    max_threads=threads
-                )
+                with _native_path_count('live_aopipeline'):
+                    result = native_dds.build_from_jpegs_to_buffer(
+                        buffer,
+                        jpeg_datas,
+                        format=dxt_format,
+                        missing_color=missing_color,
+                        max_threads=threads
+                    )
 
             if not result.success:
                 log.debug(f"_try_aopipeline_build: Native build failed for {self.id}: {result.error}")
@@ -6985,6 +7087,10 @@ class Tile(object):
             if wait_time_ms > 10:
                 bump('streaming_builder_queue_wait_count')
 
+            # Diagnostic: track time from acquire to release.  See bg counterpart.
+            with _native_path_lock:
+                _native_path_inflight['streaming_builder_held_live'] += 1
+
             if final_ready_chunks:
                 builder.add_chunks_batch_nocopy(final_ready_chunks, jpeg_refs_for_nocopy)
 
@@ -7043,7 +7149,12 @@ class Tile(object):
             
             try:
                 with _native_build_context() as threads:
-                    result = builder.finalize(buffer, max_threads=threads)
+                    # Same parallel-decode burst as finalize_to_file — wrap with
+                    # the shared semaphore so live + background builders share
+                    # one budget against the decode pool.
+                    with _finalize_to_file_sem:
+                        with _native_path_count('streaming_finalize_to_buffer'):
+                            result = builder.finalize(buffer, max_threads=threads)
                 if result.success and result.bytes_written >= 128:
                     dds_bytes = bytes(buffer[:result.bytes_written])
                     if self._populate_dds_from_prebuilt(dds_bytes):
@@ -7084,6 +7195,10 @@ class Tile(object):
             jpeg_refs_for_nocopy.clear()
             if builder is not None:
                 builder.release()
+                # Decrement builder-held counter (incremented after acquire above)
+                with _native_path_lock:
+                    _native_path_inflight['streaming_builder_held_live'] = max(
+                        0, _native_path_inflight['streaming_builder_held_live'] - 1)
 
     def _get_fallback_level(self) -> int:
         """
@@ -10767,6 +10882,13 @@ class TileCacher(object):
         update_process_memory_stat()
         # Report decode pool stats for native buffer monitoring
         update_decode_pool_stats()
+        # Publish native-build-path inflight counts so we can correlate
+        # decode_pool_overflow_mb saturation with which paths are active.
+        try:
+            for _tag, _count in _native_path_inflight_snapshot().items():
+                set_stat(f"native_inflight:{_tag}", _count)
+        except Exception:
+            pass
         # Publish activity stats for proportional eviction (macOS multi-process only)
         if self._has_shared_store():
             try:
