@@ -136,38 +136,82 @@ def _get_native_cache():
 def _batch_read_cache_files(paths: list) -> dict:
     """
     Read multiple cache files in parallel.
-    
+
     Uses native AoCache for parallel reads when available.
     Falls back to Python ThreadPoolExecutor when native unavailable.
-    
+
     Args:
         paths: List of file paths to read
-        
+
     Returns:
         Dict mapping path -> bytes for successfully read files.
         Missing/failed files are not included in the result.
     """
     if not paths:
         return {}
-    
+
+    # Phase timing — 2026-05-17.  Code reading found this is the actual
+    # hot path for cache reads (NOT Chunk.get_cache, which only handles
+    # fallback misses).  Each chunk read = 4 syscalls (open/fstat/read/
+    # close) via aocache.c:read_file_posix.  Tracking call counts +
+    # per-call ms + per-path ms tells us if the gap between
+    # phase_native_partial (379ms) and partial_py_total (29ms) is
+    # genuinely disk I/O or something else.
+    _t0_batch = time.monotonic()
+    _path_count = len(paths)
+
     native = _get_native_cache()
-    
+
     # Try native batch read first (OpenMP parallel, fastest)
     if native is not None:
         try:
+            _t0_native = time.monotonic()
             results = native.batch_read_cache(paths, max_threads=0, validate_jpeg=True)
+            _native_ms = int((time.monotonic() - _t0_native) * 1000)
+
+            _t0_build = time.monotonic()
             output = {}
+            _hit_count = 0
+            _total_bytes = 0
             for path, (data, success) in zip(paths, results):
                 if success:
                     output[path] = data
+                    _hit_count += 1
+                    if data:
+                        _total_bytes += len(data)
+            _build_ms = int((time.monotonic() - _t0_build) * 1000)
+            _total_ms = int((time.monotonic() - _t0_batch) * 1000)
+            try:
+                bump_many({
+                    'batch_cache_read_calls': 1,
+                    'batch_cache_read_paths': _path_count,
+                    'batch_cache_read_hits': _hit_count,
+                    'batch_cache_read_bytes': _total_bytes,
+                    'batch_cache_read_total_ms': _total_ms,
+                    'batch_cache_read_native_ms': _native_ms,
+                    'batch_cache_read_build_ms': _build_ms,
+                })
+            except Exception:
+                pass
             return output
         except Exception as e:
             log.debug(f"Native batch cache read failed: {e}")
             # Fall through to Python fallback
-    
+
     # Python fallback: ThreadPoolExecutor for parallel file reads
     # This is slower than native but still much faster than sequential reads
-    return _batch_read_cache_files_python(paths)
+    _t0_py = time.monotonic()
+    output = _batch_read_cache_files_python(paths)
+    _py_ms = int((time.monotonic() - _t0_py) * 1000)
+    try:
+        bump_many({
+            'batch_cache_read_py_calls': 1,
+            'batch_cache_read_py_paths': _path_count,
+            'batch_cache_read_py_total_ms': _py_ms,
+        })
+    except Exception:
+        pass
+    return output
 
 
 def _batch_read_cache_files_python(paths: list) -> dict:
@@ -752,16 +796,17 @@ def _build_dds_native(cache_dir: str, tile_row: int, tile_col: int,
         return None
     
     try:
-        result = native.build_tile_native_detailed(
-            cache_dir=cache_dir,
-            row=tile_row,
-            col=tile_col,
-            maptype=maptype,
-            zoom=zoom,
-            chunks_per_side=chunks_per_side,
-            format=dxt_format,
-            missing_color=missing_color
-        )
+        with _native_path_count('live_native_detailed'):
+            result = native.build_tile_native_detailed(
+                cache_dir=cache_dir,
+                row=tile_row,
+                col=tile_col,
+                maptype=maptype,
+                zoom=zoom,
+                chunks_per_side=chunks_per_side,
+                format=dxt_format,
+                missing_color=missing_color
+            )
         
         if result.success:
             active, total_threads = _native_thread_load()
@@ -862,6 +907,15 @@ _native_path_inflight = {
     'bg_native_to_buffer': 0,           # BackgroundDDSBuilder native_buffered
     'live_hybrid_to_buffer': 0,         # _build_dds_hybrid (live)
     'live_aopipeline': 0,               # _try_aopipeline_build (live)
+    # Additional native call sites added 2026-05-17 to cover the remaining
+    # paths that acquire decode-pool buffers.  At idle 2288 pool buffers
+    # (572 MB) were held with all wrapped counters at zero — meaning one of
+    # these unwrapped paths is the holder.
+    'live_native_detailed': 0,          # _build_dds_native via build_tile_native_detailed
+    'mipmap_all_native': 0,             # _try_native_mipmap_build / build_all_mipmaps_native
+    'mipmap_chain': 0,                  # _try_native_mipmap_build / build_mipmap_chain
+    'mipmap_single': 0,                 # _try_native_mipmap_build / build_single_mipmap
+    'mipmap_partial': 0,                # _try_native_partial_mipmap_build / build_partial_mipmap
     # Builder lifetime — incremented after acquire, decremented before release.
     # Decode-pool chunk buffers persist in builder->chunks[] until release()
     # calls aodds_builder_reset.  If these counters are much higher than the
@@ -869,6 +923,15 @@ _native_path_inflight = {
     # pre-release window — explaining decode pool saturation despite K=2 sem.
     'streaming_builder_held_bg': 0,     # BackgroundDDSBuilder acquire→release
     'streaming_builder_held_live': 0,   # Tile._try_streaming_aopipeline_build acquire→release
+    # Semaphore wait — incremented before _finalize_to_file_sem.acquire(),
+    # decremented after.  Added 2026-05-17 to identify the case where live
+    # X-Plane tile reads are queueing behind background prefetch builds for
+    # the shared K=2 sem.  If finalize_sem_wait_live > 0 while
+    # finalize_sem_wait_bg also > 0, BG is starving live.  This was the root
+    # cause of the 18:04 FUSE freeze (live reads waiting 13s for sem slots
+    # taken by prefetch builds).
+    'finalize_sem_wait_bg': 0,          # BackgroundDDSBuilder before sem.acquire
+    'finalize_sem_wait_live': 0,        # Tile._try_streaming_aopipeline_build before sem.acquire
 }
 _native_path_lock = threading.Lock()
 
@@ -4348,11 +4411,25 @@ class BackgroundDDSBuilder:
                 with _native_build_context() as threads:
                     # Semaphore bounds peak parallel-decode demand at finalize.
                     # See _finalize_to_file_sem definition for rationale.
-                    with _finalize_to_file_sem:
-                        with _native_path_count('streaming_finalize_to_file'):
-                            success, bytes_written = builder.finalize_to_file(
-                                staging_path, max_threads=threads
-                            )
+                    # Track sem wait so we can see when BG starves live reads.
+                    with _native_path_lock:
+                        _native_path_inflight['finalize_sem_wait_bg'] += 1
+                    try:
+                        with _finalize_to_file_sem:
+                            with _native_path_lock:
+                                _native_path_inflight['finalize_sem_wait_bg'] = max(
+                                    0, _native_path_inflight['finalize_sem_wait_bg'] - 1)
+                            with _native_path_count('streaming_finalize_to_file'):
+                                success, bytes_written = builder.finalize_to_file(
+                                    staging_path, max_threads=threads
+                                )
+                    except BaseException:
+                        # Decrement here too in case sem.acquire raised before
+                        # we got past it; otherwise counter would leak.
+                        with _native_path_lock:
+                            if _native_path_inflight['finalize_sem_wait_bg'] > 0:
+                                _native_path_inflight['finalize_sem_wait_bg'] -= 1
+                        raise
 
                 if success and bytes_written >= 128:
                     self._set_build_stage(tile_id, "store_from_file")
@@ -5661,13 +5738,23 @@ class Chunk(object):
         return f"Chunk({self.col},{self.row},{self.maptype},{self.zoom},{self.priority})"
 
     def get_cache(self):
-        if os.path.isfile(self.cache_path):
+        # Phase timing — added 2026-05-17 to verify the hypothesis (formed
+        # from reading the code) that 4 syscalls per cached chunk × 256
+        # chunks × 6 processes is the source of the ~350ms gap between
+        # phase_native_partial (379ms) and partial_py_total (29ms).
+        # Accumulates per-phase totals so STATS can show where time goes.
+        _t0_isfile = time.monotonic()
+        _exists = os.path.isfile(self.cache_path)
+        _isfile_ms = int((time.monotonic() - _t0_isfile) * 1000)
+
+        if _exists:
             bump('chunk_hit')
             cache_file = Path(self.cache_path)
             # Get data
             data = None
             # On Windows, the cache file can be briefly locked by AV or a concurrent writer.
             # Add a short retry/backoff loop to avoid spurious PermissionError / sharing violations.
+            _t0_read = time.monotonic()
             max_attempts = 5
             for attempt in range(1, max_attempts + 1):
                 try:
@@ -5689,13 +5776,26 @@ class Chunk(object):
                         continue
                     log.debug(f"OSError reading cache {self}: {e}")
                     return False
+            _read_ms = int((time.monotonic() - _t0_read) * 1000)
 
             # Update mtime for LRU.  Path.touch() calls os.utime() internally
             # when the file exists — the previous explicit os.utime() right
             # after was a redundant duplicate syscall (2026-05-17 cleanup).
+            _t0_touch = time.monotonic()
             try:
                 cache_file.touch()
             except (FileNotFoundError, PermissionError):
+                pass
+            _touch_ms = int((time.monotonic() - _t0_touch) * 1000)
+
+            try:
+                bump_many({
+                    'chunk_cache_get_count': 1,
+                    'chunk_cache_isfile_ms': _isfile_ms,
+                    'chunk_cache_read_ms': _read_ms,
+                    'chunk_cache_touch_ms': _touch_ms,
+                })
+            except Exception:
                 pass
 
             if _is_jpeg(data[:3]):
@@ -5707,6 +5807,13 @@ class Chunk(object):
                 self.data = b''
                 return False  # FIXED: Explicitly return False for corrupted cache
         else:
+            try:
+                bump_many({
+                    'chunk_cache_miss_isfile_ms': _isfile_ms,
+                    'chunk_cache_miss_count': 1,
+                })
+            except Exception:
+                pass
             bump('chunk_miss')
             return False
 
@@ -7165,9 +7272,20 @@ class Tile(object):
                     # with the LIVE semaphore so live X-Plane reads never
                     # queue behind background prefetch builds.  Separate K=2
                     # budget from BG's _finalize_to_file_sem.
-                    with _finalize_to_buffer_sem:
-                        with _native_path_count('streaming_finalize_to_buffer'):
-                            result = builder.finalize(buffer, max_threads=threads)
+                    with _native_path_lock:
+                        _native_path_inflight['finalize_sem_wait_live'] += 1
+                    try:
+                        with _finalize_to_buffer_sem:
+                            with _native_path_lock:
+                                _native_path_inflight['finalize_sem_wait_live'] = max(
+                                    0, _native_path_inflight['finalize_sem_wait_live'] - 1)
+                            with _native_path_count('streaming_finalize_to_buffer'):
+                                result = builder.finalize(buffer, max_threads=threads)
+                    except BaseException:
+                        with _native_path_lock:
+                            if _native_path_inflight['finalize_sem_wait_live'] > 0:
+                                _native_path_inflight['finalize_sem_wait_live'] -= 1
+                        raise
                 if result.success and result.bytes_written >= 128:
                     dds_bytes = bytes(buffer[:result.bytes_written])
                     if self._populate_dds_from_prebuilt(dds_bytes):
@@ -7945,13 +8063,26 @@ class Tile(object):
         # learns about layout_zoom in a follow-up step.
         if mipmap == 0 and self.max_zoom >= self.layout_zoom:
             native_dds = _get_native_dds()
-            if (native_dds is not None and
-                hasattr(native_dds, 'build_partial_mipmap') and
-                self._try_native_partial_mipmap_build(
-                    mipmap, startrow, endrow, bytes_per_chunk_row, time_budget)):
-                # Native build succeeded - data written directly to DDS buffer
-                # (ready.set() already called inside _try_native_partial_mipmap_build)
-                return True
+            if native_dds is not None and hasattr(native_dds, 'build_partial_mipmap'):
+                # PHASE TIMING: native partial mm0 build.  Measured separately
+                # so we can compare with the Python fallback path below.
+                _t0_np = time.monotonic()
+                _np_ok = self._try_native_partial_mipmap_build(
+                    mipmap, startrow, endrow, bytes_per_chunk_row, time_budget)
+                _np_ms = int((time.monotonic() - _t0_np) * 1000)
+                try:
+                    bump_many({
+                        'phase_native_partial_ms_total': _np_ms,
+                        'phase_native_partial_count': 1,
+                    })
+                    if _np_ms > 100:
+                        bump('phase_native_partial_slow_100ms')
+                except Exception:
+                    pass
+                if _np_ok:
+                    # Native build succeeded - data written directly to DDS buffer
+                    # (ready.set() already called inside _try_native_partial_mipmap_build)
+                    return True
             bump('partial_build_python_fallback')
         elif mipmap == 0:
             bump('partial_build_python_fallback_layout_mismatch')
@@ -7960,8 +8091,24 @@ class Tile(object):
         # PYTHON FALLBACK PATH
         # ═══════════════════════════════════════════════════════════════════
         # Pass the per-request budget to get_img (each read() gets its own budget)
+        # PHASE TIMING: get_img gathers chunks (cache or download) and composes
+        # them into a single image.  Added 2026-05-17 to attribute time inside
+        # the inline mm0 build path.
+        _t0_gi = time.monotonic()
         new_im = self.get_img(mipmap, startrow, endrow,
                 maxwait=self.get_maxwait(), time_budget=time_budget)
+        _gi_ms = int((time.monotonic() - _t0_gi) * 1000)
+        try:
+            bump_many({
+                'phase_get_img_ms_total': _gi_ms,
+                'phase_get_img_count': 1,
+            })
+            if _gi_ms > 100:
+                bump('phase_get_img_slow_100ms')
+            if _gi_ms > 500:
+                bump('phase_get_img_slow_500ms')
+        except Exception:
+            pass
         if not new_im:
             log.debug("No updates, so no image generated")
             if mipmap == 0:
@@ -7990,7 +8137,24 @@ class Tile(object):
         with self._dds_write_lock:
             self.ready.clear()
             try:
+                # PHASE TIMING: gen_mipmaps does BC1/DXT compression + mipmap
+                # chain generation.  Added 2026-05-17 to attribute time inside
+                # the inline mm0 build path (verifying whether BC1 is the
+                # actual bottleneck for VERY_SLOW header reads, vs. a guess).
+                _t0_gm = time.monotonic()
                 self.dds.gen_mipmaps(new_im, mipmap, mipmap, compress_len)
+                _gm_ms = int((time.monotonic() - _t0_gm) * 1000)
+                try:
+                    bump_many({
+                        'phase_gen_mipmaps_ms_total': _gm_ms,
+                        'phase_gen_mipmaps_count': 1,
+                    })
+                    if _gm_ms > 100:
+                        bump('phase_gen_mipmaps_slow_100ms')
+                    if _gm_ms > 250:
+                        bump('phase_gen_mipmaps_slow_250ms')
+                except Exception:
+                    pass
             finally:
                 # We haven't fully retrieved so unset flag; guard against DDS being cleared
                 log.debug(f"UNSETTING RETRIEVED! {self}")
@@ -8177,6 +8341,39 @@ class Tile(object):
         _branch = 'none'
         _fetch_t0 = time.monotonic()
         _mm_retrieved_before = mipmap.retrieved
+        # Snapshot inflight at the START of the read so VERY_SLOW warnings
+        # can attribute the slowdown to whatever was holding the pool/sem at
+        # that moment.  The previous version snapshotted at log-write time
+        # (after the read completed), which always showed empty — the
+        # holders had already released by then.  2026-05-17.
+        try:
+            _inflight_at_start = _native_path_inflight_snapshot()
+        except Exception:
+            _inflight_at_start = {}
+
+        # Tile-completion-at-serve histogram (sampled on mm0 reads only — that's
+        # what matters for visible quality).  Bucketed at 25% granularity.
+        # Added 2026-05-17 to quantify how blurry X-Plane is actually seeing
+        # vs. tile_kept_incomplete which only counts close-time incomplete.
+        if mm_idx == 0:
+            try:
+                _mm_list = self.dds.mipmap_list
+                _mm_total = len(_mm_list)
+                if _mm_total > 0:
+                    _mm_done = sum(1 for mm in _mm_list if mm.retrieved)
+                    _pct = _mm_done * 100 // _mm_total
+                    if _pct >= 100:
+                        bump('tile_serve_mm0_complete')
+                    elif _pct >= 75:
+                        bump('tile_serve_mm0_75_100')
+                    elif _pct >= 50:
+                        bump('tile_serve_mm0_50_75')
+                    elif _pct >= 25:
+                        bump('tile_serve_mm0_25_50')
+                    else:
+                        bump('tile_serve_mm0_0_25')
+            except Exception:
+                pass
 
         if offset == 0:
             # If offset = 0, read the header (and possibly some mipmap data)
@@ -8238,6 +8435,50 @@ class Tile(object):
                 f"mm_retrieved_before={_mm_retrieved_before} "
                 f"fetch_ms={_fetch_ms:.1f} seek_read_ms={_seek_ms:.1f} "
                 f"offset={offset} length={length} tile={self.row}_{self.col}_{self.maptype}_{self.tilename_zoom}"
+            )
+        # WARNING-level emission for slow reads with native-path inflight
+        # snapshot to localize WHERE the time went.  Added 2026-05-17 to
+        # identify which builder paths are starving live FUSE reads (e.g.,
+        # the 18:04 freeze where avg=490ms, max=13s were live reads queued
+        # behind BG finalizes).  Captures sem-wait state AND how complete the
+        # tile was when served so we know whether X-Plane is getting blurry
+        # output or actually waiting for a full build.
+        #
+        # 2026-05-17 (second iteration): threshold lowered from 1000ms to
+        # 200ms.  CockpitDecks websocket choke happens when X-Plane's main
+        # thread blocks on a single FUSE read long enough to miss several
+        # 30Hz dataref poll cycles — 200ms is roughly the threshold where a
+        # human notices stutter and where a websocket starts dropping frames.
+        # The 1000ms threshold hid the actual problem reads (200-999ms),
+        # producing false "AO is innocent" conclusions during diagnosis.
+        if _total_ms > 200.0:
+            try:
+                _inflight_end = _native_path_inflight_snapshot()
+                _inflight_start_str = " ".join(
+                    f"{k}={v}" for k, v in _inflight_at_start.items() if v > 0
+                )
+                _inflight_end_str = " ".join(
+                    f"{k}={v}" for k, v in _inflight_end.items() if v > 0
+                )
+            except Exception:
+                _inflight_start_str = "snapshot_failed"
+                _inflight_end_str = "snapshot_failed"
+            try:
+                _mm_total = len(self.dds.mipmap_list)
+                _mm_done = sum(1 for mm in self.dds.mipmap_list if mm.retrieved)
+                _completion_pct = (_mm_done * 100 // _mm_total) if _mm_total else 0
+            except Exception:
+                _mm_done = 0
+                _mm_total = 0
+                _completion_pct = 0
+            log.warning(
+                f"READ_DDS_BYTES VERY_SLOW total_ms={_total_ms:.0f} "
+                f"branch={_branch} mm_idx={mm_idx} "
+                f"fetch_ms={_fetch_ms:.1f} seek_ms={_seek_ms:.1f} "
+                f"tile={self.row}_{self.col}_{self.maptype}_{self.tilename_zoom} "
+                f"mm_retrieved={_mm_done}/{_mm_total} ({_completion_pct}%) "
+                f"inflight_at_start=[{_inflight_start_str}] "
+                f"inflight_at_end=[{_inflight_end_str}]"
             )
         return data
 
@@ -9754,29 +9995,32 @@ class Tile(object):
                             chain_truncated = True
                 
                 with _native_build_context() as threads:
-                    result = native_dds.build_all_mipmaps_native(
-                        jpeg_datas_per_zoom,
-                        format=dxt_format,
-                        missing_color=missing_color,
-                        max_threads=threads
-                    )
+                    with _native_path_count('mipmap_all_native'):
+                        result = native_dds.build_all_mipmaps_native(
+                            jpeg_datas_per_zoom,
+                            format=dxt_format,
+                            missing_color=missing_color,
+                            max_threads=threads
+                        )
             elif hasattr(native_dds, 'build_mipmap_chain'):
                 with _native_build_context() as threads:
-                    result = native_dds.build_mipmap_chain(
-                        jpeg_datas,
-                        format=dxt_format,
-                        missing_color=missing_color,
-                        max_mipmaps=max_mipmaps,
-                        max_threads=threads
-                    )
+                    with _native_path_count('mipmap_chain'):
+                        result = native_dds.build_mipmap_chain(
+                            jpeg_datas,
+                            format=dxt_format,
+                            missing_color=missing_color,
+                            max_mipmaps=max_mipmaps,
+                            max_threads=threads
+                        )
             else:
                 with _native_build_context() as threads:
-                    result = native_dds.build_single_mipmap(
-                        jpeg_datas,
-                        format=dxt_format,
-                        missing_color=missing_color,
-                        max_threads=threads
-                    )
+                    with _native_path_count('mipmap_single'):
+                        result = native_dds.build_single_mipmap(
+                            jpeg_datas,
+                            format=dxt_format,
+                            missing_color=missing_color,
+                            max_threads=threads
+                        )
             
             if not result.success:
                 log.debug(f"_try_native_mipmap_build: Build failed for mipmap {mipmap}: {result.error}")
@@ -10073,13 +10317,14 @@ class Tile(object):
             build_start = time.monotonic()
             
             # Build partial mipmap using native code
-            result = native_dds.build_partial_mipmap(
-                jpeg_datas=jpeg_datas,
-                chunks_width=chunks_width,
-                chunks_height=chunks_height,
-                format=dxt_format,
-                missing_color=missing_color
-            )
+            with _native_path_count('mipmap_partial'):
+                result = native_dds.build_partial_mipmap(
+                    jpeg_datas=jpeg_datas,
+                    chunks_width=chunks_width,
+                    chunks_height=chunks_height,
+                    format=dxt_format,
+                    missing_color=missing_color
+                )
             
             if not result.success:
                 log.debug(f"_try_native_partial_mipmap_build: Build failed: {result.error}")
@@ -10897,9 +11142,32 @@ class TileCacher(object):
         update_decode_pool_stats()
         # Publish native-build-path inflight counts so we can correlate
         # decode_pool_overflow_mb saturation with which paths are active.
+        # Suffix the stat key with the publishing process's PID so each of
+        # the 6 region workers writes to its own key — without this, the
+        # shared stat store is last-writer-wins and we lose data from 5/6
+        # processes (the symptom we hit on 2026-05-17 where build_stuck
+        # warnings always showed K=2 but the true multi-process state was
+        # opaque).
+        _pid = os.getpid()
         try:
             for _tag, _count in _native_path_inflight_snapshot().items():
-                set_stat(f"native_inflight:{_tag}", _count)
+                set_stat(f"native_inflight:{_tag}:{_pid}", _count)
+            # Publish FUSE handler thread state — peak active reads since
+            # last publish.  Lazy import to avoid circular dependency at
+            # module load (autoortho_fuse imports getortho).  If macFUSE
+            # pool is saturated, this number climbs and proves it.  Added
+            # 2026-05-17 to verify (not guess) whether FUSE pool is the
+            # websocket-choke bottleneck.
+            try:
+                try:
+                    from autoortho import autoortho_fuse as _aofuse
+                except ImportError:
+                    import autoortho_fuse as _aofuse
+                _cur, _peak = _aofuse.get_fuse_active_reads()
+                set_stat(f"fuse_active_reads:{_pid}", _cur)
+                set_stat(f"fuse_active_reads_peak:{_pid}", _peak)
+            except Exception:
+                pass
         except Exception:
             pass
         # Publish activity stats for proportional eviction (macOS multi-process only)
@@ -11312,15 +11580,17 @@ class TileCacher(object):
             # 50 lock acquisitions per second contending with FUSE reads,
             # delaying X-Plane main thread enough to choke CockpitDecks
             # websocket (observed 18:46 with futile_streak hitting 57).
-            # Step backoff starting at streak=3 (when the existing warning
-            # already fires).  Per-process backoff alone isn't enough — with
-            # 6 region workers each independently running eviction, even
-            # one process backed off 12s, the others keep firing.  Pushing
-            # aggressively from streak=3 means every futile process gets
-            # out of the way fast.  Trade-off: actual memory recovery is
-            # delayed by up to 30s, but eviction was already failing to
-            # recover memory on macOS anyway.
+            #
+            # 2026-05-17 (second iteration): aggressive backoff starting at
+            # streak=3 (when the existing warning fires).  Per-process backoff
+            # alone isn't enough — with 6 region workers each independently
+            # running eviction, even with one process backed off 12s, the
+            # others keep firing.  Pushing aggressively from streak=3 means
+            # every futile process gets out of the way fast.  Trade-off:
+            # actual memory recovery is delayed by up to 30s, but eviction
+            # was already failing to recover memory on macOS anyway.
             if self._futile_eviction_streak >= 3:
+                # Step backoff: stay aggressively slow as streak grows.
                 # streak  3 → 10s
                 # streak  5 → 15s
                 # streak 10 → 25s
@@ -11336,11 +11606,16 @@ class TileCacher(object):
         _lock_t0 = time.monotonic()
         with self.tc_lock:
             _wait_ms = (time.monotonic() - _lock_t0) * 1000.0
-            # Diagnostic-only lock-contention marker.  Bumped to DEBUG with
-            # a higher threshold (100ms) so genuine pathological contention
-            # still hits the log without flooding it on normal scenery load.
-            if _wait_ms > 100.0:
-                log.debug(
+            # Lock-contention marker.  Was DEBUG @ 100ms — promoted to WARNING
+            # @ 50ms 2026-05-17 to verify the eviction-vs-FUSE-reads-on-tc_lock
+            # hypothesis with real data.  This is a per-process lock (each AO
+            # worker has its own), so any contention here is within one
+            # process — eviction thread vs FUSE handler thread of the same
+            # worker.  If this fires often during websocket-choke periods,
+            # the hypothesis is verified; if it stays silent, the bottleneck
+            # is elsewhere.
+            if _wait_ms > 50.0:
+                log.warning(
                     f"tc_lock_wait op=_get_tile wait_ms={_wait_ms:.1f} "
                     f"tid={threading.get_ident()} idx={idx}"
                 )

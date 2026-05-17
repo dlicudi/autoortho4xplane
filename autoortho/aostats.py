@@ -340,9 +340,55 @@ def update_decode_pool_stats():
             overflow_mb = stats['overflow_bytes'] // (1024 * 1024)
             set_stat('decode_pool_overflow', stats['overflow_count'])
             set_stat('decode_pool_overflow_mb', overflow_mb)
+            # Per-PID waiters key so 6 workers don't last-writer-win.  Non-zero
+            # waiters indicate threads blocked on AOCOND_WAIT for a pool buffer
+            # — the smoking gun for stuck-finalize attribution.
+            try:
+                import os as _os
+                set_stat(f"decode_pool_waiters:{_os.getpid()}", stats.get('waiters', 0))
+            except Exception:
+                pass
             if stats['overflow_count'] > 0:
                 log.debug(f"Decode pool overflow: {stats['overflow_count']} "
-                          f"buffers, {overflow_mb} MB")
+                          f"buffers, {overflow_mb} MB, "
+                          f"waiters={stats.get('waiters', 0)}")
+
+        # Per-PID C-side phase stats for aodds_build_partial_mipmap.  Added
+        # 2026-05-17 to attribute the 200-400ms cost to JPEG decode / 64MB
+        # malloc / compose / BC1 compress / free.  Each PID writes to its
+        # own keys; older dylibs without the symbol degrade gracefully.
+        try:
+            import os as _os
+            phase = AoDDS.get_partial_phase_stats()
+            if phase and phase.get('count', 0) > 0:
+                _pid = _os.getpid()
+                set_stat(f"native_partial_count:{_pid}", phase['count'])
+                set_stat(f"native_partial_total_ms:{_pid}", phase['total_ms'])
+                set_stat(f"native_partial_decode_ms:{_pid}", phase['decode_ms'])
+                set_stat(f"native_partial_malloc_ms:{_pid}", phase['malloc_ms'])
+                set_stat(f"native_partial_compose_ms:{_pid}", phase['compose_ms'])
+                set_stat(f"native_partial_compress_ms:{_pid}", phase['compress_ms'])
+                set_stat(f"native_partial_free_ms:{_pid}", phase['free_ms'])
+        except Exception:
+            pass
+
+        # Per-PID Python-side phase stats for build_partial_mipmap wrapper.
+        # Counterpart to native_partial_* — together attribute the full
+        # end-to-end cost.  Python wrapper breakdown: marshal / alloc /
+        # native / convert.  Added 2026-05-17.
+        try:
+            import os as _os
+            py_phase = AoDDS.get_partial_python_phase_stats()
+            if py_phase and py_phase.get('count', 0) > 0:
+                _pid = _os.getpid()
+                set_stat(f"partial_py_count:{_pid}", py_phase['count'])
+                set_stat(f"partial_py_total_ms:{_pid}", py_phase['total_ms'])
+                set_stat(f"partial_py_marshal_ms:{_pid}", py_phase['marshal_ms'])
+                set_stat(f"partial_py_alloc_ms:{_pid}", py_phase['alloc_ms'])
+                set_stat(f"partial_py_native_ms:{_pid}", py_phase['native_ms'])
+                set_stat(f"partial_py_convert_ms:{_pid}", py_phase['convert_ms'])
+        except Exception:
+            pass
     except Exception as e:
         # Best-effort; ignore failures
         log.debug(f"update_decode_pool_stats: {e}")

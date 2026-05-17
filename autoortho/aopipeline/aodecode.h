@@ -184,6 +184,13 @@ AODECODE_API void aodecode_pool_stats_ex(
 );
 
 /**
+ * Return the number of threads currently blocked waiting for a pool buffer.
+ * Non-zero values indicate active starvation — combined with overflow at
+ * memory_limit, this localises stuck-finalize patterns to pool contention.
+ */
+AODECODE_API int32_t aodecode_pool_waiters(aodecode_pool_t* pool);
+
+/**
  * Decode multiple JPEGs in parallel.
  * 
  * This is the main batch decode function. It decodes all input JPEGs

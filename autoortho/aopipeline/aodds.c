@@ -551,9 +551,56 @@ AODDS_API int32_t aodds_using_fallback_compressor(void) {
     return (!ispc_available || force_fallback) ? 1 : 0;
 }
 
+/* aodds_get_partial_phase_stats is defined after the static globals it
+ * reads; see further down in this file (search for "Phase-timing
+ * accumulators"). */
+
 /*============================================================================
  * Timing Utilities
  *============================================================================*/
+
+/* Phase-timing accumulators for aodds_build_partial_mipmap.
+ *
+ * Added 2026-05-17 to attribute the 200-400ms cost observed in the
+ * `phase_native_partial` Python counter — the dominant slow path for
+ * inline mm0 header reads.  Each phase is timed inside the function and
+ * summed under g_partial_stats_mutex.  Python publishes via
+ * aodds_get_partial_phase_stats().
+ *
+ * NOT thread-coordinated with respect to other build paths — these are
+ * shared globals across all callers in this process.
+ */
+static pthread_mutex_t g_partial_stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int64_t g_partial_count             = 0;
+static int64_t g_partial_total_ms          = 0;
+static int64_t g_partial_decode_ms_total   = 0;
+static int64_t g_partial_malloc_ms_total   = 0;
+static int64_t g_partial_compose_ms_total  = 0;
+static int64_t g_partial_compress_ms_total = 0;
+static int64_t g_partial_free_ms_total     = 0;
+
+/* Read accumulated phase timings for aodds_build_partial_mipmap.  Returns
+ * the count of completed calls and the running total ms spent in each phase.
+ * Called from Python aostats publisher.  Added 2026-05-17. */
+AODDS_API void aodds_get_partial_phase_stats(
+    int64_t* out_count,
+    int64_t* out_total_ms,
+    int64_t* out_decode_ms,
+    int64_t* out_malloc_ms,
+    int64_t* out_compose_ms,
+    int64_t* out_compress_ms,
+    int64_t* out_free_ms
+) {
+    pthread_mutex_lock(&g_partial_stats_mutex);
+    if (out_count)        *out_count        = g_partial_count;
+    if (out_total_ms)     *out_total_ms     = g_partial_total_ms;
+    if (out_decode_ms)    *out_decode_ms    = g_partial_decode_ms_total;
+    if (out_malloc_ms)    *out_malloc_ms    = g_partial_malloc_ms_total;
+    if (out_compose_ms)   *out_compose_ms   = g_partial_compose_ms_total;
+    if (out_compress_ms)  *out_compress_ms  = g_partial_compress_ms_total;
+    if (out_free_ms)      *out_free_ms      = g_partial_free_ms_total;
+    pthread_mutex_unlock(&g_partial_stats_mutex);
+}
 
 static double get_time_ms(void) {
 #ifdef AOPIPELINE_WINDOWS
@@ -2178,21 +2225,30 @@ AODDS_API int32_t aodds_build_partial_mipmap(
     uint32_t* bytes_written,
     aodecode_pool_t* pool
 ) {
-    if (!jpeg_data || !jpeg_sizes || !output || !bytes_written || 
+    if (!jpeg_data || !jpeg_sizes || !output || !bytes_written ||
         chunks_width <= 0 || chunks_height <= 0) {
         return 0;
     }
-    
+
+    /* Phase timing — 2026-05-17.  Attributes the 200-400ms cost of this
+     * function to specific sub-phases so we can verify whether the
+     * bottleneck is JPEG decode, malloc(64MB), compose, ISPC BC1, or free.
+     * Accumulated into g_partial_*_ms_total globals; read by Python via
+     * aodds_get_partial_phase_stats().
+     */
+    double phase_t_func_start = get_time_ms();
+    double phase_t0;
+
     int32_t chunk_count = chunks_width * chunks_height;
     int32_t image_width = chunks_width * CHUNK_SIZE;
     int32_t image_height = chunks_height * CHUNK_SIZE;
-    
+
     /* Calculate required output size */
     uint32_t required = aodds_calc_mipmap_size(image_width, image_height, format);
     if (output_size < required) {
         return 0;
     }
-    
+
     /* Allocate chunk image array */
     aodecode_image_t* chunks = (aodecode_image_t*)calloc(
         chunk_count, sizeof(aodecode_image_t)
@@ -2200,9 +2256,10 @@ AODDS_API int32_t aodds_build_partial_mipmap(
     if (!chunks) {
         return 0;
     }
-    
+
     /* Parallel decode all JPEGs - using thread-safe pooled decoders */
     int32_t decoded = 0;
+    phase_t0 = get_time_ms();
     
 #if AOPIPELINE_HAS_OPENMP
     #pragma omp parallel reduction(+:decoded)
@@ -2324,14 +2381,17 @@ AODDS_API int32_t aodds_build_partial_mipmap(
     }
 #endif
     
+    int64_t phase_decode_ms = (int64_t)(get_time_ms() - phase_t0);
+
     /* Allocate tile image for rectangular dimensions */
+    phase_t0 = get_time_ms();
     aodecode_image_t tile = {0};
     tile.width = image_width;
     tile.height = image_height;
     tile.stride = image_width * 4;
     tile.channels = 4;
     tile.data = (uint8_t*)malloc(image_width * image_height * 4);
-    
+
     if (!tile.data) {
         for (int32_t i = 0; i < chunk_count; i++) {
             aodecode_free_image(&chunks[i], pool);
@@ -2339,23 +2399,45 @@ AODDS_API int32_t aodds_build_partial_mipmap(
         free(chunks);
         return 0;
     }
-    
+    int64_t phase_malloc_ms = (int64_t)(get_time_ms() - phase_t0);
+
     /* Fill and compose using rectangular function */
+    phase_t0 = get_time_ms();
     aodds_fill_and_compose_rect(chunks, chunks_width, chunks_height, &tile,
                                 missing_r, missing_g, missing_b);
-    
+    int64_t phase_compose_ms = (int64_t)(get_time_ms() - phase_t0);
+
     /* Free chunk images */
+    phase_t0 = get_time_ms();
     for (int32_t i = 0; i < chunk_count; i++) {
         aodecode_free_image(&chunks[i], pool);
     }
     free(chunks);
-    
+    int64_t phase_free_chunks_ms = (int64_t)(get_time_ms() - phase_t0);
+
     /* Compress tile image directly to output (no mipmap chain, no header) */
+    phase_t0 = get_time_ms();
     uint32_t compressed = aodds_compress(&tile, format, output);
-    
+    int64_t phase_compress_ms = (int64_t)(get_time_ms() - phase_t0);
+
     /* Cleanup */
+    phase_t0 = get_time_ms();
     free(tile.data);
-    
+    int64_t phase_free_tile_ms = (int64_t)(get_time_ms() - phase_t0);
+
+    int64_t phase_total_ms = (int64_t)(get_time_ms() - phase_t_func_start);
+
+    /* Accumulate into globals so Python can publish */
+    pthread_mutex_lock(&g_partial_stats_mutex);
+    g_partial_count             += 1;
+    g_partial_total_ms          += phase_total_ms;
+    g_partial_decode_ms_total   += phase_decode_ms;
+    g_partial_malloc_ms_total   += phase_malloc_ms;
+    g_partial_compose_ms_total  += phase_compose_ms;
+    g_partial_compress_ms_total += phase_compress_ms;
+    g_partial_free_ms_total     += (phase_free_chunks_ms + phase_free_tile_ms);
+    pthread_mutex_unlock(&g_partial_stats_mutex);
+
     *bytes_written = compressed;
     return (compressed > 0) ? 1 : 0;
 }

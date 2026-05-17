@@ -22,7 +22,7 @@ Usage:
 
 from ctypes import (
     CDLL, POINTER, Structure, c_void_p,
-    c_char, c_char_p, c_int32, c_uint8, c_uint32, c_double, c_size_t,
+    c_char, c_char_p, c_int32, c_int64, c_uint8, c_uint32, c_double, c_size_t,
     byref, cast
 )
 import logging
@@ -1145,7 +1145,7 @@ def get_default_decode_pool() -> Optional[AoDecode.BufferPool]:
 def get_decode_pool_stats() -> Optional[dict]:
     """
     Get statistics from the global decode pool.
-    
+
     Returns:
         Dict with pool stats, or None if pool not initialized
     """
@@ -1153,6 +1153,45 @@ def get_decode_pool_stats() -> Optional[dict]:
     if pool:
         return pool.stats_ex()
     return None
+
+
+def get_partial_phase_stats() -> Optional[dict]:
+    """Read C-side phase-timing accumulators for aodds_build_partial_mipmap.
+
+    Attributes time spent in JPEG decode / 64MB malloc / compose / BC1
+    compress / free.  Returns None if the native binding isn't available
+    (older dylib without the symbol).  Added 2026-05-17 to verify which
+    phase of build_partial_mipmap is the actual bottleneck.
+    """
+    lib = _load_library()
+    if lib is None:
+        return None
+    if not hasattr(lib, 'aodds_get_partial_phase_stats'):
+        return None
+    try:
+        count        = c_int64(0)
+        total_ms     = c_int64(0)
+        decode_ms    = c_int64(0)
+        malloc_ms    = c_int64(0)
+        compose_ms   = c_int64(0)
+        compress_ms  = c_int64(0)
+        free_ms      = c_int64(0)
+        lib.aodds_get_partial_phase_stats(
+            byref(count), byref(total_ms),
+            byref(decode_ms), byref(malloc_ms),
+            byref(compose_ms), byref(compress_ms), byref(free_ms),
+        )
+        return {
+            'count': count.value,
+            'total_ms': total_ms.value,
+            'decode_ms': decode_ms.value,
+            'malloc_ms': malloc_ms.value,
+            'compose_ms': compose_ms.value,
+            'compress_ms': compress_ms.value,
+            'free_ms': free_ms.value,
+        }
+    except (AttributeError, OSError):
+        return None
 
 
 def shutdown_decode_pool():
@@ -1473,6 +1512,19 @@ def _setup_signatures(lib):
     # aodds_using_fallback_compressor - check if using lower-quality fallback
     lib.aodds_using_fallback_compressor.argtypes = []
     lib.aodds_using_fallback_compressor.restype = c_int32
+
+    # aodds_get_partial_phase_stats - phase timing for build_partial_mipmap.
+    # Optional binding; older dylibs without the symbol still load (degrades
+    # to "feature absent" rather than crashing on import).  Added 2026-05-17.
+    try:
+        lib.aodds_get_partial_phase_stats.argtypes = [
+            POINTER(c_int64), POINTER(c_int64), POINTER(c_int64),
+            POINTER(c_int64), POINTER(c_int64), POINTER(c_int64),
+            POINTER(c_int64),
+        ]
+        lib.aodds_get_partial_phase_stats.restype = None
+    except AttributeError:
+        pass
     
     # aodds_version
     lib.aodds_version.argtypes = []
@@ -2540,6 +2592,40 @@ class PartialMipmapResult(NamedTuple):
     error: str = ''
 
 
+# Python-side phase-timing accumulators for build_partial_mipmap.
+# Added 2026-05-17 — C-side timing showed only ~17ms per call but the Python
+# wrapper shows ~229ms.  The extra ~212ms is somewhere in this wrapper:
+# ctypes marshalling of 256 JPEG pointers, np.zeros output allocation, or
+# the result-to-bytes copy.  These accumulators attribute time to each phase.
+_partial_py_phase_lock = threading.Lock()
+_partial_py_count                = 0
+_partial_py_total_ms             = 0
+_partial_py_marshal_ms_total     = 0   # JPEG ptr/size array setup
+_partial_py_alloc_ms_total       = 0   # np.zeros output buffer
+_partial_py_native_ms_total      = 0   # the actual lib.aodds_build_partial_mipmap call
+_partial_py_convert_ms_total     = 0   # bytes(output_buffer[:n]) copy
+
+
+def get_partial_python_phase_stats() -> Optional[dict]:
+    """Read Python-side phase accumulators for build_partial_mipmap.
+
+    Counterpart to the C-side `get_partial_phase_stats()` — together they
+    attribute the full per-call cost end-to-end (Python ctypes overhead
+    plus C work).  Added 2026-05-17.
+    """
+    with _partial_py_phase_lock:
+        if _partial_py_count == 0:
+            return None
+        return {
+            'count': _partial_py_count,
+            'total_ms': _partial_py_total_ms,
+            'marshal_ms': _partial_py_marshal_ms_total,
+            'alloc_ms': _partial_py_alloc_ms_total,
+            'native_ms': _partial_py_native_ms_total,
+            'convert_ms': _partial_py_convert_ms_total,
+        }
+
+
 def build_partial_mipmap(
     jpeg_datas: List[Optional[bytes]],
     chunks_width: int,
@@ -2589,7 +2675,7 @@ def build_partial_mipmap(
         )
     
     start_time = time.monotonic()
-    
+
     chunk_count = chunks_width * chunks_height
     if len(jpeg_datas) != chunk_count:
         return PartialMipmapResult(
@@ -2597,24 +2683,25 @@ def build_partial_mipmap(
             pixel_width=0, pixel_height=0, elapsed_ms=0.0,
             error=f"Expected {chunk_count} chunks ({chunks_width}×{chunks_height}), got {len(jpeg_datas)}"
         )
-    
+
     # Calculate output dimensions
     pixel_width = chunks_width * 256
     pixel_height = chunks_height * 256
-    
+
     # Calculate output size based on format
     fmt = FORMAT_BC1 if format.upper() in ("BC1", "DXT1") else FORMAT_BC3
     blocksize = 8 if format == "BC1" else 16
     blocks_x = pixel_width // 4
     blocks_y = pixel_height // 4
     output_size = blocks_x * blocks_y * blocksize
-    
-    # Prepare JPEG data arrays
-    # Keep references to prevent garbage collection
+
+    # PHASE: marshal — build ctypes arrays for 256 JPEG pointers + sizes.
+    # ctypes cast() + c_char_p() per chunk has measurable per-call cost.
+    _t0_marshal = time.monotonic()
     jpeg_refs = []
     jpeg_ptrs = (c_void_p * chunk_count)()
     jpeg_sizes = (c_uint32 * chunk_count)()
-    
+
     for i, data in enumerate(jpeg_datas):
         if data:
             jpeg_refs.append(data)
@@ -2623,10 +2710,14 @@ def build_partial_mipmap(
         else:
             jpeg_ptrs[i] = None
             jpeg_sizes[i] = 0
-    
-    # Allocate output buffer using numpy for efficiency
+    _marshal_ms = int((time.monotonic() - _t0_marshal) * 1000)
+
+    # PHASE: alloc — np.zeros for the output buffer.  ~8 MB for BC1 of a
+    # 4096×4096 tile; zeroed memory means OS must commit pages.
+    _t0_alloc = time.monotonic()
     output_buffer = np.zeros(output_size, dtype=np.uint8)
     bytes_written = c_uint32(0)
+    _alloc_ms = int((time.monotonic() - _t0_alloc) * 1000)
     
     # Get pool handle if provided
     pool_handle = pool if pool else None
@@ -2648,7 +2739,9 @@ def build_partial_mipmap(
         lib.aodds_build_partial_mipmap.restype = c_int32
         lib._partial_mipmap_setup_done = True
     
-    # Call native function
+    # PHASE: native — the actual C call.  C-side phase stats break this
+    # down further (decode/malloc/compose/compress/free).
+    _t0_native = time.monotonic()
     success = lib.aodds_build_partial_mipmap(
         jpeg_ptrs,
         jpeg_sizes,
@@ -2663,11 +2756,35 @@ def build_partial_mipmap(
         byref(bytes_written),
         pool_handle
     )
-    
-    elapsed_ms = (time.monotonic() - start_time) * 1000
-    
+    _native_ms = int((time.monotonic() - _t0_native) * 1000)
+
+    # PHASE: convert — copy output numpy array slice to immutable Python bytes.
+    # For a 4K BC1 tile this is ~8 MB; for partial rows it's smaller.
+    _t0_convert = time.monotonic()
     if success and bytes_written.value > 0:
         result_data = bytes(output_buffer[:bytes_written.value])
+    else:
+        result_data = None
+    _convert_ms = int((time.monotonic() - _t0_convert) * 1000)
+
+    elapsed_ms = (time.monotonic() - start_time) * 1000
+
+    # Accumulate per-phase totals so aostats can attribute the Python
+    # wrapper cost on top of C-side phase stats.
+    global _partial_py_count, _partial_py_total_ms, _partial_py_marshal_ms_total
+    global _partial_py_alloc_ms_total, _partial_py_native_ms_total, _partial_py_convert_ms_total
+    try:
+        with _partial_py_phase_lock:
+            _partial_py_count += 1
+            _partial_py_total_ms += int(elapsed_ms)
+            _partial_py_marshal_ms_total += _marshal_ms
+            _partial_py_alloc_ms_total += _alloc_ms
+            _partial_py_native_ms_total += _native_ms
+            _partial_py_convert_ms_total += _convert_ms
+    except Exception:
+        pass
+
+    if success and bytes_written.value > 0:
         return PartialMipmapResult(
             success=True,
             bytes_written=bytes_written.value,

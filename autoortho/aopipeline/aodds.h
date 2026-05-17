@@ -616,6 +616,26 @@ AODDS_API int32_t aodds_get_use_ispc(void);
 AODDS_API int32_t aodds_using_fallback_compressor(void);
 
 /**
+ * Read accumulated phase-timing stats from aodds_build_partial_mipmap.
+ *
+ * Attributes the per-call time to specific sub-phases (decode/malloc/
+ * compose/compress/free).  Output pointers may be NULL.  All times are
+ * cumulative since process start.
+ *
+ * Added 2026-05-17 to verify whether the 200-400ms per-call cost is
+ * dominated by JPEG decode, 64 MB malloc, compose, BC1 compress, or free.
+ */
+AODDS_API void aodds_get_partial_phase_stats(
+    int64_t* out_count,
+    int64_t* out_total_ms,
+    int64_t* out_decode_ms,
+    int64_t* out_malloc_ms,
+    int64_t* out_compose_ms,
+    int64_t* out_compress_ms,
+    int64_t* out_free_ms
+);
+
+/**
  * Get version information for the aodds module.
  * 
  * @return Static string with version info (do not free)

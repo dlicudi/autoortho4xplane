@@ -92,6 +92,47 @@ _cached_bc1_block = None
 # DDS header size is always 128 bytes
 _DDS_HEADER_SIZE = 128
 
+# FUSE handler thread state tracking — added 2026-05-17 to verify whether
+# the macFUSE handler thread pool is saturated during websocket-choke events.
+# Each FUSE read() call increments _fuse_active_reads on entry and decrements
+# on exit.  If this number climbs to ~10+ while VERY_SLOW reads are firing,
+# FUSE pool is the bottleneck — incoming X-Plane reads have to wait for a
+# handler thread before AO even sees them.  If it stays low (<5), macFUSE
+# pool isn't the issue.  Provides verification data instead of guessing.
+#
+# Peak tracker: tracks max concurrent reads seen since last publish, so
+# brief saturation spikes don't get missed by 10s stats sampling.
+_fuse_active_reads = 0
+_fuse_active_reads_peak = 0
+_fuse_active_reads_lock = threading.Lock()
+
+
+def _fuse_read_enter():
+    """Increment active FUSE read counter on handler entry."""
+    global _fuse_active_reads, _fuse_active_reads_peak
+    with _fuse_active_reads_lock:
+        _fuse_active_reads += 1
+        if _fuse_active_reads > _fuse_active_reads_peak:
+            _fuse_active_reads_peak = _fuse_active_reads
+
+
+def _fuse_read_exit():
+    """Decrement active FUSE read counter on handler exit."""
+    global _fuse_active_reads
+    with _fuse_active_reads_lock:
+        if _fuse_active_reads > 0:
+            _fuse_active_reads -= 1
+
+
+def get_fuse_active_reads() -> tuple:
+    """Return (current_active, peak_since_reset) — and reset peak."""
+    global _fuse_active_reads_peak
+    with _fuse_active_reads_lock:
+        cur = _fuse_active_reads
+        peak = _fuse_active_reads_peak
+        _fuse_active_reads_peak = cur  # reset peak to current
+        return (cur, peak)
+
 def _generate_fallback_dds_bytes(offset: int, length: int) -> bytes:
     """
     Generate fallback DDS bytes for when tile generation fails.
@@ -1233,6 +1274,9 @@ class AutoOrtho(Operations):
         _read_classification = 'unknown'
         _tile_lock_wait_ms = 0.0
         _tile_get_ms = 0.0
+        # Track this thread's presence in the FUSE handler pool so we can
+        # detect macFUSE pool saturation (vs. just blaming AO internals).
+        _fuse_read_enter()
         try:
             log.debug(f"READ: {path} {offset} {length} {fh}")
             # Disk-passthrough DDS fds fall through to the regular passthrough below
@@ -1330,6 +1374,8 @@ class AutoOrtho(Operations):
                 except OSError as e:
                     raise FuseOSError(e.errno)
         finally:
+            # Always decrement the FUSE active-read counter, even on exception
+            _fuse_read_exit()
             _elapsed_ms = (time.monotonic() - _read_t0) * 1000.0
             # Per-event slow markers are diagnostic.  Logged at DEBUG;
             # FUSE_PERF_SUMMARY (60s aggregate) is the WARN-level signal.

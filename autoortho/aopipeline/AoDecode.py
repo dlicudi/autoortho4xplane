@@ -187,6 +187,15 @@ def _setup_signatures(lib):
         POINTER(c_int32), POINTER(c_int64), POINTER(c_int64)
     ]
     lib.aodecode_pool_stats_ex.restype = None
+
+    # Pool waiters count — number of threads blocked on AOCOND_WAIT for a buffer.
+    # Optional binding so older dylibs without this symbol still load (degrades
+    # to "feature absent" rather than crashing on import).
+    try:
+        lib.aodecode_pool_waiters.argtypes = [c_void_p]
+        lib.aodecode_pool_waiters.restype = c_int32
+    except AttributeError:
+        pass
     
     # Batch decode
     lib.aodecode_batch.argtypes = [
@@ -371,6 +380,12 @@ class BufferPool:
             self._handle, byref(total), byref(available), byref(acquired),
             byref(overflow_count), byref(overflow_bytes), byref(memory_limit)
         )
+        # Waiters count is a separate symbol — older dylibs may not expose it.
+        # Degrade gracefully so a stats publish doesn't blow up the worker.
+        try:
+            waiters = int(self._lib.aodecode_pool_waiters(self._handle))
+        except (AttributeError, OSError):
+            waiters = 0
         return {
             'total': total.value,
             'available': available.value,
@@ -378,6 +393,7 @@ class BufferPool:
             'overflow_count': overflow_count.value,
             'overflow_bytes': overflow_bytes.value,
             'memory_limit': memory_limit.value,
+            'waiters': waiters,
         }
     
     def __repr__(self) -> str:

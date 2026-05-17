@@ -344,17 +344,32 @@ AODECODE_API void aodecode_pool_stats_ex(
         if (out_memory_limit) *out_memory_limit = 0;
         return;
     }
-    
+
     AOMUTEX_LOCK(pool->lock);
-    
+
     if (out_total) *out_total = pool->count;
     if (out_available) *out_available = pool->free_top;
     if (out_acquired) *out_acquired = pool->count - pool->free_top;
     if (out_overflow_count) *out_overflow_count = pool->overflow_count;
     if (out_overflow_bytes) *out_overflow_bytes = pool->overflow_allocated;
     if (out_memory_limit) *out_memory_limit = pool->memory_limit;
-    
+
     AOMUTEX_UNLOCK(pool->lock);
+}
+
+/**
+ * Return the number of threads currently blocked on AOCOND_WAIT waiting for
+ * a buffer to be released.  Added 2026-05-17 — when this is > 0 and overflow
+ * is at memory_limit, threads are actively starved.  Combined with the
+ * Python-side native_inflight counters, this localises the "finalize stuck
+ * for 100+ seconds" pattern: stuck finalize threads should show up here.
+ */
+AODECODE_API int32_t aodecode_pool_waiters(aodecode_pool_t* pool) {
+    if (!pool) return 0;
+    AOMUTEX_LOCK(pool->lock);
+    int32_t w = pool->waiters_count;
+    AOMUTEX_UNLOCK(pool->lock);
+    return w;
 }
 
 /*============================================================================
