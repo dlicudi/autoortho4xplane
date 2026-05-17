@@ -5690,12 +5690,13 @@ class Chunk(object):
                     log.debug(f"OSError reading cache {self}: {e}")
                     return False
 
-            cache_file.touch()
-            # Update modified data
+            # Update mtime for LRU.  Path.touch() calls os.utime() internally
+            # when the file exists — the previous explicit os.utime() right
+            # after was a redundant duplicate syscall (2026-05-17 cleanup).
             try:
-                os.utime(self.cache_path, None)
+                cache_file.touch()
             except (FileNotFoundError, PermissionError):
-                pass 
+                pass
 
             if _is_jpeg(data[:3]):
                 #print(f"Found cache that is JPEG for {self}")
