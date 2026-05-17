@@ -4090,9 +4090,19 @@ AODDS_API int32_t aodds_builder_finalize(
     /* Fill and compose in a single pass */
     aodds_fill_and_compose(builder->chunks, chunks_per_side, &builder->tile_image,
                            builder->config.missing_r, builder->config.missing_g, builder->config.missing_b);
-    
+
+    /* Release decode-pool buffers held by chunks now that compose has copied
+     * pixel data into tile_image.  See aodds_builder_finalize_to_file for the
+     * rationale and diagnosis.  Buffer variant gets the same treatment so
+     * live aopipeline path benefits from the same retention reduction. */
+    for (int32_t i = 0; i < builder->chunk_count; i++) {
+        if (builder->chunks[i].data) {
+            aodecode_free_image(&builder->chunks[i], builder->pool);
+        }
+    }
+
     /* Write DDS header */
-    int32_t header_written = aodds_write_header(dds_output, tile_size, tile_size, 
+    int32_t header_written = aodds_write_header(dds_output, tile_size, tile_size,
                                                  mipmap_count, builder->config.format);
     if (header_written != DDS_HEADER_SIZE) {
         return 0;
@@ -4278,6 +4288,23 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
     aodds_fill_and_compose(builder->chunks, chunks_per_side, &builder->tile_image,
                            builder->config.missing_r, builder->config.missing_g, builder->config.missing_b);
     aodds_trace_emit("finalize POST_FILL_COMPOSE builder=%p", (void*)builder);
+
+    /* Release decode-pool buffers held by chunks now that compose has copied
+     * pixel data into tile_image.  Previously chunks stayed in builder->chunks[]
+     * until aodds_builder_reset (called from Python's builder.release() in the
+     * outer try's finally block), holding 256 buffers × 256 KB = ~64 MB per
+     * tile across the remaining finalize work + Python store_from_file +
+     * cleanup window (~250-700ms).  Diagnosed 2026-05-17 via inflight counters:
+     * streaming_builder_held_bg=4 while streaming_finalize_to_file=2, meaning
+     * 2 builders were always holding chunks they no longer needed.
+     * aodecode_free_image is null-safe and idempotent; aodds_builder_reset
+     * still does its own check before re-freeing, so no double-free risk. */
+    for (int32_t i = 0; i < builder->chunk_count; i++) {
+        if (builder->chunks[i].data) {
+            aodecode_free_image(&builder->chunks[i], builder->pool);
+        }
+    }
+    aodds_trace_emit("finalize POST_CHUNK_RELEASE builder=%p", (void*)builder);
 
     /* Create temp file path */
     char temp_path[4096];
