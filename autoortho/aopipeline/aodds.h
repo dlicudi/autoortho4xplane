@@ -133,10 +133,15 @@ AODDS_API size_t aodds_calc_dds_size(
 
 /**
  * Calculate number of mipmap levels for given dimensions.
- * 
+ *
+ * Produces the full chain down to 1×1, matching pydds.DDS.__init__.  For
+ * 4096×4096 this returns 13.  The main builder's inner downsample guards
+ * stop reducing past 4×4, so mipmap slots smaller than 4×4 hold a copy of
+ * the 4×4 BC block (byte-identical to pydds's mm11/mm12 placeholder fill).
+ *
  * @param width     Image width
  * @param height    Image height
- * 
+ *
  * @return Number of mipmap levels (minimum 1)
  */
 AODDS_API int32_t aodds_calc_mipmap_count(int32_t width, int32_t height);

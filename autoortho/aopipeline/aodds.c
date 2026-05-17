@@ -573,10 +573,13 @@ static double get_time_ms(void) {
  *============================================================================*/
 
 AODDS_API int32_t aodds_calc_mipmap_count(int32_t width, int32_t height) {
+    /* Match pydds: full chain down to 1×1.  The main builder's inner downsample
+     * guards stop reducing past 4×4, so mipmap slots beyond that hold a copy of
+     * the 4×4 BC block — byte-identical to what pydds writes for mm11/mm12. */
     int32_t count = 1;
-    while (width > 4 && height > 4) {
-        width /= 2;
-        height /= 2;
+    while (width > 1 || height > 1) {
+        width  = (width  > 1) ? width  / 2 : 1;
+        height = (height > 1) ? height / 2 : 1;
         count++;
     }
     return count;
