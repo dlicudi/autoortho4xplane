@@ -6496,6 +6496,11 @@ class Tile(object):
         self._imgs_order.append(mipmap)
 
     def _create_chunks(self, quick_zoom=0, min_zoom=None):
+        """Returns True if a batch cache read was just performed (chunks are
+        freshly created and their cache state is up to date), False if chunks
+        already existed (state may be stale relative to disk).  Callers use
+        the return to decide whether an immediate second batch is redundant.
+        """
         col, row, width, height, zoom, zoom_diff = self._get_quick_zoom(quick_zoom, min_zoom)
 
         with self._lock:
@@ -6527,8 +6532,10 @@ class Tile(object):
                                 hits += 1
                         if hits > 0:
                             log.debug(f"Native batch cache read: {hits}/{len(paths)} hits for zoom {zoom}")
+                return True
             else:
                 log.debug(f"Reusing existing {len(self.chunks[zoom])} chunks for zoom {zoom}")
+                return False
 
     def _probe_chunk_cache_ratio(self, zoom: int) -> float:
         """
@@ -6543,7 +6550,7 @@ class Tile(object):
         Returns:
             float: Ratio of available chunks (0.0 to 1.0)
         """
-        self._create_chunks(zoom)
+        fresh = self._create_chunks(zoom)
         chunks = self.chunks.get(zoom, [])
 
         if not chunks:
@@ -6560,7 +6567,12 @@ class Tile(object):
             elif not chunk.ready.is_set():
                 need_cache_read.append(chunk)
 
-        if need_cache_read:
+        # Skip the secondary batch when _create_chunks just did one — the
+        # not-ready chunks are precisely the paths that batch just missed,
+        # so re-reading them milliseconds later is guaranteed to also miss.
+        # Only run secondary batch when chunks pre-existed (some may have
+        # been deposited in cache by another tile's download path since).
+        if need_cache_read and not fresh:
             cache_paths = [c.cache_path for c in need_cache_read]
             cached_data = _batch_read_cache_files(cache_paths)
 
@@ -6570,11 +6582,6 @@ class Tile(object):
                         chunk.set_cached_data(cached_data[chunk.cache_path])
                         available_count += 1
                         bump('chunk_hit')
-            else:
-                for chunk in need_cache_read:
-                    if chunk.get_cache():
-                        if chunk.data:
-                            available_count += 1
 
         return available_count / total_chunks
 
@@ -6609,31 +6616,33 @@ class Tile(object):
             - No locks held during wait (allows concurrent operations)
         """
         # Ensure chunks exist for this zoom level
-        self._create_chunks(zoom)
+        fresh = self._create_chunks(zoom)
         chunks = self.chunks.get(zoom, [])
-        
+
         if not chunks:
             log.debug(f"_collect_chunk_jpegs: No chunks for zoom {zoom}")
             return None
-        
+
         total_chunks = len(chunks)
         jpeg_datas = [None] * total_chunks
         available_count = 0
-        
+
         # ═══════════════════════════════════════════════════════════════════════
         # PHASE 1: Collect already-ready chunks (INSTANT)
         # ═══════════════════════════════════════════════════════════════════════
         # Check chunks that are either:
         # - Already in memory (prefetched or previously downloaded)
-        # - In disk cache (use BATCH reading for ~50x faster I/O)
+        # - In disk cache (only re-batch if _create_chunks didn't just do it)
         # This phase has zero network latency.
-        
-        # First pass: collect chunks already in memory
+
+        # First pass: collect chunks already in memory and pick up batch-read
+        # hits from _create_chunks.  set_cached_data populates chunk.data, so
+        # use the same check for both cases.
         need_cache_read_indices = []
         for i, chunk in enumerate(chunks):
             # TOCTOU safety: capture reference atomically (GIL protects this)
             chunk_data = chunk.data
-            
+
             if chunk.ready.is_set() and chunk_data:
                 # Already in memory
                 jpeg_datas[i] = chunk_data
@@ -6641,13 +6650,16 @@ class Tile(object):
             elif not chunk.ready.is_set():
                 # Not ready - need to check disk cache
                 need_cache_read_indices.append(i)
-        
-        # BATCH CACHE READ: Read all missing chunks in parallel using native code
-        # This is ~50x faster than individual get_cache() calls (1 batch vs 256 syscalls)
-        if need_cache_read_indices:
+
+        # Skip the secondary batch when _create_chunks just did one — the
+        # not-ready chunks are precisely the paths that batch just missed,
+        # so re-reading them milliseconds later is guaranteed to also miss.
+        # Only run secondary batch when chunks pre-existed (some may have
+        # been deposited in cache by another tile's download path since).
+        if need_cache_read_indices and not fresh:
             cache_paths = [chunks[i].cache_path for i in need_cache_read_indices]
             cached_data = _batch_read_cache_files(cache_paths)
-            
+
             if cached_data:
                 # Apply batch-read data to chunks
                 for i in need_cache_read_indices:
@@ -6659,18 +6671,9 @@ class Tile(object):
                         jpeg_datas[i] = data
                         available_count += 1
                         bump('chunk_hit')
-                
-                log.debug(f"_collect_chunk_jpegs: Batch cache read - "
+
+                log.debug(f"_collect_chunk_jpegs: Secondary batch cache read - "
                          f"{len(cached_data)}/{len(cache_paths)} hits")
-            else:
-                # Batch read failed or unavailable - fall back to individual reads
-                for i in need_cache_read_indices:
-                    chunk = chunks[i]
-                    if chunk.get_cache():
-                        chunk_data = chunk.data
-                        if chunk_data:
-                            jpeg_datas[i] = chunk_data
-                            available_count += 1
         
         # Check if we already have enough from instant phase
         ratio = available_count / total_chunks
