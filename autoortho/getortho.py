@@ -11302,6 +11302,31 @@ class TileCacher(object):
                 poll_interval = poll_interval_fast
             else:
                 poll_interval = poll_interval_normal
+
+            # 2026-05-17: Backoff on futile eviction streaks.  On macOS the
+            # memory compressor holds tile memory in-place even after eviction
+            # (RSS doesn't drop), so freed_mb stays under 16 every pass and
+            # futile_streak climbs without bound.  Each pass takes tc_lock
+            # while evaluating candidates — at futile_streak=50+ this is
+            # 50 lock acquisitions per second contending with FUSE reads,
+            # delaying X-Plane main thread enough to choke CockpitDecks
+            # websocket (observed 18:46 with futile_streak hitting 57).
+            # Step backoff starting at streak=3 (when the existing warning
+            # already fires).  Per-process backoff alone isn't enough — with
+            # 6 region workers each independently running eviction, even
+            # one process backed off 12s, the others keep firing.  Pushing
+            # aggressively from streak=3 means every futile process gets
+            # out of the way fast.  Trade-off: actual memory recovery is
+            # delayed by up to 30s, but eviction was already failing to
+            # recover memory on macOS anyway.
+            if self._futile_eviction_streak >= 3:
+                # streak  3 → 10s
+                # streak  5 → 15s
+                # streak 10 → 25s
+                # streak 15+ → 30s (cap)
+                _backoff = min(30.0, 5.0 + self._futile_eviction_streak * 2.0)
+                if _backoff > poll_interval:
+                    poll_interval = _backoff
             time.sleep(poll_interval)
 
     def _get_tile(self, row, col, map_type, zoom):
@@ -11331,51 +11356,83 @@ class TileCacher(object):
         idx = self._to_tile_id(row, col, map_type, zoom)
 
         log.debug(f"Get_tile: {idx}")
+
+        # Double-checked locking: 2026-05-17 the slow Tile() construction
+        # (pydds.DDS allocates ~85 MB and the 13-level mipmap chain — 50-200ms)
+        # used to be inside tc_lock, blocking every other FUSE read on the
+        # same worker.  Observed tc_lock_wait wait_ms=50-161 during cold load
+        # leading to X-Plane main-thread freezes and CockpitDecks websocket
+        # choke.  Construction is now outside the lock; the lock is only held
+        # for the fast hit-check, fast insert, and refs/LRU bookkeeping.
+        #
+        # Race: two threads can both build a Tile for the same idx
+        # simultaneously.  Resolved by re-checking under the final lock —
+        # loser discards its work and uses the winner's tile.  Wasted work
+        # is rare (same uncached tile requested by two threads concurrently)
+        # and bounded to one extra ~85 MB allocation + close().
+
+        # Phase 1: quick hit check
         _lock_t0 = time.monotonic()
         with self.tc_lock:
             _wait_ms = (time.monotonic() - _lock_t0) * 1000.0
-            # See _get_tile: DEBUG-level with 100ms threshold.
             if _wait_ms > 100.0:
                 log.debug(
-                    f"tc_lock_wait op=_open_tile wait_ms={_wait_ms:.1f} "
+                    f"tc_lock_wait op=_open_tile.check wait_ms={_wait_ms:.1f} "
                     f"tid={threading.get_ident()} idx={idx}"
                 )
             tile = self.tiles.get(idx)
-            if not tile:
-                self.misses += 1
-                bump('tile_mem_miss')
-                # Use target zoom level - supports both fixed and dynamic modes
-                # Pass row/col for dynamic zoom computation based on predicted altitude
-                tile = Tile(
-                    col, row, map_type, zoom,
-                    cache_dir=self.cache_dir,
-                    min_zoom=self.min_zoom,
-                    max_zoom=self._get_target_zoom_level(zoom, row=row, col=col),
-                    layout_zoom=self.compute_layout_zoom(zoom),
-                )
-                self.tiles[idx] = tile
-                # New tile becomes MRU
-                self._touch_tile(idx, tile)
-                self.open_count[idx] = self.open_count.get(idx, 0) + 1
-                if self.open_count[idx] > 1:
-                    log.debug(f"Tile: {idx} opened for the {self.open_count[idx]} time.")
-                # Limit open_count size to prevent unbounded memory growth
-                while len(self.open_count) > self._open_count_max:
-                    try:
-                        self.open_count.popitem(last=False)  # Remove oldest entry
-                    except KeyError:
-                        break
-            elif tile.refs <= 0:
-                # Only in this case would this cache have made a difference
-                self.hits += 1
-                bump('tile_mem_hits')
-                # Reset time budget when tile is re-opened from cache
-                # This ensures returning to an area gets a fresh budget, not the
-                # exhausted budget from a previous (possibly failed) request.
-                tile._tile_time_budget = None
+            if tile is not None:
+                # Cache hit — fast path, do all bookkeeping under lock
+                if tile.refs <= 0:
+                    self.hits += 1
+                    bump('tile_mem_hits')
+                    tile._tile_time_budget = None
+                tile.refs += 1
+                return tile
 
-            tile.refs += 1
-        return tile
+        # Phase 2: slow construction OUTSIDE the lock so other FUSE reads
+        # can keep flowing.  This is the ~50-200ms pydds allocation.
+        self.misses += 1
+        bump('tile_mem_miss')
+        new_tile = Tile(
+            col, row, map_type, zoom,
+            cache_dir=self.cache_dir,
+            min_zoom=self.min_zoom,
+            max_zoom=self._get_target_zoom_level(zoom, row=row, col=col),
+            layout_zoom=self.compute_layout_zoom(zoom),
+        )
+
+        # Phase 3: insert (with race-resolution) and bookkeeping under lock
+        with self.tc_lock:
+            existing = self.tiles.get(idx)
+            if existing is not None:
+                # Another thread built the same tile while we were constructing.
+                # Throw away our work, use theirs.  Should be rare.
+                try:
+                    new_tile.close()
+                except Exception:
+                    pass
+                bump('tile_construct_race_discard')
+                if existing.refs <= 0:
+                    self.hits += 1
+                    bump('tile_mem_hits')
+                    existing._tile_time_budget = None
+                existing.refs += 1
+                return existing
+
+            # We won the race (or were the only one) — install our tile.
+            self.tiles[idx] = new_tile
+            self._touch_tile(idx, new_tile)
+            self.open_count[idx] = self.open_count.get(idx, 0) + 1
+            if self.open_count[idx] > 1:
+                log.debug(f"Tile: {idx} opened for the {self.open_count[idx]} time.")
+            while len(self.open_count) > self._open_count_max:
+                try:
+                    self.open_count.popitem(last=False)
+                except KeyError:
+                    break
+            new_tile.refs += 1
+            return new_tile
 
     
     def _save_tile_to_passthrough(self, t):
