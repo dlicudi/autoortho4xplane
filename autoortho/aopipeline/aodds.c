@@ -3917,28 +3917,34 @@ AODDS_API int32_t aodds_builder_add_fallback_image(
         return 0;
     }
     
-    /* Allocate and copy image data */
-    uint8_t* data = NULL;
-    if (builder->pool) {
-        data = aodecode_acquire_buffer(builder->pool);
-    }
-    if (!data) {
-        data = (uint8_t*)malloc(CHUNK_BUFFER_SIZE);
-    }
-    
+    /* Allocate and copy image data.
+     *
+     * 2026-05-17: Always malloc here — never acquire from the decode pool.
+     * Fallback images are stored on the builder between acquire and finalize,
+     * which can be a long window (waiting for the K=2 finalize_to_file sem).
+     * If those buffers came from the pool, queued builders would pin a slice
+     * of pool memory that the two in-flight finalize_to_file calls need for
+     * their own parallel decode — producing a circular wait where finalize
+     * blocks on aodecode_acquire_buffer holding the sem, and the held_bg
+     * builders can't release their pool buffers because they're stuck on
+     * sem.acquire(). Plain malloc decouples this entirely.
+     *
+     * aodecode_free_image (aodecode.c:773) sees from_pool=0 and uses free().
+     */
+    uint8_t* data = (uint8_t*)malloc(CHUNK_BUFFER_SIZE);
     if (!data) {
         builder_unlock(builder);
         return 0;
     }
-    
+
     memcpy(data, rgba_data, CHUNK_BUFFER_SIZE);
-    
+
     builder->chunks[chunk_index].data = data;
     builder->chunks[chunk_index].width = width;
     builder->chunks[chunk_index].height = height;
     builder->chunks[chunk_index].stride = width * 4;
     builder->chunks[chunk_index].channels = 4;
-    builder->chunks[chunk_index].from_pool = (builder->pool != NULL);
+    builder->chunks[chunk_index].from_pool = 0;
     
     builder->chunk_status[chunk_index] = CHUNK_STATUS_FALLBACK;
     builder->status.chunks_received++;
