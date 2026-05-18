@@ -1018,6 +1018,25 @@ def begin_shutdown(reason="shutdown"):
         chunk_getter.cancel_all_work(reason)
     except Exception:
         pass
+    # Tell the native decode pool to stop accepting acquire requests so
+    # in-flight aodds_builder_finalize_to_file calls return quickly with
+    # missing chunks instead of running their full 256-chunk loop.
+    # Without this, workers block on SIGTERM for the natural ~120s BG
+    # build drain time and stop-ao.sh has to SIGKILL them.
+    try:
+        from autoortho.aopipeline.AoDDS import get_default_decode_pool
+    except ImportError:
+        try:
+            from aopipeline.AoDDS import get_default_decode_pool
+        except ImportError:
+            get_default_decode_pool = None
+    if get_default_decode_pool is not None:
+        try:
+            pool = get_default_decode_pool()
+            if pool is not None:
+                pool.request_shutdown()
+        except Exception:
+            pass
 
 
 def clear_shutdown_request():

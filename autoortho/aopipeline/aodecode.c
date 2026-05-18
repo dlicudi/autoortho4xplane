@@ -75,7 +75,13 @@ struct aodecode_pool {
     int64_t overflow_allocated; /* Bytes currently in overflow buffers */
     int32_t overflow_count;     /* Number of active overflow buffers */
     int32_t waiters_count;      /* Number of threads waiting for buffer */
-    
+
+    /* Shutdown flag — when set, acquire_buffer returns NULL immediately so
+     * in-flight finalize_to_file calls can wrap up quickly on SIGTERM
+     * instead of running their full chunk loop.  Set via
+     * aodecode_pool_request_shutdown(). */
+    int32_t shutting_down;
+
     /* Synchronization */
     AOMUTEX lock;               /* Mutex for thread safety */
     AOCOND buffer_available;    /* Condition: buffer released or limit raised */
@@ -95,6 +101,7 @@ AODECODE_API aodecode_pool_t* aodecode_create_pool(int32_t count) {
     pool->overflow_allocated = 0;
     pool->overflow_count = 0;
     pool->waiters_count = 0;
+    pool->shutting_down = 0;
     
     /* Allocate contiguous memory for all buffers */
     pool->memory = (uint8_t*)malloc((size_t)count * CHUNK_RGBA_BYTES);
@@ -180,6 +187,15 @@ AODECODE_API uint8_t* aodecode_acquire_buffer(aodecode_pool_t* pool) {
     AOMUTEX_LOCK(pool->lock);
 
     while (1) {
+        /* Step 0: Shutdown short-circuit.  Set by aodecode_pool_request_shutdown
+         * when the worker is shutting down — return NULL so the caller marks
+         * the chunk MISSING and finalize wraps up quickly instead of
+         * processing the remaining ~256 chunks. */
+        if (pool->shutting_down) {
+            AOMUTEX_UNLOCK(pool->lock);
+            return NULL;
+        }
+
         /* Step 1: Try fixed pool first (O(1), no fragmentation) */
         if (pool->free_top > 0) {
             pool->free_top--;
@@ -385,10 +401,39 @@ AODECODE_API void aodecode_pool_stats(
  */
 AODECODE_API void aodecode_pool_set_limit(aodecode_pool_t* pool, int64_t memory_limit) {
     if (!pool) return;
-    
+
     AOMUTEX_LOCK(pool->lock);
     pool->memory_limit = memory_limit;
     /* Wake all waiters so they can re-check the new limit */
+    if (pool->waiters_count > 0) {
+        AOCOND_BROADCAST(pool->buffer_available);
+    }
+    AOMUTEX_UNLOCK(pool->lock);
+}
+
+/**
+ * Request shutdown of all acquire_buffer calls on this pool.
+ *
+ * Sets a flag that aodecode_acquire_buffer checks at the top of its
+ * retry loop and immediately after each wakeup; in both cases it returns
+ * NULL instead of allocating or waiting.  Existing waiters are
+ * broadcast-woken so they observe the flag and exit.
+ *
+ * Called from the Python begin_shutdown() path on SIGTERM so in-flight
+ * finalize_to_file calls bail out instead of running their full chunk
+ * loop — the build wraps up with missing_color fills and the worker
+ * exits cleanly within seconds instead of waiting 90-120s for the
+ * decode pipeline to drain naturally.
+ *
+ * The flag is one-way (no clear function) — pools whose workers have
+ * been told to shut down should not be re-used.
+ */
+AODECODE_API void aodecode_pool_request_shutdown(aodecode_pool_t* pool) {
+    if (!pool) return;
+
+    AOMUTEX_LOCK(pool->lock);
+    pool->shutting_down = 1;
+    /* Wake all waiters so they can observe the flag and return NULL */
     if (pool->waiters_count > 0) {
         AOCOND_BROADCAST(pool->buffer_available);
     }

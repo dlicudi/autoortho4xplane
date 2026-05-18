@@ -147,6 +147,22 @@ AODECODE_API aodecode_pool_t* aodecode_create_pool_ex(int32_t count, int64_t mem
 AODECODE_API void aodecode_pool_set_limit(aodecode_pool_t* pool, int64_t memory_limit);
 
 /**
+ * Request shutdown of the pool.
+ *
+ * Subsequent aodecode_acquire_buffer calls return NULL immediately and
+ * any current waiters are broadcast-woken so they observe the flag.
+ * Used by Python's begin_shutdown() path on SIGTERM so in-flight
+ * finalize_to_file calls bail out and the worker can exit cleanly
+ * instead of waiting 90-120s for the decode pipeline to drain.
+ *
+ * One-way: there is no clear function — pools whose workers have been
+ * told to shut down should not be re-used.
+ *
+ * @param pool Pool handle
+ */
+AODECODE_API void aodecode_pool_request_shutdown(aodecode_pool_t* pool);
+
+/**
  * Get the current memory limit.
  * 
  * @param pool  Pool handle

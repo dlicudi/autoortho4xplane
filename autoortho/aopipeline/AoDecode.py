@@ -196,6 +196,15 @@ def _setup_signatures(lib):
         lib.aodecode_pool_waiters.restype = c_int32
     except AttributeError:
         pass
+
+    # Pool shutdown request — flips a one-way flag that makes future
+    # acquire_buffer calls return NULL.  Optional for the same reason as
+    # aodecode_pool_waiters above (older dylibs lack the symbol).
+    try:
+        lib.aodecode_pool_request_shutdown.argtypes = [c_void_p]
+        lib.aodecode_pool_request_shutdown.restype = None
+    except AttributeError:
+        pass
     
     # Batch decode
     lib.aodecode_batch.argtypes = [
@@ -349,6 +358,24 @@ class BufferPool:
     def set_memory_limit(self, limit_bytes: int):
         """Set the memory limit for overflow buffers."""
         self._lib.aodecode_pool_set_limit(self._handle, limit_bytes)
+
+    def request_shutdown(self) -> None:
+        """Flip the pool's shutdown flag.
+
+        After this call returns, all in-flight and future acquire_buffer
+        calls return NULL immediately — letting in-progress
+        finalize_to_file calls wrap up with missing_color chunks instead
+        of blocking the worker exit for the full ~120 s drain.
+
+        One-way: do not reuse the pool after calling.  Silently no-ops if
+        the loaded dylib doesn't export the symbol (older builds).
+        """
+        if not getattr(self, '_handle', None):
+            return
+        fn = getattr(self._lib, 'aodecode_pool_request_shutdown', None)
+        if fn is None:
+            return
+        fn(self._handle)
     
     def get_memory_limit(self) -> int:
         """Get the current memory limit."""
