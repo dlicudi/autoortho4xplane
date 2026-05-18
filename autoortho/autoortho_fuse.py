@@ -770,6 +770,13 @@ class AutoOrtho(Operations):
                 rel = os.path.relpath(compressed_path, dds_cache._dds_root)
                 pt_path = os.path.join(passthrough_root, rel)
 
+                # Skip DDM load on full misses — the json.load is a wasted
+                # open+read+parse on every cache-miss FUSE open otherwise.
+                _pt_exists = os.path.exists(pt_path)
+                _compressed_exists = os.path.exists(compressed_path)
+                if not (_pt_exists or _compressed_exists):
+                    continue
+
                 # Load DDM once for this candidate — used for completeness checks below.
                 try:
                     with open(ddm_path, 'r', encoding='utf-8') as _f:
@@ -778,7 +785,7 @@ class AutoOrtho(Operations):
                     _meta = None
 
                 # 1. Already-decompressed passthrough copy — instant serve if valid
-                if os.path.exists(pt_path):
+                if _pt_exists:
                     pt_size = os.path.getsize(pt_path)
                     if pt_size != expected_size:
                         # Wrong size: DDS built at a different zoom/format than what
@@ -816,7 +823,7 @@ class AutoOrtho(Operations):
                         return pt_path
 
                 # 2. Compressed source must exist and be non-trivial
-                if not (os.path.exists(compressed_path) and
+                if not (_compressed_exists and
                         os.path.getsize(compressed_path) >= 131072):
                     continue
 
