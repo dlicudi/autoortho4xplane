@@ -5,7 +5,7 @@ import re
 import signal
 import subprocess
 import sys
-import time
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, List, Optional
@@ -211,15 +211,20 @@ class AOProcessSupervisor:
         for handle in live:
             self._request_worker_stop(handle)
 
-        deadline = time.monotonic() + timeout
+        # Wait for workers in parallel so a slow shutdown by one worker doesn't
+        # starve the others' grace budget.  A shared sequential deadline could
+        # cut worker[N] to ~0s if worker[0] used most of the 15s window.
+        threads = []
         for handle in live:
-            remaining = max(0.0, deadline - time.monotonic())
-            try:
-                handle.process.wait(timeout=remaining)
-            except subprocess.TimeoutExpired:
-                pass
-            except Exception:
-                pass
+            t = threading.Thread(
+                target=self._wait_no_raise,
+                args=(handle, timeout),
+                daemon=True,
+            )
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join(timeout=timeout + 1.0)
 
         for handle in live:
             if handle.process.poll() is None:
@@ -238,6 +243,12 @@ class AOProcessSupervisor:
             self._cleanup_handle(handle)
 
         self.handles = []
+
+    def _wait_no_raise(self, handle: WorkerHandle, timeout: float):
+        try:
+            handle.process.wait(timeout=timeout)
+        except Exception:
+            pass
 
     def _request_worker_stop(self, handle: WorkerHandle):
         if handle.process.poll() is not None:
