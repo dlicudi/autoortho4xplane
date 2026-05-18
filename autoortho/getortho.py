@@ -4420,9 +4420,48 @@ class BackgroundDDSBuilder:
                                 _native_path_inflight['finalize_sem_wait_bg'] = max(
                                     0, _native_path_inflight['finalize_sem_wait_bg'] - 1)
                             with _native_path_count('streaming_finalize_to_file'):
-                                success, bytes_written = builder.finalize_to_file(
-                                    staging_path, max_threads=threads
-                                )
+                                _fin_t0 = time.monotonic()
+                                # Watchdog: poll staging file size while finalize is in
+                                # progress.  If size doesn't grow, the C-side call is
+                                # stuck in something other than disk IO (lock, infinite
+                                # loop, etc).  If it grows slowly, disk write IS the
+                                # bottleneck.  Added to localize build_stuck hangs.
+                                _fin_stop = threading.Event()
+                                _fin_path = staging_path
+                                _fin_tile = tile_id
+                                def _finalize_watchdog():
+                                    last_size = -1
+                                    while not _fin_stop.wait(10.0):
+                                        elapsed = time.monotonic() - _fin_t0
+                                        try:
+                                            cur_size = os.path.getsize(_fin_path)
+                                        except OSError:
+                                            cur_size = -1
+                                        growth = (cur_size - last_size) if last_size >= 0 else 0
+                                        log.warning(
+                                            f"PIPELINE_TRACE finalize_progress pid={os.getpid()} "
+                                            f"tile={_fin_tile} elapsed={elapsed:.0f}s "
+                                            f"staging_size={cur_size} growth_since_last={growth}"
+                                        )
+                                        last_size = cur_size
+                                _wd = threading.Thread(
+                                    target=_finalize_watchdog, daemon=True,
+                                    name=f"fin_wd_{tile_id}")
+                                _wd.start()
+                                try:
+                                    success, bytes_written = builder.finalize_to_file(
+                                        staging_path, max_threads=threads
+                                    )
+                                finally:
+                                    _fin_stop.set()
+                                _fin_ms = (time.monotonic() - _fin_t0) * 1000.0
+                                if _fin_ms > 2000.0:
+                                    log.warning(
+                                        f"PIPELINE_TRACE finalize_to_file SLOW pid={os.getpid()} "
+                                        f"tile={tile_id} elapsed_ms={_fin_ms:.0f} "
+                                        f"bytes_written={bytes_written} success={success} "
+                                        f"max_threads={threads} path={staging_path}"
+                                    )
                     except BaseException:
                         # Decrement here too in case sem.acquire raised before
                         # we got past it; otherwise counter would leak.
@@ -4433,10 +4472,18 @@ class BackgroundDDSBuilder:
 
                 if success and bytes_written >= 128:
                     self._set_build_stage(tile_id, "store_from_file")
+                    _store_t0 = time.monotonic()
                     self._dds_cache.store_from_file(
                         tile_id, tile.max_zoom, staging_path, tile,
                         mm0_missing_indices=prefetch_mm0_missing or None,
                         mm0_fallback_indices=prefetch_mm0_fallback or None)
+                    _store_ms = (time.monotonic() - _store_t0) * 1000.0
+                    if _store_ms > 1000.0:
+                        log.warning(
+                            f"PIPELINE_TRACE store_from_file SLOW pid={os.getpid()} "
+                            f"tile={tile_id} elapsed_ms={_store_ms:.0f} "
+                            f"bytes={bytes_written} path={staging_path}"
+                        )
                     
                     build_time = (time.monotonic() - build_start) * 1000
                     status = builder.get_status()
@@ -7282,7 +7329,15 @@ class Tile(object):
                                 _native_path_inflight['finalize_sem_wait_live'] = max(
                                     0, _native_path_inflight['finalize_sem_wait_live'] - 1)
                             with _native_path_count('streaming_finalize_to_buffer'):
+                                _fin_live_t0 = time.monotonic()
                                 result = builder.finalize(buffer, max_threads=threads)
+                                _fin_live_ms = (time.monotonic() - _fin_live_t0) * 1000.0
+                                if _fin_live_ms > 1000.0:
+                                    log.warning(
+                                        f"PIPELINE_TRACE finalize_to_buffer SLOW pid={os.getpid()} "
+                                        f"tile={self.id} elapsed_ms={_fin_live_ms:.0f} "
+                                        f"max_threads={threads}"
+                                    )
                     except BaseException:
                         with _native_path_lock:
                             if _native_path_inflight['finalize_sem_wait_live'] > 0:

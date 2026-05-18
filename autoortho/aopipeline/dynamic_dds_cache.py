@@ -481,6 +481,7 @@ class DynamicDDSCache:
                 return None
 
             # Read the DDS file (possibly compressed on disk)
+            _read_t0 = time.monotonic()
             try:
                 with open(dds_path, "rb") as f:
                     raw_bytes = f.read()
@@ -488,8 +489,10 @@ class DynamicDDSCache:
                 self._delete_pair(dds_path, ddm_path)
                 self._misses += 1
                 return None
+            _read_ms = (time.monotonic() - _read_t0) * 1000.0
 
             # Decompress if the file was stored compressed
+            _decomp_t0 = time.monotonic()
             try:
                 dds_bytes = self._decompress_dds(raw_bytes, meta)
             except Exception:
@@ -497,6 +500,16 @@ class DynamicDDSCache:
                 self._delete_pair(dds_path, ddm_path)
                 self._misses += 1
                 return None
+            _decomp_ms = (time.monotonic() - _decomp_t0) * 1000.0
+
+            if (_read_ms + _decomp_ms) > 200.0:
+                log.warning(
+                    f"DDS_CACHE_LOAD VERY_SLOW total_ms={_read_ms + _decomp_ms:.0f} "
+                    f"read_ms={_read_ms:.1f} decompress_ms={_decomp_ms:.1f} "
+                    f"raw_bytes={len(raw_bytes)} dds_bytes={len(dds_bytes)} "
+                    f"compressed={len(raw_bytes) != len(dds_bytes)} "
+                    f"tile={tile_id} path={dds_path}"
+                )
 
             # Validate size (against uncompressed DDS dimensions)
             if tile.dds is not None and len(dds_bytes) != tile.dds.total_size:
