@@ -599,6 +599,50 @@ class DynamicDDSCache:
         except Exception:
             return False
 
+    def mark_passthrough_complete(self, tile_id: str, max_zoom: int, tile) -> bool:
+        """Write just the DDM marker for a tile already saved to passthrough.
+
+        Used by `_save_tile_to_passthrough` in getortho.py: the live FUSE
+        path writes the .dds bytes directly to dds_passthrough/ but never
+        calls store() or store_from_file(), so the matching DDM in
+        dds_cache/ is never written.  Without this method, every
+        live-built tile becomes an orphan: scan_passthrough deletes it
+        at next startup, and _get_disk_dds_path refuses to serve it
+        between startups (no DDM = not validated).
+
+        Observed 2026-05-18: 2510 live saves / 71 BG store_from_file
+        runs in one 11-min session → ~83% of live-built tiles were
+        orphaned, breaking passthrough re-use.
+
+        The caller (_save_tile_to_passthrough) guarantees all mipmaps
+        are retrieved before reaching here, so we mark missing_indices
+        and fallback_indices empty.  Writes only the .ddm; the .dds is
+        already in dds_passthrough/ where the existing serve path
+        expects it.
+
+        Returns True on success, False on failure (non-critical).
+        """
+        if not self._enabled:
+            return False
+        try:
+            _, ddm_path = self._paths_for(
+                tile.row, tile.col, tile.maptype,
+                tile.tilename_zoom, max_zoom
+            )
+            dds_format, compressor = self._get_format_and_compressor()
+            meta = self._build_ddm(
+                tile, max_zoom, dds_format, compressor,
+                mm0_missing_indices=None,
+                mm0_fallback_indices=None,
+                disk_compression="none",  # passthrough is uncompressed
+            )
+            os.makedirs(os.path.dirname(ddm_path), exist_ok=True)
+            self._write_ddm(ddm_path, meta)
+            return True
+        except Exception as e:
+            log.debug(f"mark_passthrough_complete failed for {tile_id}: {e}")
+            return False
+
     def get_staging_path(self, tile_id: str, max_zoom: int, tile) -> Optional[str]:
         """Get a temp file path for native direct-to-disk writes.
 

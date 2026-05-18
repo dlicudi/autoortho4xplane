@@ -11853,6 +11853,18 @@ class TileCacher(object):
             os.replace(tmp_path, pt_path)
             bump('dds_passthrough_live_save')
             log.debug(f"Saved live-built tile {t.id} to passthrough cache")
+
+            # Write the matching DDM marker so this passthrough is recognised
+            # as valid by _get_disk_dds_path and not deleted as an orphan by
+            # scan_passthrough.  Without this, the live FUSE path writes
+            # passthrough .dds files that no subsequent open can use (DDM
+            # missing → validity check fails) and that get deleted on every
+            # restart — observed 2026-05-18: only 17% of live-saved tiles
+            # were ever re-served, all others orphaned.  The tile is verified
+            # complete by the all(mm.retrieved ...) guard above, so the DDM
+            # accurately reflects state.
+            if dynamic_dds_cache.mark_passthrough_complete(t.id, t.max_zoom, t):
+                bump('dds_passthrough_live_save_with_ddm')
         except Exception as e:
             log.debug(f"Failed to save tile to passthrough: {e}")
             if tmp_path is not None:
