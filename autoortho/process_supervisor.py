@@ -18,7 +18,15 @@ except ImportError:
 log = logging.getLogger(__name__)
 
 
-DEFAULT_WORKER_STOP_TIMEOUT = 3.0
+# 15s is generous but matches reality: when a SIGTERM arrives while the
+# worker's main thread is inside a C call (e.g. aodecode_acquire_buffer's
+# cond_wait), Python's signal handler can only run once C returns.  In
+# practice the worker needs 7-10s for the in-flight build to settle and
+# the shutdown sequence to drain.  Previous 3.0s consistently triggered
+# the force-kill path even on completely clean shutdowns — observed
+# 2026-05-18, 6/6 workers needed SIGKILL despite getortho.shutdown
+# logging "shutdown complete" before the force-kill timeout fired.
+DEFAULT_WORKER_STOP_TIMEOUT = 15.0
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
