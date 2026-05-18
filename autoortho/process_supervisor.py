@@ -42,8 +42,27 @@ class WorkerHandle:
 class AOProcessSupervisor:
     """Owns AO-launched mount workers and their process-tree shutdown."""
 
+    # Class-level registry so _global_shutdown in __main__.py can find every
+    # live supervisor and stop its workers without needing a reference to the
+    # AutoOrtho controller.  Previously, Ctrl-C caused os._exit(0) to fire
+    # before stop_all() was called, leaving worker subprocesses orphaned and
+    # FUSE mounts up.
+    _active_supervisors: List["AOProcessSupervisor"] = []
+
     def __init__(self):
         self.handles: List[WorkerHandle] = []
+        AOProcessSupervisor._active_supervisors.append(self)
+
+    @classmethod
+    def stop_all_supervisors(cls, timeout=DEFAULT_WORKER_STOP_TIMEOUT):
+        """Stop workers in every live supervisor.  Used from _global_shutdown
+        so signal-driven shutdown cleans up worker subprocesses."""
+        for supervisor in list(cls._active_supervisors):
+            try:
+                supervisor.stop_all(timeout=timeout)
+            except Exception:
+                pass
+        cls._active_supervisors = []
 
     def start_mount_worker(
         self,

@@ -173,6 +173,23 @@ def _global_shutdown(signum=None, frame=None):
     except Exception as e:
         log.debug(f"getortho shutdown error: {e}")
 
+    # 5b. Stop mount worker subprocesses.  Without this, Ctrl-C in the AO
+    # supervisor reaches os._exit(0) below before the worker subprocesses
+    # are torn down — they become orphaned, keep their FUSE mounts up, and
+    # the user has to run stop-ao.sh to clean them.  stop_all() sends
+    # SIGTERM to each worker's process group, which triggers the worker's
+    # own _global_shutdown (calling begin_shutdown → pool.request_shutdown
+    # → in-flight finalize_to_file calls bail).
+    try:
+        try:
+            from autoortho.process_supervisor import AOProcessSupervisor
+        except ImportError:
+            from process_supervisor import AOProcessSupervisor
+        AOProcessSupervisor.stop_all_supervisors()
+        log.debug("Mount worker supervisors stopped")
+    except Exception as e:
+        log.debug(f"Supervisor shutdown error: {e}")
+
     # 6. Report remaining alive threads
     try:
         alive = threading.enumerate()
