@@ -9,7 +9,24 @@
 #include "aocache.h"
 #include "internal.h"
 #include <stdio.h>
+#include <time.h>
 #include <turbojpeg.h>
+
+/* Maximum time a thread will block waiting for a pool buffer before giving
+ * up and returning NULL.  Prevents the classic resource-starvation deadlock
+ * observed when 2+ concurrent finalize_to_file calls each hold ~64 MB of
+ * decoded chunks while waiting for the pool memory_limit to free up
+ * (chunks won't release until the holder's parallel loop completes — but
+ * the loop is blocked waiting for the same pool).  30s is generous for
+ * legitimate waits (normal finalize is <2s) and short enough that recovery
+ * is faster than the existing build_stuck threshold (~90s).
+ *
+ * On timeout, aodecode_acquire_buffer returns NULL.  All current call
+ * sites in aodds.c handle NULL by marking the chunk MISSING and
+ * continuing — the tile builds with one or more missing_color chunks
+ * rather than hanging forever.  Tile gets rebuilt on the next request.
+ */
+#define AODECODE_ACQUIRE_TIMEOUT_MS 30000
 
 /* Version string */
 #define AODECODE_VERSION "1.0.0"
@@ -186,10 +203,43 @@ AODECODE_API uint8_t* aodecode_acquire_buffer(aodecode_pool_t* pool) {
             return buffer;
         }
         
-        /* Step 3: Limit reached - wait for buffer to be released */
+        /* Step 3: Limit reached - wait for buffer to be released.
+         * Bounded wait to break the multi-builder deadlock described in
+         * AODECODE_ACQUIRE_TIMEOUT_MS above. */
         pool->waiters_count++;
-        AOCOND_WAIT(pool->buffer_available, pool->lock);
+#ifdef AOPIPELINE_WINDOWS
+        BOOL signaled = SleepConditionVariableCS(
+            &pool->buffer_available, &pool->lock, AODECODE_ACQUIRE_TIMEOUT_MS);
+        int timed_out = (signaled == 0);
+#else
+        struct timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += AODECODE_ACQUIRE_TIMEOUT_MS / 1000;
+        deadline.tv_nsec += (AODECODE_ACQUIRE_TIMEOUT_MS % 1000) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec += 1;
+            deadline.tv_nsec -= 1000000000L;
+        }
+        int rc = pthread_cond_timedwait(
+            &pool->buffer_available, &pool->lock, &deadline);
+        int timed_out = (rc == ETIMEDOUT);
+#endif
         pool->waiters_count--;
+        if (timed_out) {
+            /* Deadlock recovery: bail out so caller can mark chunk MISSING
+             * and release its own held buffers.  Logged to stderr so it
+             * appears in worker logs without needing a new symbol. */
+            fprintf(stderr,
+                "AODECODE: acquire_buffer timed out after %d ms "
+                "(overflow=%lld/%lld bytes, waiters=%d) — returning NULL\n",
+                AODECODE_ACQUIRE_TIMEOUT_MS,
+                (long long)pool->overflow_allocated,
+                (long long)pool->memory_limit,
+                pool->waiters_count);
+            fflush(stderr);
+            AOMUTEX_UNLOCK(pool->lock);
+            return NULL;
+        }
         /* Loop back to try again after wakeup */
     }
     
