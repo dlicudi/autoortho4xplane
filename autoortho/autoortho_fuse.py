@@ -1186,7 +1186,14 @@ class AutoOrtho(Operations):
         # Handle DSF files with time exclusion redirect
         if self.dsf_re.match(path):
             _class[0] = 'dsf'
-            _uid, _gid, _pid = fuse_get_context()
+            # fuse_get_context() can raise AttributeError on Windows mfusepy
+            # (binding returns int instead of a pointer struct).  _pid is only
+            # used for diagnostic logging below, so degrade gracefully rather
+            # than failing the open with EINVAL.
+            try:
+                _uid, _gid, _pid = fuse_get_context()
+            except (AttributeError, TypeError, ValueError):
+                _uid, _gid, _pid = -1, -1, "?"
             # Check if DSF should be redirected to global scenery
             redirect_path = time_exclusion_manager.get_redirect_path(path)
             if redirect_path:
