@@ -12,21 +12,32 @@
 #include <time.h>
 #include <turbojpeg.h>
 
-/* Maximum time a thread will block waiting for a pool buffer before giving
- * up and returning NULL.  Prevents the classic resource-starvation deadlock
- * observed when 2+ concurrent finalize_to_file calls each hold ~64 MB of
- * decoded chunks while waiting for the pool memory_limit to free up
- * (chunks won't release until the holder's parallel loop completes — but
- * the loop is blocked waiting for the same pool).  30s is generous for
- * legitimate waits (normal finalize is <2s) and short enough that recovery
- * is faster than the existing build_stuck threshold (~90s).
+/* Maximum CUMULATIVE time a thread will block waiting for a pool buffer
+ * before giving up and returning NULL.  Prevents the classic
+ * resource-starvation deadlock observed when 2+ concurrent
+ * finalize_to_file calls each hold ~64 MB of decoded chunks while
+ * waiting for the pool memory_limit to free up (chunks won't release
+ * until the holder's parallel loop completes — but the loop is blocked
+ * waiting for the same pool).
+ *
+ * The first version of this fix used a per-call timeout on
+ * pthread_cond_timedwait, but spurious wakeups (broadcast on every
+ * buffer release) reset the deadline each loop iteration — so under
+ * heavy contention no single wait reached the timeout even though the
+ * cumulative wait was effectively infinite (8+ min observed at EGKK
+ * 2026-05-18, 90 threads in livelock).  This version tracks the FIRST
+ * wait time and respects the budget across all retries.
+ *
+ * 60s budget: longer than legitimate finalize (<2s) but shorter than
+ * the build_stuck warning threshold (90s) so the user-visible "stuck"
+ * lines never fire under the recovery path.
  *
  * On timeout, aodecode_acquire_buffer returns NULL.  All current call
  * sites in aodds.c handle NULL by marking the chunk MISSING and
  * continuing — the tile builds with one or more missing_color chunks
  * rather than hanging forever.  Tile gets rebuilt on the next request.
  */
-#define AODECODE_ACQUIRE_TIMEOUT_MS 30000
+#define AODECODE_ACQUIRE_TIMEOUT_MS 60000
 
 /* Version string */
 #define AODECODE_VERSION "1.0.0"
@@ -156,9 +167,18 @@ AODECODE_API uint8_t* aodecode_acquire_buffer(aodecode_pool_t* pool) {
     
     uint8_t* buffer = NULL;
     int64_t fixed_pool_size = (int64_t)pool->count * CHUNK_RGBA_BYTES;
-    
+
+    /* Track cumulative wait time across spurious wakeups so a single thread
+     * cannot starve forever under broadcast-on-release contention. */
+    int wait_started = 0;
+#ifdef AOPIPELINE_WINDOWS
+    ULONGLONG wait_start_tick = 0;
+#else
+    struct timespec wait_start_ts;
+#endif
+
     AOMUTEX_LOCK(pool->lock);
-    
+
     while (1) {
         /* Step 1: Try fixed pool first (O(1), no fragmentation) */
         if (pool->free_top > 0) {
@@ -204,18 +224,52 @@ AODECODE_API uint8_t* aodecode_acquire_buffer(aodecode_pool_t* pool) {
         }
         
         /* Step 3: Limit reached - wait for buffer to be released.
-         * Bounded wait to break the multi-builder deadlock described in
-         * AODECODE_ACQUIRE_TIMEOUT_MS above. */
+         * Bounded CUMULATIVE wait — see AODECODE_ACQUIRE_TIMEOUT_MS comment
+         * above for why per-call timeout wasn't sufficient. */
+        if (!wait_started) {
+#ifdef AOPIPELINE_WINDOWS
+            wait_start_tick = GetTickCount64();
+#else
+            clock_gettime(CLOCK_MONOTONIC, &wait_start_ts);
+#endif
+            wait_started = 1;
+        }
+
+        /* Compute remaining budget.  If exhausted, bail. */
+        long remaining_ms;
+#ifdef AOPIPELINE_WINDOWS
+        ULONGLONG now_tick = GetTickCount64();
+        long elapsed_ms = (long)(now_tick - wait_start_tick);
+#else
+        struct timespec now_ts;
+        clock_gettime(CLOCK_MONOTONIC, &now_ts);
+        long elapsed_ms = (long)((now_ts.tv_sec - wait_start_ts.tv_sec) * 1000L
+                                + (now_ts.tv_nsec - wait_start_ts.tv_nsec) / 1000000L);
+#endif
+        remaining_ms = (long)AODECODE_ACQUIRE_TIMEOUT_MS - elapsed_ms;
+        if (remaining_ms <= 0) {
+            fprintf(stderr,
+                "AODECODE: acquire_buffer total wait %ld ms exceeded budget %d ms "
+                "(overflow=%lld/%lld bytes, waiters=%d) — returning NULL\n",
+                elapsed_ms, AODECODE_ACQUIRE_TIMEOUT_MS,
+                (long long)pool->overflow_allocated,
+                (long long)pool->memory_limit,
+                pool->waiters_count);
+            fflush(stderr);
+            AOMUTEX_UNLOCK(pool->lock);
+            return NULL;
+        }
+
         pool->waiters_count++;
 #ifdef AOPIPELINE_WINDOWS
         BOOL signaled = SleepConditionVariableCS(
-            &pool->buffer_available, &pool->lock, AODECODE_ACQUIRE_TIMEOUT_MS);
+            &pool->buffer_available, &pool->lock, (DWORD)remaining_ms);
         int timed_out = (signaled == 0);
 #else
         struct timespec deadline;
         clock_gettime(CLOCK_REALTIME, &deadline);
-        deadline.tv_sec += AODECODE_ACQUIRE_TIMEOUT_MS / 1000;
-        deadline.tv_nsec += (AODECODE_ACQUIRE_TIMEOUT_MS % 1000) * 1000000L;
+        deadline.tv_sec += remaining_ms / 1000;
+        deadline.tv_nsec += (remaining_ms % 1000) * 1000000L;
         if (deadline.tv_nsec >= 1000000000L) {
             deadline.tv_sec += 1;
             deadline.tv_nsec -= 1000000000L;
@@ -226,11 +280,10 @@ AODECODE_API uint8_t* aodecode_acquire_buffer(aodecode_pool_t* pool) {
 #endif
         pool->waiters_count--;
         if (timed_out) {
-            /* Deadlock recovery: bail out so caller can mark chunk MISSING
-             * and release its own held buffers.  Logged to stderr so it
-             * appears in worker logs without needing a new symbol. */
+            /* This per-call timeout reaching firing means we consumed
+             * exactly the remaining budget without a signal.  Bail. */
             fprintf(stderr,
-                "AODECODE: acquire_buffer timed out after %d ms "
+                "AODECODE: acquire_buffer cumulative wait exhausted after %d ms "
                 "(overflow=%lld/%lld bytes, waiters=%d) — returning NULL\n",
                 AODECODE_ACQUIRE_TIMEOUT_MS,
                 (long long)pool->overflow_allocated,
