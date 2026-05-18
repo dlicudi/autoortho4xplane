@@ -564,13 +564,29 @@ AODDS_API int32_t aodds_using_fallback_compressor(void) {
  * Added 2026-05-17 to attribute the 200-400ms cost observed in the
  * `phase_native_partial` Python counter — the dominant slow path for
  * inline mm0 header reads.  Each phase is timed inside the function and
- * summed under g_partial_stats_mutex.  Python publishes via
+ * summed under the partial-stats lock.  Python publishes via
  * aodds_get_partial_phase_stats().
  *
  * NOT thread-coordinated with respect to other build paths — these are
  * shared globals across all callers in this process.
+ *
+ * Platform-conditional lock — mirrors AODDS_TRACE_LOCK above so we don't
+ * need pthread.h on Windows (mingw64 builds without pthread_mutex_t
+ * available unless pthread-w32 is pulled in, which we don't link against).
  */
+#ifdef AOPIPELINE_WINDOWS
+static CRITICAL_SECTION g_partial_stats_cs;
+static int g_partial_stats_cs_init = 0;
+#define PARTIAL_STATS_LOCK() do { \
+    if (!g_partial_stats_cs_init) { InitializeCriticalSection(&g_partial_stats_cs); g_partial_stats_cs_init = 1; } \
+    EnterCriticalSection(&g_partial_stats_cs); \
+} while(0)
+#define PARTIAL_STATS_UNLOCK() LeaveCriticalSection(&g_partial_stats_cs)
+#else
 static pthread_mutex_t g_partial_stats_mutex = PTHREAD_MUTEX_INITIALIZER;
+#define PARTIAL_STATS_LOCK() pthread_mutex_lock(&g_partial_stats_mutex)
+#define PARTIAL_STATS_UNLOCK() pthread_mutex_unlock(&g_partial_stats_mutex)
+#endif
 static int64_t g_partial_count             = 0;
 static int64_t g_partial_total_ms          = 0;
 static int64_t g_partial_decode_ms_total   = 0;
@@ -591,7 +607,7 @@ AODDS_API void aodds_get_partial_phase_stats(
     int64_t* out_compress_ms,
     int64_t* out_free_ms
 ) {
-    pthread_mutex_lock(&g_partial_stats_mutex);
+    PARTIAL_STATS_LOCK();
     if (out_count)        *out_count        = g_partial_count;
     if (out_total_ms)     *out_total_ms     = g_partial_total_ms;
     if (out_decode_ms)    *out_decode_ms    = g_partial_decode_ms_total;
@@ -599,7 +615,7 @@ AODDS_API void aodds_get_partial_phase_stats(
     if (out_compose_ms)   *out_compose_ms   = g_partial_compose_ms_total;
     if (out_compress_ms)  *out_compress_ms  = g_partial_compress_ms_total;
     if (out_free_ms)      *out_free_ms      = g_partial_free_ms_total;
-    pthread_mutex_unlock(&g_partial_stats_mutex);
+    PARTIAL_STATS_UNLOCK();
 }
 
 static double get_time_ms(void) {
@@ -2428,7 +2444,7 @@ AODDS_API int32_t aodds_build_partial_mipmap(
     int64_t phase_total_ms = (int64_t)(get_time_ms() - phase_t_func_start);
 
     /* Accumulate into globals so Python can publish */
-    pthread_mutex_lock(&g_partial_stats_mutex);
+    PARTIAL_STATS_LOCK();
     g_partial_count             += 1;
     g_partial_total_ms          += phase_total_ms;
     g_partial_decode_ms_total   += phase_decode_ms;
@@ -2436,7 +2452,7 @@ AODDS_API int32_t aodds_build_partial_mipmap(
     g_partial_compose_ms_total  += phase_compose_ms;
     g_partial_compress_ms_total += phase_compress_ms;
     g_partial_free_ms_total     += (phase_free_chunks_ms + phase_free_tile_ms);
-    pthread_mutex_unlock(&g_partial_stats_mutex);
+    PARTIAL_STATS_UNLOCK();
 
     *bytes_written = compressed;
     return (compressed > 0) ? 1 : 0;
