@@ -884,7 +884,15 @@ _active_native_builds_lock = threading.Lock()
 # that BG cannot steal, while BG keeps its own K=2 budget — total peak burst
 # capped at K=4 across both paths (still well under pool cap with malloc'd
 # fallback images).
-_finalize_to_file_sem = threading.Semaphore(2)      # BG prefetch only
+# 2026-05-18: BG sem dropped from 2 to 1.  Even with the K=2 BG + K=2 live
+# split above, concurrent BG finalizes still hit the decode-pool memory_limit
+# under fresh-airport cold-tile bursts (1004/1024 MB observed at EGKK).  Two
+# BGs each holding ~64 MB of decoded chunks until POST_CHUNK_RELEASE was
+# enough to push past the cap; the resulting livelock in aodecode_acquire_buffer
+# manifested as build_stuck for 8+ minutes and prevented worker shutdown.
+# Single-BG limits peak BG demand to ~64 MB, leaving plenty of headroom for
+# the live K=2 path.  Live throughput unchanged.
+_finalize_to_file_sem = threading.Semaphore(1)      # BG prefetch only
 _finalize_to_buffer_sem = threading.Semaphore(2)    # Live X-Plane reads only
 
 # ---------------------------------------------------------------------------
