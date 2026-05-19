@@ -1083,22 +1083,29 @@ def _calculate_decode_memory_limit() -> int:
     Calculate memory limit for overflow decode buffers.
 
     Each RGBA buffer is ~256 KB (256x256x4).  A single streaming build can
-    hold up to ~256 buffers concurrently when most chunks need fallbacks
-    (one buffer per fallback chunk, held for the lifetime of the build).
-    With multiple concurrent builds plus the OpenMP fan-out inside
-    finalize_to_file, demand can briefly exceed the fixed pool.
+    hold up to ~256 buffers concurrently (one buffer per chunk, held for
+    the duration of the parallel decode + fill_compose).  With the
+    Semaphore(1)+Semaphore(2) finalize concurrency, worst-case real demand
+    per worker is ~4 builders × 64 MB ≈ 256 MB peak.
 
-    The previous 128 MB cap was reached in practice by 2 concurrent builds
-    on tiles with many fallback chunks, causing aodecode_acquire_buffer to
-    block on the pool's condition variable while each build was already
-    holding its own fallback buffers — a classic resource-starvation
-    deadlock.  Raising the cap to 1 GB gives ~4000 overflow buffer slots,
-    which comfortably absorbs the worst-case demand we've observed.
+    Historical context: the original 128 MB cap deadlocked under sustained
+    load.  That was diagnosed as resource starvation and the cap was
+    raised to 1 GB as a fix — but the real root cause was a counter leak
+    in aodecode.c's decode_jpeg_internal (overflow buffers were freed via
+    plain free() without decrementing pool->overflow_allocated, so the
+    accounting counter ratcheted up monotonically until it hit the cap and
+    every acquire fell into cond_wait forever).  Fixed in commit f253b3d
+    (2026-05-19).
+
+    With the leak fixed, 512 MB gives 2× headroom over the observed
+    ~256 MB worst-case demand, while reclaiming 512 MB of virtual address
+    space per worker (3 GB across 6 workers).  Validated during the
+    2026-05-19 afternoon flight session.
 
     Returns:
         Memory limit in bytes
     """
-    return 1024 * 1024 * 1024
+    return 512 * 1024 * 1024
 
 
 def get_default_decode_pool() -> Optional[AoDecode.BufferPool]:
