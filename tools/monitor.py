@@ -246,6 +246,12 @@ class MonitorState:
     network_high_warned: bool = False
     # Build pipeline pressure — pid → (ts, queue_size, active, max_active)
     coordinator_state: dict = field(default_factory=dict)
+    # Session peaks — coordinator_state holds the latest values per PID, but
+    # the queue can fill and drain between samples, so we track the highest
+    # depth ever seen (and when) for display.
+    bg_queue_peak: int = 0
+    bg_queue_peak_ts: Optional[datetime] = None
+    bg_queue_peak_pid: str = ""
     # Per-PID inflight builders from latest STATS (separate from coordinator
     # which only tracks BG).  Live builders are the FUSE-driven on-demand
     # builds invisible to coordinator_heartbeat.
@@ -498,9 +504,17 @@ def parse_line(state: MonitorState, line: str) -> None:
     m = _COORDINATOR_RE.search(line)
     if m:
         pid = m.group(1)
+        queue_size = int(m.group(2))
         state.coordinator_state[pid] = (
-            ts, int(m.group(2)), int(m.group(3)), int(m.group(4))
+            ts, queue_size, int(m.group(3)), int(m.group(4))
         )
+        # Track session-wide peak.  coordinator_state only holds the latest
+        # per PID; if a queue fills then drains between samples, we'd lose
+        # the high-water mark without this.
+        if queue_size > state.bg_queue_peak:
+            state.bg_queue_peak = queue_size
+            state.bg_queue_peak_ts = ts
+            state.bg_queue_peak_pid = pid
         return
 
 
@@ -738,16 +752,24 @@ def render_header(state: MonitorState) -> Panel:
 
     # BG queue depth — predictive backlog only.  Live builds don't have a
     # queue (each FUSE read triggers its own builder), so a separate metric.
+    # Shows current max-across-workers AND session peak (queues fill and
+    # drain between samples; without the peak tracker, transient backups
+    # disappear from the display the next time we render).
     if state.coordinator_state:
-        max_queue = max(c[1] for c in state.coordinator_state.values())
+        cur_max = max(c[1] for c in state.coordinator_state.values())
         queue_cap = 100
-        bar = make_bar(min(max_queue, queue_cap), queue_cap,
+        bar = make_bar(min(cur_max, queue_cap), queue_cap,
                        green_until=0.25, yellow_until=0.75)
         worst = max(state.coordinator_state.items(), key=lambda kv: kv[1][1])
         worst_str = (f"  worst=pid {worst[0]}({worst[1][1]})"
                      if worst[1][1] > 0 else "")
+        peak_str = ""
+        if state.bg_queue_peak > 0:
+            ts_str = state.bg_queue_peak_ts.strftime("%H:%M:%S") if state.bg_queue_peak_ts else "?"
+            peak_str = (f"  [dim]peak={state.bg_queue_peak} "
+                        f"(pid {state.bg_queue_peak_pid} @ {ts_str})[/dim]")
         tbl.add_row("BG queue:",
-                    f"{bar}  max_depth={max_queue}{worst_str}")
+                    f"{bar}  now={cur_max}{worst_str}{peak_str}")
 
     return Panel(tbl, title=f"AutoOrtho health  ({state.log_path})", border_style=color)
 
