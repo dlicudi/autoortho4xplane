@@ -440,7 +440,7 @@ class DynamicDDSCache:
 
             # Staleness checks (excludes ZL mismatch, handled separately)
             if self._is_stale(meta, tile, dds_path):
-                self._delete_pair(dds_path, ddm_path)
+                self._delete_pair(dds_path, ddm_path, reason="stale")
                 self._misses += 1
                 return None
 
@@ -458,7 +458,7 @@ class DynamicDDSCache:
                     log.debug(f"DDS cache: ZL downgrade available {tile_id} "
                               f"z{cached_zl} -> z{max_zoom}")
                 else:
-                    self._delete_pair(dds_path, ddm_path)
+                    self._delete_pair(dds_path, ddm_path, reason="zl_mismatch")
                 self._misses += 1
                 return None
 
@@ -486,7 +486,7 @@ class DynamicDDSCache:
                 with open(dds_path, "rb") as f:
                     raw_bytes = f.read()
             except (FileNotFoundError, OSError):
-                self._delete_pair(dds_path, ddm_path)
+                self._delete_pair(dds_path, ddm_path, reason="read_error")
                 self._misses += 1
                 return None
             _read_ms = (time.monotonic() - _read_t0) * 1000.0
@@ -497,7 +497,7 @@ class DynamicDDSCache:
                 dds_bytes = self._decompress_dds(raw_bytes, meta)
             except Exception:
                 log.debug(f"DDS cache: decompression failed for {tile_id}, removing")
-                self._delete_pair(dds_path, ddm_path)
+                self._delete_pair(dds_path, ddm_path, reason="decompress_fail")
                 self._misses += 1
                 return None
             _decomp_ms = (time.monotonic() - _decomp_t0) * 1000.0
@@ -515,7 +515,7 @@ class DynamicDDSCache:
             if tile.dds is not None and len(dds_bytes) != tile.dds.total_size:
                 log.debug(f"DDS cache: size mismatch for {tile_id} "
                           f"({len(dds_bytes)} vs {tile.dds.total_size})")
-                self._delete_pair(dds_path, ddm_path)
+                self._delete_pair(dds_path, ddm_path, reason="size_mismatch")
                 self._misses += 1
                 return None
 
@@ -1234,7 +1234,8 @@ class DynamicDDSCache:
                 old_dds_bytes = self._decompress_dds(old_raw, old_meta)
             except Exception:
                 log.debug(f"DDS upgrade: decompression failed for {old_dds_path}")
-                self._delete_pair(old_dds_path, old_ddm_path)
+                self._delete_pair(old_dds_path, old_ddm_path,
+                                  reason="upgrade_old_decompress_fail")
                 return None
 
             old_width = old_meta.get("w", 0)
@@ -1295,7 +1296,8 @@ class DynamicDDSCache:
             # Store the upgraded DDS
             if self.store(tile_id, new_max_zoom, new_dds_bytes, tile):
                 # Remove old entry
-                self._delete_pair(old_dds_path, old_ddm_path)
+                self._delete_pair(old_dds_path, old_ddm_path,
+                                  reason="upgrade_replace_old")
                 old_key = self._tile_key(tile_id, old_max_zoom)
                 with self._lock:
                     if old_key in self._entries:
@@ -1358,7 +1360,8 @@ class DynamicDDSCache:
                 old_dds_bytes = self._decompress_dds(old_raw, old_meta)
             except Exception:
                 log.debug(f"DDS downgrade: decompression failed for {old_dds_path}")
-                self._delete_pair(old_dds_path, old_ddm_path)
+                self._delete_pair(old_dds_path, old_ddm_path,
+                                  reason="downgrade_old_decompress_fail")
                 return None
 
             old_width = old_meta.get("w", 0)
@@ -1399,7 +1402,8 @@ class DynamicDDSCache:
             new_dds_bytes = bytes(new_dds)
 
             if self.store(tile_id, new_max_zoom, new_dds_bytes, tile):
-                self._delete_pair(old_dds_path, old_ddm_path)
+                self._delete_pair(old_dds_path, old_ddm_path,
+                                  reason="downgrade_replace_old")
                 old_key = self._tile_key(tile_id, old_max_zoom)
                 with self._lock:
                     if old_key in self._entries:
@@ -1439,7 +1443,7 @@ class DynamicDDSCache:
             else:
                 return False
 
-        self._delete_pair(dds_path, ddm_path)
+        self._delete_pair(dds_path, ddm_path, reason="evict_api")
         return True
 
     def evict_lru(self, bytes_to_free: int) -> int:
@@ -1465,7 +1469,7 @@ class DynamicDDSCache:
 
         # Delete files outside the lock
         for dds_path, ddm_path in to_delete:
-            self._delete_pair(dds_path, ddm_path)
+            self._delete_pair(dds_path, ddm_path, reason="evict_lru")
 
         if freed > 0:
             log.debug(f"DDS cache evicted {len(to_delete)} entries, freed {freed / (1024*1024):.1f}MB")
@@ -2376,13 +2380,29 @@ class DynamicDDSCache:
             self._network_healing_in_progress.discard(key)
 
     @staticmethod
-    def _delete_pair(dds_path: str, ddm_path: str) -> None:
-        """Delete DDS + DDM file pair, ignoring missing files."""
+    def _delete_pair(dds_path: str, ddm_path: str, reason: str = "unknown") -> None:
+        """Delete DDS + DDM file pair, ignoring missing files.
+
+        ``reason`` tags the call site for orphan-source diagnosis.  Every
+        delete here orphans the corresponding ``dds_passthrough/.dds``
+        (different directory tree), so knowing which reason fires most
+        often during a flight tells us which path to fix.  Counters are
+        bumped into the global STATS dict via getortho.bump (lazy import
+        to dodge the circular dependency at module load).
+        """
         for path in (dds_path, ddm_path):
             try:
                 os.remove(path)
             except OSError:
                 pass
+        try:
+            try:
+                from autoortho.getortho import bump as _bump
+            except ImportError:
+                from getortho import bump as _bump  # type: ignore[no-redef]
+            _bump(f'dds_cache_delete_pair:{reason}')
+        except Exception:
+            pass
 
     def _cleanup_jpegs_async(self, tile) -> None:
         """Schedule JPEG cleanup for a tile whose DDS is now complete."""

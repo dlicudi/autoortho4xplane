@@ -148,11 +148,19 @@ _BY_CLASS_KV_RE = re.compile(r"(\w+)=(\d+)")
 # the giant dict logged each ~10s.  Used to harvest counters we want to
 # display in the monitor (build phase timings, upscale path costs, layout-
 # mismatch frequencies, etc.) without writing one regex per counter.
-_STATS_KEYVAL_RE = re.compile(r"'([a-zA-Z_][a-zA-Z_0-9]*(?::\d+)?)'\s*:\s*(\d+)")
+_STATS_KEYVAL_RE = re.compile(
+    r"'([a-zA-Z_][a-zA-Z_0-9]*(?::[a-zA-Z_0-9]+)?)'\s*:\s*(\d+)"
+)
 
 # Counters we want to track from STATS for the "build perf" / "Python
 # upscale path baseline" displays.  These let us compare current Python
 # upscale costs against the future native C upscale.
+# Prefix-match keys that start with any of these strings are also tracked
+# — used for tagged-counter families like dds_cache_delete_pair:<reason>
+# where we want every variant without listing them all by hand.
+_TRACKED_STATS_PREFIXES = (
+    "dds_cache_delete_pair:",
+)
 _TRACKED_STATS_KEYS = {
     # Python upscale path (the thing the C work will replace)
     'compose_upscale_to_layout',
@@ -642,10 +650,13 @@ def _parse_pool_stats(state: MonitorState, line: str, ts: datetime) -> None:
     # grow monotonically within a session, so taking the max across
     # per-worker STATS lines gives the cumulative view (some keys are
     # global, some are per-PID-tagged like "tile_count:53873" — we treat
-    # them uniformly here).
+    # them uniformly here).  Tagged counter families (anything starting
+    # with one of _TRACKED_STATS_PREFIXES) are captured too — currently
+    # used for dds_cache_delete_pair:<reason> orphan-source diagnosis.
     for m in _STATS_KEYVAL_RE.finditer(line):
         key = m.group(1)
-        if key in _TRACKED_STATS_KEYS:
+        if (key in _TRACKED_STATS_KEYS
+                or any(key.startswith(p) for p in _TRACKED_STATS_PREFIXES)):
             val = int(m.group(2))
             prev = state.tracked_stats.get(key, 0)
             if val > prev:
@@ -962,6 +973,26 @@ def render_build_perf(state: MonitorState) -> Panel:
              "phase_gen_mipmaps_ms_total",
              ["phase_gen_mipmaps_slow_100ms"],
              [">100ms"])
+
+    # ── Cache-delete sites (orphan-source diagnosis) ──────────
+    # Each _delete_pair call site in dynamic_dds_cache.py is tagged with
+    # a reason; bumping dds_cache_delete_pair:<reason> into STATS lets us
+    # see which one is generating orphans (passthrough .dds files whose
+    # matching DDM gets deleted here).
+    section("Cache delete sites (orphan sources — _delete_pair callers)")
+    delete_keys = sorted(
+        k for k in s.keys() if k.startswith("dds_cache_delete_pair:")
+    )
+    if not delete_keys:
+        row("  (no deletes recorded yet)", "[dim]0[/dim]", dim=True)
+    else:
+        total = sum(s[k] for k in delete_keys)
+        for k in delete_keys:
+            reason = k.split(":", 1)[1]
+            v = s[k]
+            pct = (v / total * 100) if total > 0 else 0
+            row(f"  {reason}:", f"{v}  ({pct:.0f}%)")
+        row("  [bold]total deletes:[/bold]", f"[bold]{total}[/bold]")
 
     # ── Build path outcomes ────────────────────────────────────
     section("Build path outcomes")
