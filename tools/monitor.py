@@ -702,12 +702,7 @@ def render_header(state: MonitorState) -> Panel:
 
     # Build pressure: combined live + BG.  Live builds are FUSE-driven and
     # bypass the coordinator queue, so the coordinator alone undercounts
-    # actual builder activity during heavy fresh-load bursts.  Also append
-    # the latest FUSE tile-class read count as an X-Plane demand signal —
-    # streaming_builder_held_* only counts native streaming-pool builders,
-    # but tile-class reads include hybrid/python paths and in-flight tile
-    # object reads, so it's a broader proxy for "X-Plane is asking for new
-    # stuff right now."
+    # actual builder activity during heavy fresh-load bursts.
     if state.coordinator_state or state.live_builders:
         bg_active = sum(c[2] for c in state.coordinator_state.values())
         total_bg_slots = sum(c[3] for c in state.coordinator_state.values())
@@ -718,14 +713,28 @@ def render_header(state: MonitorState) -> Panel:
         visual_cap = max(total_bg_slots * 2, 24) if total_bg_slots else max(24, total_active)
         bar = make_bar(total_active, visual_cap,
                        green_until=0.4, yellow_until=0.75)
-        demand_str = ""
-        if sample and sample.by_class:
-            by_class = parse_by_class(sample.by_class)
-            tile_reads = by_class.get("tile", 0)
-            demand_str = f"  | last-window tile reads: {tile_reads}"
         tbl.add_row("Build slots:",
                     f"{bar}  {total_active} active "
-                    f"({live_held} live + {bg_active}/{total_bg_slots} BG){demand_str}")
+                    f"({live_held} live + {bg_active}/{total_bg_slots} BG)")
+
+    # Live demand — tile-class reads in the latest FUSE window.  This is
+    # the "X-Plane asking for new stuff right now" signal that bypasses
+    # the BG coordinator queue entirely (each FUSE read fires its own
+    # on-demand builder).  streaming_builder_held_live + BG queue both
+    # undercount actual demand during cold-load bursts because builds
+    # often complete between STATS samples.  Reference cap 2000 reads/min
+    # covers the calm-to-saturated range:
+    #   <500   = calm cruise   |   500-1500 = active   |   1500+ = heavy/cold
+    if sample and sample.by_class:
+        by_class = parse_by_class(sample.by_class)
+        tile_reads = by_class.get("tile", 0)
+        demand_cap = 2000
+        bar = make_bar(min(tile_reads, demand_cap), demand_cap,
+                       green_until=0.25, yellow_until=0.75)
+        slow_str = (f"  [yellow]{sample.slow_500ms} slow_500ms[/yellow]"
+                    if sample.slow_500ms > 0 else "")
+        tbl.add_row("Live demand:",
+                    f"{bar}  {tile_reads} tile reads/min{slow_str}")
 
     # BG queue depth — predictive backlog only.  Live builds don't have a
     # queue (each FUSE read triggers its own builder), so a separate metric.
