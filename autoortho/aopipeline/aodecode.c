@@ -716,13 +716,18 @@ static int decode_jpeg_internal(
     int from_pool = 0;
     
     if (pool && width == CHUNK_SIZE && height == CHUNK_SIZE) {
-        /* Standard chunk size - try to use pool */
+        /* Standard chunk size - acquire from pool (fixed or overflow path).
+         * Mark from_pool=1 for ANY non-NULL buffer so aodecode_free_image
+         * routes through aodecode_release_buffer.  release_buffer
+         * distinguishes fixed vs overflow via pointer arithmetic and keeps
+         * pool->overflow_allocated accurate.  Previously this only set
+         * from_pool=1 when the buffer was inside pool->memory, so overflow
+         * buffers were free()'d directly and their overflow_allocated
+         * increment from acquire_buffer was never decremented — the
+         * counter ratcheted up monotonically until the memory_limit cap
+         * was hit and all acquires deadlocked. */
         buffer = aodecode_acquire_buffer(pool);
-        /* Check if it's actually from the pool */
-        if (pool->memory && buffer >= pool->memory && 
-            buffer < pool->memory + ((size_t)pool->count * CHUNK_RGBA_BYTES)) {
-            from_pool = 1;
-        }
+        from_pool = (buffer != NULL);
     } else {
         /* Non-standard size - must malloc */
         buffer = (uint8_t*)malloc((size_t)width * height * 4);
