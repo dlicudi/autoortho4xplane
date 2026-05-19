@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+from rich.columns import Columns
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -166,6 +167,8 @@ _STATS_KEYVAL_RE = re.compile(
 # where we want every variant without listing them all by hand.
 _TRACKED_STATS_PREFIXES = (
     "dds_cache_delete_pair:",
+    "mark_passthrough_complete:",
+    "is_stale_",
 )
 _TRACKED_STATS_KEYS = {
     # Python upscale path (the thing the C work will replace)
@@ -991,121 +994,117 @@ def render_counters(state: MonitorState) -> Panel:
 
 
 def render_build_perf(state: MonitorState) -> Panel:
-    """Display Python upscale path baseline + native build phase timings.
-
-    Designed to support the "should we port upscale to native C?" decision —
-    shows the time/count of every code path that would benefit, side-by-side
-    with the layout-mismatch frequency that drives them.
-    """
+    """Two-column build perf panel: timings on the left, counters on the right."""
     s = state.tracked_stats
-    tbl = Table.grid(padding=(0, 2))
-    tbl.add_column(style="bold")
-    tbl.add_column(justify="right")
 
-    def row(label: str, value: str, dim: bool = False) -> None:
-        tbl.add_row(label, f"[dim]{value}[/dim]" if dim else value)
+    def make_table() -> Table:
+        t = Table.grid(padding=(0, 1))
+        t.add_column(style="bold")
+        t.add_column(justify="right")
+        return t
 
-    def section(title: str) -> None:
-        tbl.add_row("", "")
-        tbl.add_row(f"[bold cyan]{title}[/bold cyan]", "")
+    def row(t: Table, label: str, value: str, dim: bool = False) -> None:
+        t.add_row(label, f"[dim]{value}[/dim]" if dim else value)
 
-    def avg_ms(count_key: str, total_key: str) -> Optional[float]:
-        cnt = s.get(count_key, 0)
-        tot = s.get(total_key, 0)
-        if cnt > 0:
-            return tot / cnt
-        return None
+    def section(t: Table, title: str) -> None:
+        t.add_row(f"[bold cyan]{title}[/bold cyan]", "")
 
-    def fmt_perf(label: str, count_key: str, total_key: str,
+    def fmt_perf(t: Table, label: str, count_key: str, total_key: str,
                  slow_keys: list, slow_labels: list) -> None:
         cnt = s.get(count_key, 0)
         tot = s.get(total_key, 0)
         if cnt == 0:
-            row(label, "[dim]no events[/dim]", dim=True)
+            row(t, label, "[dim]—[/dim]", dim=True)
             return
         avg = tot / cnt
-        slow_parts = []
-        for sk, sl in zip(slow_keys, slow_labels):
-            slow_parts.append(f"{sl}={s.get(sk, 0)}")
-        slow_str = "  " + "  ".join(slow_parts) if slow_parts else ""
-        row(label,
-            f"N={cnt}  avg={avg:.1f}ms  total={tot/1000:.1f}s{slow_str}")
+        slow = " ".join(f"{sl}={s.get(sk, 0)}"
+                        for sk, sl in zip(slow_keys, slow_labels))
+        row(t, label, f"N={cnt} avg={avg:.1f}ms {slow}")
 
-    # ── Python upscale baseline ────────────────────────────────
-    section("Python upscale path (Δ vs future native C)")
-    fmt_perf("  compose_upscale_to_layout:",
+    left = make_table()
+    right = make_table()
+
+    # ── LEFT: timing data ─────────────────────────────────────
+    section(left, "Python upscale path")
+    fmt_perf(left, "  upscale_to_layout:",
              "compose_upscale_to_layout",
              "compose_upscale_to_layout_ms_total",
              ["compose_upscale_to_layout_slow_10ms",
               "compose_upscale_to_layout_slow_50ms"],
-             [">10ms", ">50ms"])
-    fmt_perf("  build_all_mipmaps_from_mm0:",
+             [">10", ">50"])
+    fmt_perf(left, "  mipmaps_from_mm0:",
              "build_all_mipmaps_from_mm0",
              "build_all_mipmaps_from_mm0_ms_total",
              ["build_all_mipmaps_from_mm0_slow_50ms",
               "build_all_mipmaps_from_mm0_slow_250ms"],
-             [">50ms", ">250ms"])
+             [">50", ">250"])
 
-    # ── Layout-mismatch frequency ──────────────────────────────
-    section("Layout-mismatch frequency (Python fallback triggers)")
-    for key, label in (
-        ("streaming_prefetch_skip_layout_mismatch", "  streaming_prefetch_skip:"),
-        ("background_build_force_python_layout_mismatch", "  background_build_force_python:"),
-        ("partial_build_python_fallback", "  partial_build_python_fallback:"),
-    ):
-        v = s.get(key, 0)
-        row(label, f"{v}" if v else "[dim]0[/dim]", dim=(v == 0))
-
-    # ── Native build phase timings ─────────────────────────────
-    section("Native build phase timings")
-    fmt_perf("  phase_native_partial:",
+    section(left, "Native build phases")
+    fmt_perf(left, "  native_partial:",
              "phase_native_partial_count",
              "phase_native_partial_ms_total",
-             ["phase_native_partial_slow_100ms"],
-             [">100ms"])
-    fmt_perf("  phase_get_img:",
+             ["phase_native_partial_slow_100ms"], [">100"])
+    fmt_perf(left, "  get_img:",
              "phase_get_img_count",
              "phase_get_img_ms_total",
-             ["phase_get_img_slow_100ms", "phase_get_img_slow_500ms"],
-             [">100ms", ">500ms"])
-    fmt_perf("  phase_gen_mipmaps:",
+             ["phase_get_img_slow_100ms",
+              "phase_get_img_slow_500ms"], [">100", ">500"])
+    fmt_perf(left, "  gen_mipmaps:",
              "phase_gen_mipmaps_count",
              "phase_gen_mipmaps_ms_total",
-             ["phase_gen_mipmaps_slow_100ms"],
-             [">100ms"])
+             ["phase_gen_mipmaps_slow_100ms"], [">100"])
 
-    # ── Cache-delete sites (orphan-source diagnosis) ──────────
-    # Each _delete_pair call site in dynamic_dds_cache.py is tagged with
-    # a reason; bumping dds_cache_delete_pair:<reason> into STATS lets us
-    # see which one is generating orphans (passthrough .dds files whose
-    # matching DDM gets deleted here).
-    section("Cache delete sites (orphan sources — _delete_pair callers)")
-    delete_keys = sorted(
-        k for k in s.keys() if k.startswith("dds_cache_delete_pair:")
-    )
+    # ── RIGHT: counter data (orphan diagnostics + outcomes) ───
+    section(right, "Cache delete sites (orphan sources)")
+    delete_keys = sorted(k for k in s.keys()
+                         if k.startswith("dds_cache_delete_pair:"))
     if not delete_keys:
-        row("  (no deletes recorded yet)", "[dim]0[/dim]", dim=True)
+        row(right, "  (none)", "[dim]0[/dim]", dim=True)
     else:
         total = sum(s[k] for k in delete_keys)
         for k in delete_keys:
             reason = k.split(":", 1)[1]
             v = s[k]
             pct = (v / total * 100) if total > 0 else 0
-            row(f"  {reason}:", f"{v}  ({pct:.0f}%)")
-        row("  [bold]total deletes:[/bold]", f"[bold]{total}[/bold]")
+            row(right, f"  {reason}:", f"{v} ({pct:.0f}%)")
+        row(right, "  [bold]total:[/bold]", f"[bold]{total}[/bold]")
 
-    # ── Build path outcomes ────────────────────────────────────
-    section("Build path outcomes")
+    section(right, "DDM marker writes")
     for key, label in (
-        ("prebuilt_dds_builds", "  prebuilt_dds_builds:"),
-        ("prebuilt_dds_builds_streaming", "  prebuilt_dds_builds_streaming:"),
-        ("prebuilt_dds_skipped_locked", "  prebuilt_dds_skipped_locked:"),
-        ("prebuilt_dds_skip_closed", "  prebuilt_dds_skip_closed:"),
+        ("mark_passthrough_complete:preserved_existing", "  preserved:"),
+        ("mark_passthrough_complete:fresh_default_none", "  fresh:"),
     ):
         v = s.get(key, 0)
-        row(label, f"{v}" if v else "[dim]0[/dim]", dim=(v == 0))
+        row(right, label, f"{v}" if v else "[dim]0[/dim]", dim=(v == 0))
 
-    return Panel(tbl, title="Build perf (baseline for native upscale comparison)",
+    section(right, "_is_stale rule breakdown")
+    for key, label in (
+        ("is_stale_rule0_version", "  rule0_version:"),
+        ("is_stale_rule1_format", "  rule1_format:"),
+        ("is_stale_rule2_compressor", "  rule2_compressor:"),
+        ("is_stale_rule3_size_mismatch", "  rule3_size_mismatch:"),
+        ("is_stale_rule3_file_missing", "  rule3_file_missing:"),
+    ):
+        v = s.get(key, 0)
+        if v:
+            row(right, label, f"{v}")
+
+    section(right, "Build outcomes / fallbacks")
+    for key, label in (
+        ("prebuilt_dds_builds", "  prebuilt:"),
+        ("prebuilt_dds_builds_streaming", "  streaming:"),
+        ("prebuilt_dds_skipped_locked", "  skip_locked:"),
+        ("prebuilt_dds_skip_closed", "  skip_closed:"),
+        ("background_build_force_python_layout_mismatch", "  py_fallback_bg:"),
+        ("partial_build_python_fallback", "  py_fallback_partial:"),
+        ("streaming_prefetch_skip_layout_mismatch", "  prefetch_skip:"),
+    ):
+        v = s.get(key, 0)
+        if v:
+            row(right, label, f"{v}")
+
+    return Panel(Columns([left, right], equal=True, expand=True),
+                 title="Build perf",
                  border_style="magenta")
 
 
