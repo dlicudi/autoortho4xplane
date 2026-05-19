@@ -11889,18 +11889,33 @@ class TileCacher(object):
                 log.warning(f"Rejected uniform (missing_color) tile {t.id} from passthrough cache")
                 return
 
-            # Write the DDM marker before publishing the .dds so a concurrent
-            # _get_disk_dds_path caller never sees the passthrough file with a
-            # missing DDM and deletes it as an orphan (autoortho_fuse.py:794).
-            # The all(mm.retrieved ...) guard above proves the DDM accurately
-            # reflects state.
-            ddm_written = dynamic_dds_cache.mark_passthrough_complete(t.id, t.max_zoom, t)
+            # Write the canonical cache pair (compressed DDS + matching DDM)
+            # before publishing the passthrough.  Previously this called
+            # mark_passthrough_complete which wrote only a DDM marker with
+            # hardcoded disk_compression="none", relying on the BG
+            # store_from_file path to fill in the actual cache file later.
+            # That path runs for ~2% of live-built tiles, so the other 98%
+            # ended up with a DDM pointing at a file that never got written
+            # — _is_stale Rule 3 then fired (file_missing), deleted the
+            # DDM, and forced a full rebuild on next visit.  Writing the
+            # cache file inline closes that gap.
+            try:
+                with open(tmp_path, "rb") as f:
+                    dds_bytes = f.read()
+                stored = dynamic_dds_cache.store(
+                    t.id, t.max_zoom, dds_bytes, t,
+                    mm0_missing_indices=None,
+                    mm0_fallback_indices=None,
+                )
+            except Exception as e:
+                log.debug(f"live_save: store() failed for {t.id}: {e}")
+                stored = False
 
             os.replace(tmp_path, pt_path)
             bump('dds_passthrough_live_save')
             log.debug(f"Saved live-built tile {t.id} to passthrough cache")
 
-            if ddm_written:
+            if stored:
                 bump('dds_passthrough_live_save_with_ddm')
         except Exception as e:
             log.debug(f"Failed to save tile to passthrough: {e}")

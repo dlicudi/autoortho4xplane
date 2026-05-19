@@ -342,10 +342,10 @@ class DynamicDDSCache:
 
     def _is_stale(self, meta: dict, tile, dds_path: str) -> bool:
         """Check if a cached DDS entry is stale and needs rebuilding.
-        
+
         NOTE: Does NOT check ZL mismatch. ZL upgrades are handled separately
         in load() via find_upgrade_candidate() to enable mipmap shifting.
-        
+
         Staleness rules:
         1. fmt != current DXT format -> config changed
         2. comp != current compressor -> config changed
@@ -356,6 +356,17 @@ class DynamicDDSCache:
         except ImportError:
             from aoconfig import CFG  # type: ignore[no-redef]
 
+        def _bump_stale(tag: str) -> None:
+            """Counter for which Rule fired — orphan-source diagnosis."""
+            try:
+                try:
+                    from autoortho.getortho import bump as _b
+                except ImportError:
+                    from getortho import bump as _b  # type: ignore[no-redef]
+                _b(f"is_stale_{tag}")
+            except Exception:
+                pass
+
         # Rule 0: DDM schema version.  v<4 entries were written when DDS dims
         # followed the build zoom instead of layout_zoom; their cached bytes
         # don't match the new DDS layout.
@@ -363,6 +374,7 @@ class DynamicDDSCache:
         if meta_v < DDM_VERSION:
             log.debug(f"DDS stale: DDM version {meta_v} < current {DDM_VERSION} "
                       f"(layout-zoom change requires rebuild)")
+            _bump_stale("rule0_version")
             return True
 
         # Rule 1: DXT format changed
@@ -373,12 +385,14 @@ class DynamicDDSCache:
             current_fmt = "BC3"
         if meta.get("fmt") != current_fmt:
             log.debug(f"DDS stale: format changed ({meta.get('fmt')} -> {current_fmt})")
+            _bump_stale("rule1_format")
             return True
 
         # Rule 2: Compressor changed
         current_comp = CFG.pydds.compressor.upper()
         if meta.get("comp") != current_comp:
             log.debug(f"DDS stale: compressor changed ({meta.get('comp')} -> {current_comp})")
+            _bump_stale("rule2_compressor")
             return True
 
         # Rule 3: File size validation (uncompressed files only)
@@ -391,8 +405,10 @@ class DynamicDDSCache:
                     actual_size = os.path.getsize(dds_path)
                     if actual_size != expected_size:
                         log.debug(f"DDS stale: size mismatch ({actual_size} vs {expected_size})")
+                        _bump_stale("rule3_size_mismatch")
                         return True
                 except OSError:
+                    _bump_stale("rule3_file_missing")
                     return True
 
         return False
@@ -620,6 +636,23 @@ class DynamicDDSCache:
         already in dds_passthrough/ where the existing serve path
         expects it.
 
+        CRITICAL: disk_compression preservation.  The DDM is written to
+        dds_cache/, which may already contain a (possibly zstd-compressed)
+        DDS from a previous store().  Earlier versions of this function
+        hardcoded disk_compression="none" (reasoning: the *passthrough*
+        file is uncompressed), but the DDM is the metadata for the
+        *cache* file — which may be zstd.  Overwriting with "none"
+        produced a metadata/data mismatch: file zstd, DDM says
+        uncompressed → _is_stale Rule 3 fired → _delete_pair removed the
+        cache pair → passthrough orphaned at next scan.  Diagnosed
+        2026-05-19 from 47 z17 tiles whose .ddm mtime was newer than
+        their .dds mtime AND whose data zstd-decompressed cleanly.
+
+        Fix: read any existing DDM and preserve its disk_compression.
+        Only default to "none" when no DDM exists (genuinely fresh).
+        Side-effect: bump a counter so we can see which branch fired
+        and verify the fix worked.
+
         Returns True on success, False on failure (non-critical).
         """
         if not self._enabled:
@@ -629,15 +662,33 @@ class DynamicDDSCache:
                 tile.row, tile.col, tile.maptype,
                 tile.tilename_zoom, max_zoom
             )
+            # Preserve disk_compression from any existing DDM.  See the
+            # docstring for the "47 zstd files mis-labeled as none" bug
+            # this guards against.
+            existing = self._read_ddm(ddm_path)
+            if existing is not None:
+                disk_compression = existing.get("disk_compression", "none")
+                bump_tag = "preserved_existing"
+            else:
+                disk_compression = "none"
+                bump_tag = "fresh_default_none"
             dds_format, compressor = self._get_format_and_compressor()
             meta = self._build_ddm(
                 tile, max_zoom, dds_format, compressor,
                 mm0_missing_indices=None,
                 mm0_fallback_indices=None,
-                disk_compression="none",  # passthrough is uncompressed
+                disk_compression=disk_compression,
             )
             os.makedirs(os.path.dirname(ddm_path), exist_ok=True)
             self._write_ddm(ddm_path, meta)
+            try:
+                try:
+                    from autoortho.getortho import bump as _bump
+                except ImportError:
+                    from getortho import bump as _bump  # type: ignore[no-redef]
+                _bump(f"mark_passthrough_complete:{bump_tag}")
+            except Exception:
+                pass
             return True
         except Exception as e:
             log.debug(f"mark_passthrough_complete failed for {tile_id}: {e}")
@@ -2379,22 +2430,25 @@ class DynamicDDSCache:
         with self._lock:
             self._network_healing_in_progress.discard(key)
 
-    @staticmethod
-    def _delete_pair(dds_path: str, ddm_path: str, reason: str = "unknown") -> None:
-        """Delete DDS + DDM file pair, ignoring missing files.
+    def _delete_pair(self, dds_path: str, ddm_path: str, reason: str = "unknown") -> None:
+        """Delete DDS + DDM file pair, and the matching passthrough copy.
 
         ``reason`` tags the call site for orphan-source diagnosis.  Every
-        delete here orphans the corresponding ``dds_passthrough/.dds``
-        (different directory tree), so knowing which reason fires most
-        often during a flight tells us which path to fix.  Counters are
-        bumped into the global STATS dict via getortho.bump (lazy import
-        to dodge the circular dependency at module load).
+        delete here used to orphan the corresponding ``dds_passthrough/.dds``
+        because the passthrough lives in a separate directory tree and
+        was never touched.  That left the disk full of files the cache
+        could no longer validate (no matching DDM) and broke
+        ``evict_lru``'s budget accounting (eviction freed the cache copy
+        but not the larger uncompressed passthrough copy).  Both copies
+        are now removed in the same call so the cache invariant
+        "passthrough exists ⇒ cache pair exists" is preserved.
         """
         for path in (dds_path, ddm_path):
             try:
                 os.remove(path)
             except OSError:
                 pass
+        self._invalidate_passthrough(dds_path)
         try:
             try:
                 from autoortho.getortho import bump as _bump
