@@ -8298,6 +8298,7 @@ class Tile(object):
         Returns True on success (or already-built), False if mm0 image
         wasn't producible (caller should fall through to slower paths).
         """
+        _bam_t0 = time.monotonic()
         with self._lock:
             if self.dds is None or self._closed:
                 return False
@@ -8323,8 +8324,25 @@ class Tile(object):
                     self.dds.gen_mipmaps(img0_layout, startmipmap=0, maxmipmaps=99)
                 finally:
                     self.ready.set()
-        bump('build_all_mipmaps_from_mm0')
-        log.debug(f"_build_all_mipmaps_from_mm0: built mm0..mm{self.max_mipmap} for {self}")
+        # Timing baseline: the full Python upscale-and-build path.  This is
+        # the total cost we're paying when build_zoom < layout_zoom — what
+        # the native C upscale work will eliminate.  Populates:
+        #   build_all_mipmaps_from_mm0          — count (existing)
+        #   build_all_mipmaps_from_mm0_ms_total — cumulative ms
+        #   build_all_mipmaps_from_mm0_slow_50ms  / _slow_250ms — tail
+        _bam_ms = int((time.monotonic() - _bam_t0) * 1000)
+        try:
+            bump_many({
+                'build_all_mipmaps_from_mm0': 1,
+                'build_all_mipmaps_from_mm0_ms_total': _bam_ms,
+            })
+            if _bam_ms > 50:
+                bump('build_all_mipmaps_from_mm0_slow_50ms')
+            if _bam_ms > 250:
+                bump('build_all_mipmaps_from_mm0_slow_250ms')
+        except Exception:
+            pass
+        log.debug(f"_build_all_mipmaps_from_mm0: built mm0..mm{self.max_mipmap} for {self} in {_bam_ms}ms")
         return True
 
     def _upscale_to_layout(self, img, mipmap):
@@ -8369,11 +8387,32 @@ class Tile(object):
                 # Re-check after lock acquisition — close() may have run.
                 if self._closed or getattr(img, '_freed', False):
                     return img
+                # Timing baseline: total wall-clock cost of the Python
+                # upscale path (orchestration + ctypes call + C upscale).
+                # Captured so the future native C upscale implementation
+                # in aodds.c can be compared apples-to-apples.  Populates:
+                #   compose_upscale_to_layout         — count of upscales
+                #   compose_upscale_to_layout_ms_total — cumulative ms
+                #   compose_upscale_to_layout_slow_10ms — count over 10ms
+                #   compose_upscale_to_layout_slow_50ms — count over 50ms
+                _up_t0 = time.monotonic()
                 upscaled = img.crop_and_upscale(0, 0, src_w, src_h, scale)
-            bump('compose_upscale_to_layout')
+                _up_ms = int((time.monotonic() - _up_t0) * 1000)
+            try:
+                bump_many({
+                    'compose_upscale_to_layout': 1,
+                    'compose_upscale_to_layout_ms_total': _up_ms,
+                })
+                if _up_ms > 10:
+                    bump('compose_upscale_to_layout_slow_10ms')
+                if _up_ms > 50:
+                    bump('compose_upscale_to_layout_slow_50ms')
+            except Exception:
+                pass
             log.debug(
                 f"compose upscale: {self} mipmap={mipmap} "
-                f"{src_w}x{src_h} -> {src_w*scale}x{src_h*scale} (target {target_w}x{target_h})"
+                f"{src_w}x{src_h} -> {src_w*scale}x{src_h*scale} (target {target_w}x{target_h}) "
+                f"in {_up_ms}ms"
             )
             return upscaled
         except Exception as e:

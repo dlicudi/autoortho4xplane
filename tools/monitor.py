@@ -144,6 +144,47 @@ _INFLIGHT_BUILDERS_RE = re.compile(
 # "disk_passthrough=1672(0slow,0.0ms_avg),tile=178(30slow,9.3ms_avg)"
 _BY_CLASS_KV_RE = re.compile(r"(\w+)=(\d+)")
 
+# Generic STATS-dict key/value extractor — captures `'name': int_value` from
+# the giant dict logged each ~10s.  Used to harvest counters we want to
+# display in the monitor (build phase timings, upscale path costs, layout-
+# mismatch frequencies, etc.) without writing one regex per counter.
+_STATS_KEYVAL_RE = re.compile(r"'([a-zA-Z_][a-zA-Z_0-9]*(?::\d+)?)'\s*:\s*(\d+)")
+
+# Counters we want to track from STATS for the "build perf" / "Python
+# upscale path baseline" displays.  These let us compare current Python
+# upscale costs against the future native C upscale.
+_TRACKED_STATS_KEYS = {
+    # Python upscale path (the thing the C work will replace)
+    'compose_upscale_to_layout',
+    'compose_upscale_to_layout_ms_total',
+    'compose_upscale_to_layout_slow_10ms',
+    'compose_upscale_to_layout_slow_50ms',
+    'build_all_mipmaps_from_mm0',
+    'build_all_mipmaps_from_mm0_ms_total',
+    'build_all_mipmaps_from_mm0_slow_50ms',
+    'build_all_mipmaps_from_mm0_slow_250ms',
+    # Layout mismatch frequency (how often Python path fires)
+    'streaming_prefetch_skip_layout_mismatch',
+    'background_build_force_python_layout_mismatch',
+    'partial_build_python_fallback',
+    # Native build phase timings (already published by AO)
+    'phase_native_partial_count',
+    'phase_native_partial_ms_total',
+    'phase_native_partial_slow_100ms',
+    'phase_get_img_count',
+    'phase_get_img_ms_total',
+    'phase_get_img_slow_100ms',
+    'phase_get_img_slow_500ms',
+    'phase_gen_mipmaps_count',
+    'phase_gen_mipmaps_ms_total',
+    'phase_gen_mipmaps_slow_100ms',
+    # Build path outcomes
+    'prebuilt_dds_builds',
+    'prebuilt_dds_builds_streaming',
+    'prebuilt_dds_skipped_locked',
+    'prebuilt_dds_skip_closed',
+}
+
 
 def parse_ts(line: str) -> Optional[datetime]:
     m = _TS_RE.match(line)
@@ -252,6 +293,11 @@ class MonitorState:
     bg_queue_peak: int = 0
     bg_queue_peak_ts: Optional[datetime] = None
     bg_queue_peak_pid: str = ""
+    # Tracked STATS counters for the build-perf / Python-upscale baseline
+    # display.  STATS lines are per-worker and the broker aggregates global
+    # keys across workers — we take the max value seen since startup as
+    # the cumulative session view (counters only grow within a session).
+    tracked_stats: dict = field(default_factory=dict)
     # Per-PID inflight builders from latest STATS (separate from coordinator
     # which only tracks BG).  Live builders are the FUSE-driven on-demand
     # builds invisible to coordinator_heartbeat.
@@ -592,6 +638,19 @@ def _parse_pool_stats(state: MonitorState, line: str, ts: datetime) -> None:
         else:
             state.bg_builders[pid] = count
 
+    # Harvest tracked counters for the build-perf displays.  Counters only
+    # grow monotonically within a session, so taking the max across
+    # per-worker STATS lines gives the cumulative view (some keys are
+    # global, some are per-PID-tagged like "tile_count:53873" — we treat
+    # them uniformly here).
+    for m in _STATS_KEYVAL_RE.finditer(line):
+        key = m.group(1)
+        if key in _TRACKED_STATS_KEYS:
+            val = int(m.group(2))
+            prev = state.tracked_stats.get(key, 0)
+            if val > prev:
+                state.tracked_stats[key] = val
+
 
 # ─────────────────────────── rendering ───────────────────────────
 
@@ -820,6 +879,105 @@ def render_counters(state: MonitorState) -> Panel:
     return Panel(tbl, title="Counters (since start)", border_style="cyan")
 
 
+def render_build_perf(state: MonitorState) -> Panel:
+    """Display Python upscale path baseline + native build phase timings.
+
+    Designed to support the "should we port upscale to native C?" decision —
+    shows the time/count of every code path that would benefit, side-by-side
+    with the layout-mismatch frequency that drives them.
+    """
+    s = state.tracked_stats
+    tbl = Table.grid(padding=(0, 2))
+    tbl.add_column(style="bold")
+    tbl.add_column(justify="right")
+
+    def row(label: str, value: str, dim: bool = False) -> None:
+        tbl.add_row(label, f"[dim]{value}[/dim]" if dim else value)
+
+    def section(title: str) -> None:
+        tbl.add_row("", "")
+        tbl.add_row(f"[bold cyan]{title}[/bold cyan]", "")
+
+    def avg_ms(count_key: str, total_key: str) -> Optional[float]:
+        cnt = s.get(count_key, 0)
+        tot = s.get(total_key, 0)
+        if cnt > 0:
+            return tot / cnt
+        return None
+
+    def fmt_perf(label: str, count_key: str, total_key: str,
+                 slow_keys: list, slow_labels: list) -> None:
+        cnt = s.get(count_key, 0)
+        tot = s.get(total_key, 0)
+        if cnt == 0:
+            row(label, "[dim]no events[/dim]", dim=True)
+            return
+        avg = tot / cnt
+        slow_parts = []
+        for sk, sl in zip(slow_keys, slow_labels):
+            slow_parts.append(f"{sl}={s.get(sk, 0)}")
+        slow_str = "  " + "  ".join(slow_parts) if slow_parts else ""
+        row(label,
+            f"N={cnt}  avg={avg:.1f}ms  total={tot/1000:.1f}s{slow_str}")
+
+    # ── Python upscale baseline ────────────────────────────────
+    section("Python upscale path (Δ vs future native C)")
+    fmt_perf("  compose_upscale_to_layout:",
+             "compose_upscale_to_layout",
+             "compose_upscale_to_layout_ms_total",
+             ["compose_upscale_to_layout_slow_10ms",
+              "compose_upscale_to_layout_slow_50ms"],
+             [">10ms", ">50ms"])
+    fmt_perf("  build_all_mipmaps_from_mm0:",
+             "build_all_mipmaps_from_mm0",
+             "build_all_mipmaps_from_mm0_ms_total",
+             ["build_all_mipmaps_from_mm0_slow_50ms",
+              "build_all_mipmaps_from_mm0_slow_250ms"],
+             [">50ms", ">250ms"])
+
+    # ── Layout-mismatch frequency ──────────────────────────────
+    section("Layout-mismatch frequency (Python fallback triggers)")
+    for key, label in (
+        ("streaming_prefetch_skip_layout_mismatch", "  streaming_prefetch_skip:"),
+        ("background_build_force_python_layout_mismatch", "  background_build_force_python:"),
+        ("partial_build_python_fallback", "  partial_build_python_fallback:"),
+    ):
+        v = s.get(key, 0)
+        row(label, f"{v}" if v else "[dim]0[/dim]", dim=(v == 0))
+
+    # ── Native build phase timings ─────────────────────────────
+    section("Native build phase timings")
+    fmt_perf("  phase_native_partial:",
+             "phase_native_partial_count",
+             "phase_native_partial_ms_total",
+             ["phase_native_partial_slow_100ms"],
+             [">100ms"])
+    fmt_perf("  phase_get_img:",
+             "phase_get_img_count",
+             "phase_get_img_ms_total",
+             ["phase_get_img_slow_100ms", "phase_get_img_slow_500ms"],
+             [">100ms", ">500ms"])
+    fmt_perf("  phase_gen_mipmaps:",
+             "phase_gen_mipmaps_count",
+             "phase_gen_mipmaps_ms_total",
+             ["phase_gen_mipmaps_slow_100ms"],
+             [">100ms"])
+
+    # ── Build path outcomes ────────────────────────────────────
+    section("Build path outcomes")
+    for key, label in (
+        ("prebuilt_dds_builds", "  prebuilt_dds_builds:"),
+        ("prebuilt_dds_builds_streaming", "  prebuilt_dds_builds_streaming:"),
+        ("prebuilt_dds_skipped_locked", "  prebuilt_dds_skipped_locked:"),
+        ("prebuilt_dds_skip_closed", "  prebuilt_dds_skip_closed:"),
+    ):
+        v = s.get(key, 0)
+        row(label, f"{v}" if v else "[dim]0[/dim]", dim=(v == 0))
+
+    return Panel(tbl, title="Build perf (baseline for native upscale comparison)",
+                 border_style="magenta")
+
+
 def render_events(state: MonitorState) -> Panel:
     state.trim()
     tbl = Table.grid(padding=(0, 1))
@@ -846,7 +1004,12 @@ def render_events(state: MonitorState) -> Panel:
 
 
 def render(state: MonitorState) -> Group:
-    return Group(render_header(state), render_counters(state), render_events(state))
+    return Group(
+        render_header(state),
+        render_counters(state),
+        render_build_perf(state),
+        render_events(state),
+    )
 
 
 # ─────────────────────────── tailer ───────────────────────────
