@@ -144,6 +144,12 @@ _INFLIGHT_BUILDERS_RE = re.compile(
 # "disk_passthrough=1672(0slow,0.0ms_avg),tile=178(30slow,9.3ms_avg)"
 _BY_CLASS_KV_RE = re.compile(r"(\w+)=(\d+)")
 
+# Startup passthrough scan summary, one per worker at AO startup.
+# Format: "DDS passthrough scan: checked N, deleted M bad tiles in T ms"
+_PASSTHROUGH_SCAN_RE = re.compile(
+    r"DDS passthrough scan: checked (\d+), deleted (\d+) bad tiles in (\d+)ms"
+)
+
 # Generic STATS-dict key/value extractor — captures `'name': int_value` from
 # the giant dict logged each ~10s.  Used to harvest counters we want to
 # display in the monitor (build phase timings, upscale path costs, layout-
@@ -306,6 +312,17 @@ class MonitorState:
     # keys across workers — we take the max value seen since startup as
     # the cumulative session view (counters only grow within a session).
     tracked_stats: dict = field(default_factory=dict)
+    # Most-recent startup passthrough scan results.  Each AO startup emits
+    # one line per worker; we group by timestamp window (within ~5s of
+    # first line) and sum.  Lets us show "1099 orphans deleted at last
+    # startup" without grepping logs.
+    last_scan_ts: Optional[datetime] = None
+    last_scan_checked: int = 0
+    last_scan_deleted: int = 0
+    # Rolling window of (ts, cumulative delete-pair total) so we can
+    # compute orphan-creation rate over the last 60s.  Used by the live
+    # diagnostic readout — "orphans/min" alongside the cumulative count.
+    delete_pair_samples: deque = field(default_factory=lambda: deque(maxlen=60))
     # Per-PID inflight builders from latest STATS (separate from coordinator
     # which only tracks BG).  Live builders are the FUSE-driven on-demand
     # builds invisible to coordinator_heartbeat.
@@ -515,6 +532,22 @@ def parse_line(state: MonitorState, line: str) -> None:
         _parse_pool_stats(state, line, ts)
         return
 
+    m = _PASSTHROUGH_SCAN_RE.search(line)
+    if m:
+        checked, deleted, elapsed = (int(m.group(1)), int(m.group(2)),
+                                     int(m.group(3)))
+        # Group scan-summary lines within a 30s window as one startup scan.
+        # AO emits 6 lines (one per worker) within ~10s of startup.
+        if (state.last_scan_ts is None
+                or (ts - state.last_scan_ts).total_seconds() > 30):
+            state.last_scan_ts = ts
+            state.last_scan_checked = checked
+            state.last_scan_deleted = deleted
+        else:
+            state.last_scan_checked += checked
+            state.last_scan_deleted += deleted
+        return
+
     m = _NETWORK_ERROR_RATE_RE.search(line)
     if m:
         rate = float(m.group(1))
@@ -661,6 +694,16 @@ def _parse_pool_stats(state: MonitorState, line: str, ts: datetime) -> None:
             prev = state.tracked_stats.get(key, 0)
             if val > prev:
                 state.tracked_stats[key] = val
+
+    # Sample cumulative dds_cache_delete_pair total for orphan-rate calc.
+    # Each STATS line that reports any delete-pair counter contributes a
+    # data point.  60 samples ≈ 10 min at the ~10s STATS cadence — enough
+    # to compute "deletes per minute over last 60s" cleanly.
+    delete_total = sum(
+        v for k, v in state.tracked_stats.items()
+        if k.startswith("dds_cache_delete_pair:")
+    )
+    state.delete_pair_samples.append((ts, delete_total))
 
 
 # ─────────────────────────── rendering ───────────────────────────
@@ -819,6 +862,63 @@ def render_header(state: MonitorState) -> Panel:
                     if sample.slow_500ms > 0 else "")
         tbl.add_row("Live demand:",
                     f"{bar}  {tile_reads} tile reads/min{slow_str}")
+
+    # Unified pending count — sum of everything that could still produce
+    # work or output: BG queued + BG active + live builders held.  This
+    # is the "is AO idle right now?" number — when it's 0 the system has
+    # nothing pending and is safe to stop.  (Recent tile-class FUSE reads
+    # in the last window are completed work, not pending — not counted.)
+    if state.coordinator_state or state.live_builders:
+        bg_queued = sum(c[1] for c in state.coordinator_state.values())
+        bg_active = sum(c[2] for c in state.coordinator_state.values())
+        live_held = sum(state.live_builders.values())
+        total_pending = bg_queued + bg_active + live_held
+        if total_pending == 0:
+            pending_str = "[green]0 (idle)[/green]"
+        else:
+            pending_str = (f"[yellow]{total_pending}[/yellow] "
+                           f"({bg_queued} queued + {bg_active} BG active "
+                           f"+ {live_held} live held)")
+        tbl.add_row("Pending builds:", pending_str)
+
+    # Orphan creation rate — delta of dds_cache_delete_pair counter over
+    # the last ~60s of STATS samples.  Each delete-pair call orphans the
+    # corresponding passthrough .dds (if one exists), so this is a real-
+    # time view of orphan generation while diagnosing.
+    if len(state.delete_pair_samples) >= 2:
+        now_sample = state.delete_pair_samples[-1]
+        # Find earliest sample within the last 60s
+        cutoff = now_sample[0] - timedelta(seconds=60)
+        baseline = next(
+            (s for s in state.delete_pair_samples if s[0] >= cutoff),
+            state.delete_pair_samples[0],
+        )
+        dt = (now_sample[0] - baseline[0]).total_seconds()
+        dn = now_sample[1] - baseline[1]
+        if dt > 0:
+            rate = dn / dt * 60  # per minute
+            total = now_sample[1]
+            if dn > 0:
+                rate_str = (f"[yellow]{rate:.0f}/min[/yellow]  "
+                            f"(last 60s)  total={total}")
+            else:
+                rate_str = f"[green]0/min[/green]  (last 60s)  total={total}"
+            tbl.add_row("Cache deletes:", rate_str)
+
+    # Last startup passthrough scan — single-line summary of how many
+    # orphan files were swept at AO startup.  Saves grepping logs.
+    if state.last_scan_ts is not None:
+        ts_str = state.last_scan_ts.strftime("%H:%M:%S")
+        d = state.last_scan_deleted
+        if d == 0:
+            scan_str = f"[green]0 orphans deleted[/green]  (at {ts_str})"
+        elif d < 100:
+            scan_str = (f"[yellow]{d}[/yellow] orphans deleted of "
+                        f"{state.last_scan_checked} checked  (at {ts_str})")
+        else:
+            scan_str = (f"[red]{d}[/red] orphans deleted of "
+                        f"{state.last_scan_checked} checked  (at {ts_str})")
+        tbl.add_row("Last AO scan:", scan_str)
 
     # BG queue depth — predictive backlog only.  Live builds don't have a
     # queue (each FUSE read triggers its own builder), so a separate metric.
