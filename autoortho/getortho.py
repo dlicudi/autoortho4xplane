@@ -895,6 +895,12 @@ _active_native_builds_lock = threading.Lock()
 _finalize_to_file_sem = threading.Semaphore(1)      # BG prefetch only
 _finalize_to_buffer_sem = threading.Semaphore(2)    # Live X-Plane reads only
 
+# NOTE: previously a Semaphore(2) cap lived here to prevent the death-spiral
+# pattern when 3+ tiles simultaneously held self._lock during get_img.  The
+# proper fix (build-pin redesign in _build_all_mipmaps_from_mm0) supersedes
+# the cap — get_img no longer holds self._lock at all, so concurrent builds
+# don't compound contention on the same shared resources.  Removed 2026-05-24.
+
 # ---------------------------------------------------------------------------
 # Native build path inflight tracking
 #
@@ -6433,6 +6439,16 @@ class Tile(object):
         # evicted tiles and skip stale work.
         self._closed = False
 
+        # Build pin — counts in-flight build operations that hold AoImage
+        # references OUTSIDE self._lock.  Used by _build_all_mipmaps_from_mm0
+        # so its slow get_img call (~2s of network I/O) can run without
+        # blocking other paths on self._lock.  close() waits for pin to
+        # drain before freeing self.imgs / self.dds — without this, an
+        # evicting thread could free the AoImage buffer mid-build →
+        # segfault in aoimage_crop_and_upscale.
+        self._build_pin = 0
+        self._build_pin_cond = threading.Condition()
+
         # Bounded repair state for partial DDS cache entries missing mipmap 0.
         self._mm0_promotion_queued = False
         self._mm0_promotion_pin_until = 0.0
@@ -8369,29 +8385,46 @@ class Tile(object):
         from the same source in a single pass.  Cost is dominated by the
         mm0 BC1 compress; subsequent mipmaps are cheap.
 
-        Concurrency: holds ``self._lock`` for the entire helper.
-        ``Tile.close()`` is expected to acquire the same lock before
-        freeing ``self.imgs`` and ``self.dds`` — without this, an evicting
-        thread can free the AoImage buffer mid-``crop_and_upscale``
-        (segfault in ``aoimage_crop_and_upscale``).
+        Concurrency: uses a build-pin pattern instead of holding self._lock
+        during the entire helper.  The slow get_img call (~2s of network
+        I/O) runs OUTSIDE self._lock so other FUSE reads on the same tile
+        aren't blocked.  self._build_pin is incremented before get_img and
+        decremented in finally; Tile.close() waits for the pin to drain
+        before freeing buffers, preventing the segfault that would
+        otherwise occur if close() freed an AoImage mid-build.
+        self._lock is then taken only for the fast in-memory work (~100ms
+        native build, ~150ms Python fallback).  Net: lock-hold time drops
+        from ~2s to ~150ms, breaking the death-spiral pattern that caused
+        the 2026-05-24 XP crash without the heavy-handed semaphore cap.
 
         Idempotent: short-circuits when all mipmaps are already retrieved.
         Returns True on success (or already-built), False if mm0 image
         wasn't producible (caller should fall through to slower paths).
         """
         _bam_t0 = time.monotonic()
-        _lock_wait_t0 = time.monotonic()
-        # Track this path in the native inflight snapshot so VERY_SLOW
-        # FUSE-read warnings can attribute slow reads to a concurrent
-        # upscale rebuild holding self._lock.
-        with _native_path_count('upscale_rebuild'), self._lock:
-            _lock_wait_ms = int((time.monotonic() - _lock_wait_t0) * 1000)
-            if self.dds is None or self._closed:
+
+        # Fast-path checks without holding any lock.  Re-validated inside
+        # the lock below in case of races.
+        if self.dds is None or self._closed:
+            return False
+        if all(mm.retrieved for mm in self.dds.mipmap_list[: self.max_mipmap + 1]):
+            return True
+
+        # Acquire build pin BEFORE get_img.  Pin protects AoImage references
+        # from being freed by close() while this build is using them.  Pin is
+        # held for the entire body — released in finally below.
+        # Re-check _closed under the cond: close() sets _closed=True under
+        # the same cond before waiting for pin to drain, so this catches the
+        # race where close() set the flag but we passed the fast-path check
+        # above before that happened.
+        with self._build_pin_cond:
+            if self._closed:
                 return False
-            # Already built?
-            if all(mm.retrieved for mm in self.dds.mipmap_list[: self.max_mipmap + 1]):
-                return True
-            # Source image at build zoom — chunks exist at this level by construction.
+            self._build_pin += 1
+        try:
+            # Source image at build zoom — chunks exist at this level by
+            # construction.  Runs WITHOUT self._lock so other FUSE reads
+            # aren't blocked during chunk fetch / decode / compose (~1-3s).
             _get_img_t0 = time.monotonic()
             img0 = self.get_img(0, startrow=0, endrow=None,
                                 maxwait=self.get_maxwait(), time_budget=time_budget)
@@ -8399,50 +8432,62 @@ class Tile(object):
             if img0 is None:
                 log.debug(f"_build_all_mipmaps_from_mm0: mm0 image not available for {self}")
                 return False
-            # Re-check after I/O: tile may have been marked for close.
-            if self.dds is None or self._closed or getattr(img0, '_freed', False):
-                return False
 
-            # Try the native C layout-aware path first.  Falls back to the
-            # Python upscale+gen_mipmaps path below on any C-side failure.
-            # Gated by config so an A/B comparison or debug roll-back is
-            # possible without redeploying.
-            _use_native = getattr(CFG.autoortho, 'use_native_layout_aware_chain', True)
-            if _use_native and self._try_native_layout_aware_build():
-                self._build_origin = 'upscale_rebuild_native'
-                _bam_ms = int((time.monotonic() - _bam_t0) * 1000)
-                try:
-                    bump_many({
-                        'build_all_mipmaps_from_mm0_native': 1,
-                        'build_all_mipmaps_from_mm0_native_ms_total': _bam_ms,
-                        'build_all_mipmaps_from_mm0_lock_wait_ms_total': _lock_wait_ms,
-                        'build_all_mipmaps_from_mm0_get_img_ms_total': _get_img_ms,
-                    })
-                    if _bam_ms > 50:
-                        bump('build_all_mipmaps_from_mm0_native_slow_50ms')
-                    if _bam_ms > 250:
-                        bump('build_all_mipmaps_from_mm0_native_slow_250ms')
-                except Exception:
-                    pass
-                log.debug(
-                    f"_build_all_mipmaps_from_mm0: NATIVE built "
-                    f"mm0..mm{self.max_mipmap} for {self} in {_bam_ms}ms"
-                )
-                return True
-            # Python fallback path below.
-            if _use_native:
-                bump('build_all_mipmaps_from_mm0_native_fallback')
+            # Now take self._lock for the fast in-memory work.  Re-validate
+            # state in case the tile was closed or another thread built the
+            # mipmaps while we were doing get_img.
+            _lock_wait_t0 = time.monotonic()
+            with _native_path_count('upscale_rebuild'), self._lock:
+                _lock_wait_ms = int((time.monotonic() - _lock_wait_t0) * 1000)
+                if self.dds is None or self._closed or getattr(img0, '_freed', False):
+                    return False
+                if all(mm.retrieved for mm in self.dds.mipmap_list[: self.max_mipmap + 1]):
+                    return True  # Another thread built it during our get_img
 
-            img0_layout = self._upscale_to_layout(img0, 0)
-            if self.dds is None or self._closed:
-                return False
-            with self._dds_write_lock:
-                self.ready.clear()
-                try:
-                    # maxmipmaps=99 -> "all", pydds caps at smallest_mm internally.
-                    self.dds.gen_mipmaps(img0_layout, startmipmap=0, maxmipmaps=99)
-                finally:
-                    self.ready.set()
+                # Try the native C layout-aware path first.  Falls back to the
+                # Python upscale+gen_mipmaps path below on any C-side failure.
+                # Gated by config so an A/B comparison or debug roll-back is
+                # possible without redeploying.
+                _use_native = getattr(CFG.autoortho, 'use_native_layout_aware_chain', True)
+                if _use_native and self._try_native_layout_aware_build():
+                    self._build_origin = 'upscale_rebuild_native'
+                    _bam_ms = int((time.monotonic() - _bam_t0) * 1000)
+                    try:
+                        bump_many({
+                            'build_all_mipmaps_from_mm0_native': 1,
+                            'build_all_mipmaps_from_mm0_native_ms_total': _bam_ms,
+                            'build_all_mipmaps_from_mm0_lock_wait_ms_total': _lock_wait_ms,
+                            'build_all_mipmaps_from_mm0_get_img_ms_total': _get_img_ms,
+                        })
+                        if _bam_ms > 50:
+                            bump('build_all_mipmaps_from_mm0_native_slow_50ms')
+                        if _bam_ms > 250:
+                            bump('build_all_mipmaps_from_mm0_native_slow_250ms')
+                    except Exception:
+                        pass
+                    log.debug(
+                        f"_build_all_mipmaps_from_mm0: NATIVE built "
+                        f"mm0..mm{self.max_mipmap} for {self} in {_bam_ms}ms"
+                    )
+                    return True
+                # Python fallback path below.
+                if _use_native:
+                    bump('build_all_mipmaps_from_mm0_native_fallback')
+
+                img0_layout = self._upscale_to_layout(img0, 0)
+                if self.dds is None or self._closed:
+                    return False
+                with self._dds_write_lock:
+                    self.ready.clear()
+                    try:
+                        # maxmipmaps=99 -> "all", pydds caps at smallest_mm internally.
+                        self.dds.gen_mipmaps(img0_layout, startmipmap=0, maxmipmaps=99)
+                    finally:
+                        self.ready.set()
+        finally:
+            with self._build_pin_cond:
+                self._build_pin -= 1
+                self._build_pin_cond.notify_all()
         # Tag tile so the FUSE serve histogram can attribute reads to this
         # build path.  Diagnoses whether blurry-tile reports correlate with
         # the upscale path firing vs. the native_partial path.
@@ -11104,6 +11149,35 @@ class Tile(object):
         if self.refs > 0:
             log.warning(f"TILE: Trying to close, but has refs: {self.refs}")
             return
+
+        # Wait for any in-flight build operation to release its pin.  The
+        # build path (_build_all_mipmaps_from_mm0) holds AoImage references
+        # outside self._lock during get_img to avoid blocking FUSE reads on
+        # the same tile.  Without this wait, an evicting close() could free
+        # self.imgs while a build is still using img0 → segfault in
+        # aoimage_crop_and_upscale.  The pin is released by the build path
+        # after it's done with all AoImage references.  Typical wait: 0ms
+        # (no in-flight build); worst case: ~2-3s (slow get_img).
+        #
+        # Set self._closed = True under the pin cond BEFORE waiting so any
+        # new build attempt sees the closed flag and bails out before
+        # incrementing the pin — closes the race where close() could finish
+        # its pin wait, release the cond, and have a new build slip in
+        # before close() acquires self._lock.
+        with self._build_pin_cond:
+            self._closed = True
+            _pin_wait_t0 = time.monotonic() if self._build_pin > 0 else None
+            while self._build_pin > 0:
+                self._build_pin_cond.wait()
+            if _pin_wait_t0 is not None:
+                _pin_wait_ms = int((time.monotonic() - _pin_wait_t0) * 1000)
+                try:
+                    bump_many({
+                        'tile_close_pin_wait_ms_total': _pin_wait_ms,
+                        'tile_close_pin_wait_count': 1,
+                    })
+                except Exception:
+                    pass
 
         # Take the tile lock for the destructive cleanup phase.  This is
         # the SAME lock that build paths (_build_all_mipmaps_from_mm0, etc.)
