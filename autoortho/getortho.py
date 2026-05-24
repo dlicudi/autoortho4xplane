@@ -12222,6 +12222,8 @@ class TileCacher(object):
         """Write a fully-built tile's DDS to the passthrough cache directory."""
         tmp_path = None
         try:
+            if not getattr(CFG.autoortho, 'dds_passthrough_enabled', False):
+                return
             if dynamic_dds_cache is None or not dynamic_dds_cache._enabled:
                 return
             if t.dds is None:

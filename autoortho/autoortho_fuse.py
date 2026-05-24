@@ -717,6 +717,8 @@ class AutoOrtho(Operations):
         rejected — X-Plane reads low mip levels for distant tiles and would render
         fallback (green) terrain if those levels contain zero-filled BC1 blocks.
         """
+        if not getattr(CFG.autoortho, 'dds_passthrough_enabled', False):
+            return None
         dds_cache = getortho.dynamic_dds_cache
         if dds_cache is None or not dds_cache._enabled:
             return None

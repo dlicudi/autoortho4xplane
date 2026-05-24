@@ -332,6 +332,12 @@ fetch_threads = 32
 # Falls back to the Python path on any C-side failure.
 # Set False to force the Python path for A/B comparison or debugging.
 use_native_layout_aware_chain = True
+# DDS passthrough cache (uncompressed copies of dds_cache zstd entries for
+# faster FUSE serving).  Trades ~2x disk usage for ~10-30ms saved per cold
+# tile open via direct os.read() instead of zstd decompress.  Default False:
+# disable writes AND opens of passthrough files, serving everything from
+# dds_cache.  Flip True to compare perf with passthrough on.
+dds_passthrough_enabled = False
 # Simheaven compatibility mode.
 simheaven_compat = False
 # Using custom generated Ortho4XP tiles along with AutoOrtho.
