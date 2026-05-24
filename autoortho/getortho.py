@@ -940,6 +940,19 @@ _native_path_inflight = {
     # taken by prefetch builds).
     'finalize_sem_wait_bg': 0,          # BackgroundDDSBuilder before sem.acquire
     'finalize_sem_wait_live': 0,        # Tile._try_streaming_aopipeline_build before sem.acquire
+    # Python upscale rebuild path — held while
+    # ``Tile._build_all_mipmaps_from_mm0`` is running.  This path acquires
+    # ``self._lock`` and ``self._dds_write_lock`` and CPU-compresses up to
+    # 13 BC1 mipmaps from the upscaled mm0 — ~960ms average.  If FUSE reads
+    # are slow with ``upscale_rebuild>0`` in the snapshot, the lock-or-CPU
+    # held by this path is the cause.
+    'upscale_rebuild': 0,
+    # Native C layout-aware chain — held while
+    # ``Tile._try_native_layout_aware_build`` is running.  Replaces the
+    # Python upscale_rebuild path with C decode+compose+upscale+BC1 chain
+    # via aodds_build_layout_aware_chain.  Estimated ~250ms vs ~960ms for
+    # the Python path, and GIL-free for the heavy work.
+    'layout_aware_chain': 0,
 }
 _native_path_lock = threading.Lock()
 
@@ -6424,6 +6437,18 @@ class Tile(object):
         self._mm0_promotion_queued = False
         self._mm0_promotion_pin_until = 0.0
 
+        # Diagnostic instrumentation — per-tile lifetime tracking.  Populated
+        # by build paths and serve path; consumed by TILE_LIFETIME log in
+        # TileCacher._close_tile.  Goal: tie a tile's served-quality outcome
+        # back to which build path produced it (upscale_rebuild vs
+        # native_partial vs cached) so we can diagnose blurry-tile reports
+        # without guessing which counter is the cause.
+        self._build_origin = None      # 'upscale_rebuild' | 'native_partial' | None
+        self._serve_count = 0          # number of FUSE mm0 reads
+        self._serve_partial_count = 0  # number of mm0 reads where %retrieved < 100
+        self._max_mm0_pct_served = 0   # peak %mm0 retrieved across all serves
+        self._created_at = time.monotonic()
+
         #self.tile_condition = threading.Condition()
         if min_zoom:
             self.min_zoom = int(min_zoom)
@@ -8218,6 +8243,10 @@ class Tile(object):
                 if _np_ok:
                     # Native build succeeded - data written directly to DDS buffer
                     # (ready.set() already called inside _try_native_partial_mipmap_build)
+                    # Tag origin only when not already set by a heavier path
+                    # (e.g. an earlier upscale_rebuild that we don't want to mask).
+                    if self._build_origin is None:
+                        self._build_origin = 'native_partial'
                     return True
             bump('partial_build_python_fallback')
         elif mipmap == 0:
@@ -8351,21 +8380,59 @@ class Tile(object):
         wasn't producible (caller should fall through to slower paths).
         """
         _bam_t0 = time.monotonic()
-        with self._lock:
+        _lock_wait_t0 = time.monotonic()
+        # Track this path in the native inflight snapshot so VERY_SLOW
+        # FUSE-read warnings can attribute slow reads to a concurrent
+        # upscale rebuild holding self._lock.
+        with _native_path_count('upscale_rebuild'), self._lock:
+            _lock_wait_ms = int((time.monotonic() - _lock_wait_t0) * 1000)
             if self.dds is None or self._closed:
                 return False
             # Already built?
             if all(mm.retrieved for mm in self.dds.mipmap_list[: self.max_mipmap + 1]):
                 return True
             # Source image at build zoom — chunks exist at this level by construction.
+            _get_img_t0 = time.monotonic()
             img0 = self.get_img(0, startrow=0, endrow=None,
                                 maxwait=self.get_maxwait(), time_budget=time_budget)
+            _get_img_ms = int((time.monotonic() - _get_img_t0) * 1000)
             if img0 is None:
                 log.debug(f"_build_all_mipmaps_from_mm0: mm0 image not available for {self}")
                 return False
             # Re-check after I/O: tile may have been marked for close.
             if self.dds is None or self._closed or getattr(img0, '_freed', False):
                 return False
+
+            # Try the native C layout-aware path first.  Falls back to the
+            # Python upscale+gen_mipmaps path below on any C-side failure.
+            # Gated by config so an A/B comparison or debug roll-back is
+            # possible without redeploying.
+            _use_native = getattr(CFG.autoortho, 'use_native_layout_aware_chain', True)
+            if _use_native and self._try_native_layout_aware_build():
+                self._build_origin = 'upscale_rebuild_native'
+                _bam_ms = int((time.monotonic() - _bam_t0) * 1000)
+                try:
+                    bump_many({
+                        'build_all_mipmaps_from_mm0_native': 1,
+                        'build_all_mipmaps_from_mm0_native_ms_total': _bam_ms,
+                        'build_all_mipmaps_from_mm0_lock_wait_ms_total': _lock_wait_ms,
+                        'build_all_mipmaps_from_mm0_get_img_ms_total': _get_img_ms,
+                    })
+                    if _bam_ms > 50:
+                        bump('build_all_mipmaps_from_mm0_native_slow_50ms')
+                    if _bam_ms > 250:
+                        bump('build_all_mipmaps_from_mm0_native_slow_250ms')
+                except Exception:
+                    pass
+                log.debug(
+                    f"_build_all_mipmaps_from_mm0: NATIVE built "
+                    f"mm0..mm{self.max_mipmap} for {self} in {_bam_ms}ms"
+                )
+                return True
+            # Python fallback path below.
+            if _use_native:
+                bump('build_all_mipmaps_from_mm0_native_fallback')
+
             img0_layout = self._upscale_to_layout(img0, 0)
             if self.dds is None or self._closed:
                 return False
@@ -8376,6 +8443,10 @@ class Tile(object):
                     self.dds.gen_mipmaps(img0_layout, startmipmap=0, maxmipmaps=99)
                 finally:
                     self.ready.set()
+        # Tag tile so the FUSE serve histogram can attribute reads to this
+        # build path.  Diagnoses whether blurry-tile reports correlate with
+        # the upscale path firing vs. the native_partial path.
+        self._build_origin = 'upscale_rebuild'
         # Timing baseline: the full Python upscale-and-build path.  This is
         # the total cost we're paying when build_zoom < layout_zoom — what
         # the native C upscale work will eliminate.  Populates:
@@ -8387,6 +8458,8 @@ class Tile(object):
             bump_many({
                 'build_all_mipmaps_from_mm0': 1,
                 'build_all_mipmaps_from_mm0_ms_total': _bam_ms,
+                'build_all_mipmaps_from_mm0_lock_wait_ms_total': _lock_wait_ms,
+                'build_all_mipmaps_from_mm0_get_img_ms_total': _get_img_ms,
             })
             if _bam_ms > 50:
                 bump('build_all_mipmaps_from_mm0_slow_50ms')
@@ -8396,6 +8469,158 @@ class Tile(object):
             pass
         log.debug(f"_build_all_mipmaps_from_mm0: built mm0..mm{self.max_mipmap} for {self} in {_bam_ms}ms")
         return True
+
+    def _try_native_layout_aware_build(self) -> bool:
+        """Attempt the native C build_layout_aware_chain.  Returns True on success.
+
+        Pre-conditions (caller's responsibility):
+          - Holds ``self._lock``.
+          - Has already called ``get_img(0, ...)`` so that chunks at
+            ``self.max_zoom`` are downloaded and waited for under the
+            normal time-budget / cascade logic.
+          - ``self.dds`` and ``self._closed`` checked.
+
+        On success: writes BC1 data into ``self.dds.mipmap_list[*].databuffer``,
+        sets ``retrieved=True`` on each, and replicates the smallest mipmap
+        into the post-``smallest_mm`` slots (matching pydds gen_mipmaps).
+
+        On failure (no native lib, function missing, build failed, OOM,
+        chunk-count mismatch): returns False so the caller can fall back
+        to the Python upscale path.  Never raises.
+
+        Replaces the slow path inside ``_build_all_mipmaps_from_mm0`` —
+        Python upscale (~17 ms) + per-mipmap Python BC1 (~945 ms) becomes
+        a single C call (~250 ms estimated, OpenMP + ISPC, GIL-free).
+        """
+        try:
+            native_dds = _get_native_dds()
+            if native_dds is None:
+                return False
+            if not hasattr(native_dds, 'build_layout_aware_chain'):
+                return False
+
+            # Collect raw JPEG bytes at build_zoom.  get_img has just run
+            # so chunks are populated in self.chunks[self.max_zoom].
+            # _collect_chunks_for_zoom does NOT trigger downloads — it just
+            # walks the existing chunks dict and falls back to disk cache.
+            jpeg_datas = self._collect_chunks_for_zoom(self.max_zoom)
+            if not jpeg_datas:
+                return False
+
+            # Validate count matches the build-zoom chunks-per-row.
+            # self.chunks_per_row is set in Tile.__init__ based on
+            # (tilename_zoom - max_zoom).  Mismatch means the chunk grid
+            # is wrong shape — let the Python path handle it.
+            expected_chunk_count = self.chunks_per_row * self.chunks_per_row
+            if len(jpeg_datas) != expected_chunk_count:
+                log.debug(
+                    f"_try_native_layout_aware_build: chunk count mismatch "
+                    f"({len(jpeg_datas)} != {expected_chunk_count}) for {self}"
+                )
+                return False
+
+            # self.width is layout chunks-per-side (16 for standard tiles).
+            # When build_zoom == layout_zoom, layout_chunks_per_side ==
+            # chunks_per_side and the C function takes the no-upscale fast
+            # path (functionally identical to aodds_build_mipmap_chain).
+            layout_chunks_per_side = self.width
+
+            dxt_format = CFG.pydds.format.upper()
+            missing_color = (
+                CFG.autoortho.missing_color[0],
+                CFG.autoortho.missing_color[1],
+                CFG.autoortho.missing_color[2],
+            )
+
+            # Sub-timer: isolates the C call cost from the caller-side
+            # get_img + chunk-collection cost.  Lets us see whether the
+            # remaining latency is in get_img (network/IO bound) or in
+            # the native build (CPU bound).
+            _native_call_t0 = time.monotonic()
+            with _native_build_context() as threads:
+                with _native_path_count('layout_aware_chain'):
+                    result = native_dds.build_layout_aware_chain(
+                        jpeg_datas,
+                        layout_chunks_per_side=layout_chunks_per_side,
+                        format=dxt_format,
+                        missing_color=missing_color,
+                        max_mipmaps=0,  # all the way down to 4×4
+                        max_threads=threads,
+                    )
+            _native_call_ms = int((time.monotonic() - _native_call_t0) * 1000)
+            try:
+                bump_many({
+                    'build_all_mipmaps_from_mm0_native_call_count': 1,
+                    'build_all_mipmaps_from_mm0_native_call_ms_total': _native_call_ms,
+                })
+                if _native_call_ms > 100:
+                    bump('build_all_mipmaps_from_mm0_native_call_slow_100ms')
+                if _native_call_ms > 500:
+                    bump('build_all_mipmaps_from_mm0_native_call_slow_500ms')
+            except Exception:
+                pass
+
+            if not result.success or not result.data:
+                log.debug(
+                    f"_try_native_layout_aware_build: native build failed "
+                    f"for {self}: {result.error}"
+                )
+                return False
+
+            # The C path silently fills missing chunks with missing_color and
+            # returns success — so an all-missing input yields a uniform BC1
+            # mm0.  Detect that here so the Python fallback runs instead of
+            # the caller treating the bad data as a finished build.
+            import struct as _struct
+            _sample = min(4096, len(result.data))
+            if _sample >= 8:
+                _colors = {_struct.unpack_from('<H', result.data, _i * 8)[0]
+                           for _i in range(_sample // 8)}
+                if len(_colors) <= 3:
+                    bump('build_all_mipmaps_from_mm0_native_uniform_reject')
+                    log.debug(
+                        f"_try_native_layout_aware_build: native produced "
+                        f"uniform missing_color for {self}; falling back"
+                    )
+                    return False
+
+            # Tile may have closed mid-build; re-check before mutating state.
+            if self.dds is None or self._closed:
+                return False
+
+            with self._dds_write_lock:
+                self.ready.clear()
+                try:
+                    smallest_mm = self.dds.smallest_mm
+                    for i in range(result.mipmap_count):
+                        if i >= len(self.dds.mipmap_list):
+                            break
+                        mip_data = result.get_mipmap_data(i)
+                        if mip_data is None:
+                            continue
+                        self.dds.mipmap_list[i].databuffer = BytesIO(
+                            initial_bytes=mip_data
+                        )
+                        self.dds.mipmap_list[i].retrieved = True
+                    # Mipmaps past smallest_mm get the 4×4 BC1 block copied —
+                    # matches pydds gen_mipmaps placeholder behaviour.
+                    if (result.mipmap_count > 0
+                            and result.mipmap_count - 1 >= smallest_mm):
+                        smallest_data = result.get_mipmap_data(
+                            result.mipmap_count - 1
+                        )
+                        if smallest_data:
+                            for mm in self.dds.mipmap_list[smallest_mm + 1:]:
+                                mm.databuffer = BytesIO(
+                                    initial_bytes=smallest_data
+                                )
+                                mm.retrieved = True
+                finally:
+                    self.ready.set()
+            return True
+        except Exception as e:
+            log.debug(f"_try_native_layout_aware_build: exception {e}")
+            return False
 
     def _upscale_to_layout(self, img, mipmap):
         """Upscale a composed build image to the layout mipmap size if smaller.
@@ -8539,14 +8764,57 @@ class Tile(object):
                     _pct = _mm_done * 100 // _mm_total
                     if _pct >= 100:
                         bump('tile_serve_mm0_complete')
+                        _bucket = 'complete'
                     elif _pct >= 75:
                         bump('tile_serve_mm0_75_100')
+                        _bucket = '75_100'
                     elif _pct >= 50:
                         bump('tile_serve_mm0_50_75')
+                        _bucket = '50_75'
                     elif _pct >= 25:
                         bump('tile_serve_mm0_25_50')
+                        _bucket = '25_50'
                     else:
                         bump('tile_serve_mm0_0_25')
+                        _bucket = '0_25'
+
+                    # Cross-tabbed counter — answers "which build path is
+                    # producing the blurry serves?" without sampling logs.
+                    # Format: serve_x_zl<N>_<origin>_<bucket>
+                    # e.g. serve_x_zl18_upscale_rebuild_complete (upscale blur),
+                    #      serve_x_zl16_native_partial_0_25     (low-mm0 blur).
+                    _origin = self._build_origin or 'unknown'
+                    bump(f'serve_x_zl{self.tilename_zoom}_{_origin}_{_bucket}')
+
+                    # mm0 buffer content sampling — distinguishes "tile was
+                    # served with real data" from "tile was served with
+                    # zero-filled buffer".  Reads one BC1 block (8 bytes) at
+                    # the start of mm0 via memoryview (no IO, just memory
+                    # access).  If all-zero, X-Plane is rendering a zeroed
+                    # texture — visible as missing/black.  If filled, it's
+                    # either real ortho or missing_color fallback.
+                    try:
+                        _mm0 = _mm_list[0]
+                        _mm0_buf = getattr(_mm0, 'databuffer', None)
+                        if _mm0_buf is None:
+                            bump(f'serve_mm0_buf_none_zl{self.tilename_zoom}')
+                        else:
+                            _sample = bytes(_mm0_buf.getbuffer()[:8])
+                            if _sample == b'\x00' * 8:
+                                bump(f'serve_mm0_buf_zero_zl{self.tilename_zoom}')
+                            else:
+                                bump(f'serve_mm0_buf_filled_zl{self.tilename_zoom}')
+                    except Exception:
+                        pass
+
+                    # Per-tile serve tracking — consumed at close time to
+                    # emit TILE_LIFETIME log line.  Integer += under the GIL
+                    # is safe enough for diagnostic counters.
+                    self._serve_count += 1
+                    if _pct < 100:
+                        self._serve_partial_count += 1
+                    if _pct > self._max_mm0_pct_served:
+                        self._max_mm0_pct_served = _pct
             except Exception:
                 pass
 
@@ -9588,6 +9856,7 @@ class Tile(object):
                          f"at {col}x{row} (scale {scale_factor}x)")
                 bump('upscaled_chunk_count')
                 bump('chunk_from_cascade_fallback')
+                bump(f'chunk_from_cascade_fallback_zoom{zoom}')
                 
                 # Don't close fallback_chunk - shared pool manages lifecycle
                 # Other threads may still be using this chunk
@@ -12062,6 +12331,26 @@ class TileCacher(object):
                 return True
             log.debug(f"No more refs for {tile_id} closing...")
             t = self.tiles.pop(tile_id)
+
+        # Per-tile lifetime summary — emits one INFO line per tile close so
+        # we can correlate serve-quality outcomes with build origin without
+        # cross-referencing many counter samples.  Gated to tiles that
+        # actually served data (serve_count > 0) so prefetch-only tiles
+        # don't spam the log.  Added to diagnose blurry-tile reports.
+        try:
+            if t._serve_count > 0:
+                _lifetime_s = time.monotonic() - t._created_at
+                _origin = t._build_origin or 'unknown'
+                log.info(
+                    f"TILE_LIFETIME tile={tile_id} origin={_origin} "
+                    f"zl={t.tilename_zoom} layout_zoom={getattr(t, 'layout_zoom', '-')} "
+                    f"build_zoom={t.max_zoom} "
+                    f"serves={t._serve_count} partial={t._serve_partial_count} "
+                    f"max_mm0_pct={t._max_mm0_pct_served} "
+                    f"lifetime_s={_lifetime_s:.1f}"
+                )
+        except Exception:
+            pass
 
         # Outside lock: save to passthrough then free tile memory
         self._save_tile_to_passthrough(t)

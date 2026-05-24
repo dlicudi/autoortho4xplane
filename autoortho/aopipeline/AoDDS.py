@@ -3018,6 +3018,201 @@ def build_mipmap_chain(
         )
 
 
+def build_layout_aware_chain(
+    jpeg_datas: List[Optional[bytes]],
+    layout_chunks_per_side: int,
+    format: str = "BC1",
+    missing_color: Tuple[int, int, int] = (66, 77, 55),
+    max_mipmaps: int = 0,
+    pool: Optional[c_void_p] = None,
+    max_threads: int = 0
+) -> MipmapChainResult:
+    """
+    Build a mipmap chain at LAYOUT dimensions from chunks at BUILD dimensions.
+
+    Same as ``build_mipmap_chain`` but when ``layout_chunks_per_side`` is
+    larger than ``sqrt(len(jpeg_datas))``, the composed tile is nearest-
+    neighbor-upscaled to layout dimensions before BC1 compression.  This
+    replaces the slow Python upscale path (``Tile._build_all_mipmaps_from_mm0``)
+    with native C+OpenMP execution.
+
+    Use this when build_zoom < layout_zoom (e.g. a ZL18 filename tile built
+    from ZL17 chunks because the user's max_zoom config caps downloads).
+
+    When ``layout_chunks_per_side == sqrt(len(jpeg_datas))``, output is
+    functionally identical to ``build_mipmap_chain``.
+
+    Args:
+        jpeg_datas: List of JPEG bytes (None or b'' for missing chunks).
+                    Length must be a perfect square (build chunk count).
+        layout_chunks_per_side: Chunks-per-side at layout dimensions.
+                                Must be a power-of-2 multiple of the build
+                                chunks-per-side.
+        format: "BC1" (DXT1) or "BC3" (DXT5).
+        missing_color: RGB fill for missing chunks.
+        max_mipmaps: Cap on mipmap count (0 = all down to 4x4).
+        pool: Optional decode buffer pool.
+        max_threads: OpenMP thread cap (0 = max).
+
+    Returns:
+        MipmapChainResult sized for layout dimensions.
+    """
+    import math
+    import time
+
+    start_time = time.monotonic()
+    lib = _load_library()
+    chunk_count = len(jpeg_datas)
+
+    if chunk_count == 0:
+        return MipmapChainResult(
+            success=False, bytes_written=0, mipmap_count=0, data=None,
+            mipmap_offsets=[], mipmap_sizes=[], elapsed_ms=0.0,
+            error="No JPEG data provided"
+        )
+
+    chunks_per_side = int(math.sqrt(chunk_count))
+    if chunks_per_side * chunks_per_side != chunk_count:
+        return MipmapChainResult(
+            success=False, bytes_written=0, mipmap_count=0, data=None,
+            mipmap_offsets=[], mipmap_sizes=[], elapsed_ms=0.0,
+            error=f"chunk_count must be perfect square, got {chunk_count}"
+        )
+
+    if layout_chunks_per_side < chunks_per_side:
+        return MipmapChainResult(
+            success=False, bytes_written=0, mipmap_count=0, data=None,
+            mipmap_offsets=[], mipmap_sizes=[], elapsed_ms=0.0,
+            error=(f"layout_chunks_per_side ({layout_chunks_per_side}) "
+                   f"must be >= chunks_per_side ({chunks_per_side})")
+        )
+
+    if layout_chunks_per_side > chunks_per_side:
+        scale = layout_chunks_per_side // chunks_per_side
+        if (scale * chunks_per_side != layout_chunks_per_side
+                or (scale & (scale - 1)) != 0):
+            return MipmapChainResult(
+                success=False, bytes_written=0, mipmap_count=0, data=None,
+                mipmap_offsets=[], mipmap_sizes=[], elapsed_ms=0.0,
+                error=(f"layout_chunks_per_side ({layout_chunks_per_side}) must "
+                       f"be a power-of-2 multiple of chunks_per_side "
+                       f"({chunks_per_side})")
+            )
+
+    # Output buffer is sized for the LAYOUT tile, not the build tile.
+    layout_tile_size = layout_chunks_per_side * 256
+    fmt = FORMAT_BC1 if format.upper() in ("BC1", "DXT1") else FORMAT_BC3
+
+    total_mipmaps = 0
+    size = layout_tile_size
+    while size >= 4:
+        total_mipmaps += 1
+        size //= 2
+
+    if max_mipmaps > 0:
+        total_mipmaps = min(total_mipmaps, max_mipmaps)
+
+    output_size = 0
+    size = layout_tile_size
+    for _ in range(total_mipmaps):
+        output_size += calc_mipmap_size(size, size, format)
+        size //= 2
+        if size < 4:
+            size = 4
+
+    output_buffer = np.zeros(output_size, dtype=np.uint8)
+    mipmap_offsets_arr = (c_uint32 * total_mipmaps)()
+    mipmap_sizes_arr = (c_uint32 * total_mipmaps)()
+
+    jpeg_ptrs = (POINTER(c_uint8) * chunk_count)()
+    jpeg_sizes = (c_uint32 * chunk_count)()
+    jpeg_refs = []
+
+    for i, data in enumerate(jpeg_datas):
+        if data and len(data) > 0:
+            jpeg_refs.append(data)
+            jpeg_ptrs[i] = cast(data, POINTER(c_uint8))
+            jpeg_sizes[i] = len(data)
+        else:
+            jpeg_ptrs[i] = None
+            jpeg_sizes[i] = 0
+
+    bytes_written = c_uint32()
+    mipmap_count_out = c_int32()
+    pool_handle = pool if pool else None
+
+    # Setup ctypes signature once per library instance.
+    if not hasattr(lib, '_layout_aware_chain_setup_done'):
+        lib.aodds_build_layout_aware_chain.argtypes = [
+            POINTER(POINTER(c_uint8)),  # jpeg_data
+            POINTER(c_uint32),          # jpeg_sizes
+            c_int32,                    # chunk_count
+            c_int32,                    # layout_chunks_per_side
+            c_int32,                    # format
+            c_uint8, c_uint8, c_uint8,  # missing color
+            POINTER(c_uint8),           # output
+            c_uint32,                   # output_size
+            POINTER(c_uint32),          # bytes_written
+            POINTER(c_int32),           # mipmap_count_out
+            POINTER(c_uint32),          # mipmap_offsets
+            POINTER(c_uint32),          # mipmap_sizes
+            c_int32,                    # max_mipmaps
+            c_void_p,                   # pool
+            c_int32                     # max_threads
+        ]
+        lib.aodds_build_layout_aware_chain.restype = c_int32
+        lib._layout_aware_chain_setup_done = True
+
+    success = lib.aodds_build_layout_aware_chain(
+        jpeg_ptrs,
+        jpeg_sizes,
+        chunk_count,
+        layout_chunks_per_side,
+        fmt,
+        missing_color[0],
+        missing_color[1],
+        missing_color[2],
+        output_buffer.ctypes.data_as(POINTER(c_uint8)),
+        output_size,
+        byref(bytes_written),
+        byref(mipmap_count_out),
+        mipmap_offsets_arr,
+        mipmap_sizes_arr,
+        max_mipmaps if max_mipmaps > 0 else 0,
+        pool_handle,
+        c_int32(max_threads)
+    )
+
+    elapsed_ms = (time.monotonic() - start_time) * 1000
+
+    if success and bytes_written.value > 0:
+        result_data = bytes(output_buffer[:bytes_written.value])
+        offsets = [mipmap_offsets_arr[i] for i in range(mipmap_count_out.value)]
+        sizes = [mipmap_sizes_arr[i] for i in range(mipmap_count_out.value)]
+
+        return MipmapChainResult(
+            success=True,
+            bytes_written=bytes_written.value,
+            mipmap_count=mipmap_count_out.value,
+            data=result_data,
+            mipmap_offsets=offsets,
+            mipmap_sizes=sizes,
+            elapsed_ms=elapsed_ms,
+            error=""
+        )
+    else:
+        return MipmapChainResult(
+            success=False,
+            bytes_written=0,
+            mipmap_count=0,
+            data=None,
+            mipmap_offsets=[],
+            mipmap_sizes=[],
+            elapsed_ms=elapsed_ms,
+            error="Failed to build layout-aware mipmap chain"
+        )
+
+
 # ============================================================================
 # Native Multi-Zoom Mipmap Building
 # ============================================================================

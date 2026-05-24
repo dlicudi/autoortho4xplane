@@ -458,6 +458,60 @@ AODDS_API int32_t aodds_build_mipmap_chain(
 );
 
 /**
+ * Layout-aware mipmap chain — same as aodds_build_mipmap_chain but
+ * upscales the composed tile to layout dimensions before BC1 when
+ * layout_chunks_per_side > sqrt(chunk_count).
+ *
+ * Use this when build_zoom < layout_zoom (e.g. a ZL18 filename tile
+ * built from ZL17 chunks due to max_zoom config).  Without the upscale,
+ * BC1-compressing a smaller buffer into the layout-sized DDS slot
+ * produces a wrong-strided result (white-tile bug).
+ *
+ * When layout_chunks_per_side == sqrt(chunk_count), behavior is
+ * functionally identical to aodds_build_mipmap_chain.
+ *
+ * @param jpeg_data              Array of JPEG data pointers (NULL = missing)
+ * @param jpeg_sizes             Array of JPEG data sizes (0 = missing)
+ * @param chunk_count            Number of chunks (perfect square)
+ * @param layout_chunks_per_side Target chunks-per-side for layout dims
+ *                               (must be power-of-2 multiple of build).
+ * @param format                 Output compression format (BC1 or BC3)
+ * @param missing_r/g/b          Fill color for missing chunks
+ * @param output                 Pre-allocated output buffer for full chain
+ * @param output_size            Output buffer size in bytes
+ * @param bytes_written          Total bytes written (output)
+ * @param mipmap_count_out       Number of mipmaps generated (output)
+ * @param mipmap_offsets         Per-mipmap offset array (output)
+ * @param mipmap_sizes           Per-mipmap size array (output)
+ * @param max_mipmaps            Cap on mipmap count (0 = all down to 4×4)
+ * @param pool                   Optional decode buffer pool (may be NULL)
+ * @param max_threads            OpenMP thread cap (0 = max available)
+ *
+ * @return 1 on success, 0 on failure (bad params, OOM, or compose error).
+ *
+ * Thread Safety: Thread-safe, can be called from multiple threads.
+ */
+AODDS_API int32_t aodds_build_layout_aware_chain(
+    const uint8_t** jpeg_data,
+    const uint32_t* jpeg_sizes,
+    int32_t chunk_count,
+    int32_t layout_chunks_per_side,
+    dds_format_t format,
+    uint8_t missing_r,
+    uint8_t missing_g,
+    uint8_t missing_b,
+    uint8_t* output,
+    uint32_t output_size,
+    uint32_t* bytes_written,
+    int32_t* mipmap_count_out,
+    uint32_t* mipmap_offsets,
+    uint32_t* mipmap_sizes,
+    int32_t max_mipmaps,
+    aodecode_pool_t* pool,
+    int32_t max_threads
+);
+
+/**
  * Build ALL mipmaps from native zoom level chunks.
  * 
  * QUALITY OPTIMIZATION:

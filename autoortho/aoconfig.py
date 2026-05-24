@@ -325,6 +325,13 @@ tile_queue_enabled = True
 # Recommended: 100 (default)
 tile_queue_max_size = 100
 fetch_threads = 32
+# Use native C layout-aware mipmap chain for downgraded builds
+# (build_zoom < layout_zoom).  When enabled, the path that produces the
+# upscaled mm0 + derived mipmaps runs in C via OpenMP + ISPC instead of
+# Python PIL + per-mipmap BC1 under the GIL.  ~4x speedup expected.
+# Falls back to the Python path on any C-side failure.
+# Set False to force the Python path for A/B comparison or debugging.
+use_native_layout_aware_chain = True
 # Simheaven compatibility mode.
 simheaven_compat = False
 # Using custom generated Ortho4XP tiles along with AutoOrtho.

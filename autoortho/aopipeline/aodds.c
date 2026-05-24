@@ -2460,11 +2460,95 @@ AODDS_API int32_t aodds_build_partial_mipmap(
 
 
 /*============================================================================
+ * Nearest-neighbor in-place upscale helper.
+ *
+ * Replaces ``tile->data`` with a new malloc'd buffer of dimensions
+ * (target_size × target_size).  Frees the previous buffer.  Power-of-2
+ * scale factor only; square images only.  Mirrors the visual behavior of
+ * ``aoimage_crop_and_upscale`` so any code path that switches from the
+ * Python upscale path to this C path renders identically.
+ *
+ * Returns 1 on success, 0 on failure (caller's tile is unmodified on
+ * failure so the caller can still free tile->data normally).
+ *
+ * Added to support layout-aware DDS building: when build_zoom <
+ * layout_zoom, the composed tile arrives at the smaller build-zoom
+ * dimensions and must be upscaled to layout dimensions before BC1
+ * compression — otherwise the wrong-strided buffer produces the white-
+ * tile bug (see getortho.py:8384 history).
+ *============================================================================*/
+
+static int32_t aodds_upscale_nearest_inplace(aodecode_image_t* tile,
+                                             int32_t target_size) {
+    if (!tile || !tile->data || target_size <= 0) {
+        return 0;
+    }
+    if (tile->width != tile->height) {
+        return 0;  /* Square images only — AO tiles are always square. */
+    }
+    if (tile->width == target_size) {
+        return 1;  /* No-op; already at target. */
+    }
+    if (target_size < tile->width) {
+        return 0;  /* Downscale not supported by this helper. */
+    }
+
+    /* Power-of-2 scale check. */
+    int32_t scale = target_size / tile->width;
+    if (scale * tile->width != target_size) return 0;
+    if ((scale & (scale - 1)) != 0) return 0;
+
+    /* Overflow guard on destination buffer size. */
+    size_t dst_pixels = (size_t)target_size * (size_t)target_size;
+    if (dst_pixels / (size_t)target_size != (size_t)target_size) return 0;
+    size_t dst_bytes = dst_pixels * 4;
+    if (dst_bytes / 4 != dst_pixels) return 0;
+
+    uint8_t* dst = (uint8_t*)malloc(dst_bytes);
+    if (!dst) return 0;
+
+    /* Nearest-neighbor: replicate each src pixel scale × scale times. */
+    const uint8_t* src = tile->data;
+    int32_t src_w = tile->width;
+
+    for (int32_t sy = 0; sy < src_w; sy++) {
+        const uint8_t* src_row = src + (size_t)sy * src_w * 4;
+        for (int32_t ry = 0; ry < scale; ry++) {
+            uint8_t* dst_row = dst +
+                ((size_t)sy * scale + ry) * (size_t)target_size * 4;
+            uint8_t* dp = dst_row;
+            for (int32_t sx = 0; sx < src_w; sx++) {
+                uint8_t r = src_row[sx * 4 + 0];
+                uint8_t g = src_row[sx * 4 + 1];
+                uint8_t b = src_row[sx * 4 + 2];
+                uint8_t a = src_row[sx * 4 + 3];
+                for (int32_t rx = 0; rx < scale; rx++) {
+                    *dp++ = r;
+                    *dp++ = g;
+                    *dp++ = b;
+                    *dp++ = a;
+                }
+            }
+        }
+    }
+
+    /* Replace the buffer — original was malloc'd by the caller (tile.data
+     * is always malloc'd in the chain builders, not pool-backed). */
+    free(tile->data);
+    tile->data = dst;
+    tile->width = target_size;
+    tile->height = target_size;
+    tile->stride = target_size * 4;
+    tile->from_pool = 0;  /* New buffer is malloc'd. */
+    return 1;
+}
+
+/*============================================================================
  * Build Mipmap Chain: Generate starting mipmap + all smaller mipmaps
- * 
+ *
  * This function builds the requested mipmap level AND all smaller mipmaps
  * down to 4×4, matching the behavior of Python's gen_mipmaps().
- * 
+ *
  * Use this for on-demand mipmap building to ensure smaller mipmaps are
  * also populated, preventing NULL buffer warnings when X-Plane reads
  * into smaller mipmap positions.
@@ -2731,8 +2815,290 @@ AODDS_API int32_t aodds_build_mipmap_chain(
 }
 
 /*============================================================================
+ * Layout-Aware Mipmap Chain
+ *
+ * Same shape as ``aodds_build_mipmap_chain`` but supports the case where
+ * ``layout_chunks_per_side > chunks_per_side`` — i.e. the source chunks
+ * are at a smaller zoom (build_zoom) than what the output DDS layout
+ * expects.  Between compose and BC1, the composed tile is nearest-
+ * neighbor-upscaled to layout dimensions via ``aodds_upscale_nearest_
+ * inplace``.  Output mipmap chain is sized for layout dimensions.
+ *
+ * When ``layout_chunks_per_side == chunks_per_side`` this is functionally
+ * equivalent to ``aodds_build_mipmap_chain``.  Kept as a separate entry
+ * point (rather than modifying the existing function) so existing callers
+ * are unaffected.
+ *
+ * REPLACES: Python's ``Tile._build_all_mipmaps_from_mm0`` path
+ * (~962 ms/build via PIL + per-mipmap BC1 under GIL).  Native path should
+ * run in ~200-300 ms/build using OpenMP-parallel decode + ISPC BC1.
+ *============================================================================*/
+
+AODDS_API int32_t aodds_build_layout_aware_chain(
+    const uint8_t** jpeg_data,
+    const uint32_t* jpeg_sizes,
+    int32_t chunk_count,
+    int32_t layout_chunks_per_side,
+    dds_format_t format,
+    uint8_t missing_r,
+    uint8_t missing_g,
+    uint8_t missing_b,
+    uint8_t* output,
+    uint32_t output_size,
+    uint32_t* bytes_written,
+    int32_t* mipmap_count_out,
+    uint32_t* mipmap_offsets,
+    uint32_t* mipmap_sizes,
+    int32_t max_mipmaps,
+    aodecode_pool_t* pool,
+    int32_t max_threads
+) {
+    if (!jpeg_data || !jpeg_sizes || !output || !bytes_written ||
+        !mipmap_count_out || !mipmap_offsets || !mipmap_sizes ||
+        chunk_count <= 0 || layout_chunks_per_side <= 0) {
+        return 0;
+    }
+
+    *bytes_written = 0;
+    *mipmap_count_out = 0;
+
+    /* Build chunks must be a perfect square. */
+    int32_t chunks_per_side = (int32_t)sqrt((double)chunk_count);
+    if (chunks_per_side * chunks_per_side != chunk_count) {
+        return 0;
+    }
+
+    /* Layout must be >= build (we only upscale, never downscale here). */
+    if (layout_chunks_per_side < chunks_per_side) {
+        return 0;
+    }
+    /* And it must be a power-of-two multiple of build to fit nearest-
+     * neighbor upscale semantics. */
+    if (layout_chunks_per_side > chunks_per_side) {
+        int32_t scale = layout_chunks_per_side / chunks_per_side;
+        if (scale * chunks_per_side != layout_chunks_per_side) return 0;
+        if ((scale & (scale - 1)) != 0) return 0;
+    }
+
+    int32_t build_tile_size = chunks_per_side * CHUNK_SIZE;
+    int32_t layout_tile_size = layout_chunks_per_side * CHUNK_SIZE;
+
+    /* Mipmap chain is sized for the LAYOUT dimensions, not build. */
+    int32_t total_mipmaps = 0;
+    int32_t size = layout_tile_size;
+    while (size >= 4) {
+        total_mipmaps++;
+        size /= 2;
+    }
+    if (max_mipmaps > 0 && total_mipmaps > max_mipmaps) {
+        total_mipmaps = max_mipmaps;
+    }
+
+    uint32_t total_required = 0;
+    size = layout_tile_size;
+    for (int32_t i = 0; i < total_mipmaps; i++) {
+        total_required += aodds_calc_mipmap_size(size, size, format);
+        size /= 2;
+        if (size < 4) size = 4;
+    }
+
+    if (output_size < total_required) {
+        return 0;
+    }
+
+    /* Decode chunks (OpenMP-parallel via pooled decoders). */
+    aodecode_image_t* chunks = (aodecode_image_t*)calloc(
+        chunk_count, sizeof(aodecode_image_t)
+    );
+    if (!chunks) {
+        return 0;
+    }
+
+    int32_t decoded = 0;
+
+#if AOPIPELINE_HAS_OPENMP
+    #pragma omp parallel num_threads(max_threads > 0 ? max_threads : omp_get_max_threads()) reduction(+:decoded)
+    {
+        int decoder_from_pool = 0;
+        tjhandle tjh = acquire_pooled_decoder(&decoder_from_pool);
+
+        if (tjh) {
+            #pragma omp for schedule(static)
+            for (int32_t i = 0; i < chunk_count; i++) {
+                if (!jpeg_data[i] || jpeg_sizes[i] == 0) continue;
+
+                int width, height, subsamp, colorspace;
+                if (tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
+                                        &width, &height, &subsamp, &colorspace) < 0) {
+                    continue;
+                }
+                if (width != CHUNK_SIZE || height != CHUNK_SIZE) continue;
+
+                uint8_t* buffer;
+                int from_pool = 0;
+                if (pool) {
+                    buffer = aodecode_acquire_buffer(pool);
+                    from_pool = (buffer != NULL);
+                } else {
+                    buffer = (uint8_t*)malloc(CHUNK_SIZE * CHUNK_SIZE * 4);
+                }
+                if (!buffer) continue;
+
+                if (tjDecompress2(tjh, jpeg_data[i], jpeg_sizes[i],
+                                  buffer, width, 0, height,
+                                  TJPF_RGBA, TJFLAG_FASTDCT) < 0) {
+                    if (from_pool) aodecode_release_buffer(pool, buffer);
+                    else free(buffer);
+                    continue;
+                }
+
+                chunks[i].data = buffer;
+                chunks[i].width = width;
+                chunks[i].height = height;
+                chunks[i].stride = width * 4;
+                chunks[i].channels = 4;
+                chunks[i].from_pool = from_pool;
+                decoded++;
+            }
+            release_pooled_decoder(tjh, decoder_from_pool);
+        }
+    }
+#else
+    tjhandle tjh = (tjhandle)aodecode_get_thread_decoder();
+    int is_persistent = aodecode_is_persistent_decoder(tjh);
+
+    if (tjh) {
+        for (int32_t i = 0; i < chunk_count; i++) {
+            if (!jpeg_data[i] || jpeg_sizes[i] == 0) continue;
+
+            int width, height, subsamp, colorspace;
+            if (tjDecompressHeader3(tjh, jpeg_data[i], jpeg_sizes[i],
+                                    &width, &height, &subsamp, &colorspace) < 0) {
+                continue;
+            }
+            if (width != CHUNK_SIZE || height != CHUNK_SIZE) continue;
+
+            uint8_t* buffer = (uint8_t*)malloc(CHUNK_SIZE * CHUNK_SIZE * 4);
+            if (!buffer) continue;
+
+            if (tjDecompress2(tjh, jpeg_data[i], jpeg_sizes[i],
+                              buffer, width, 0, height,
+                              TJPF_RGBA, TJFLAG_FASTDCT) < 0) {
+                free(buffer);
+                continue;
+            }
+
+            chunks[i].data = buffer;
+            chunks[i].width = width;
+            chunks[i].height = height;
+            chunks[i].stride = width * 4;
+            chunks[i].channels = 4;
+            chunks[i].from_pool = 0;
+            decoded++;
+        }
+        if (!is_persistent) {
+            tjDestroy(tjh);
+        }
+    }
+#endif
+
+    /* Compose chunks into a tile at BUILD dimensions. */
+    aodecode_image_t tile = {0};
+    tile.width = build_tile_size;
+    tile.height = build_tile_size;
+    tile.stride = build_tile_size * 4;
+    tile.channels = 4;
+    tile.data = (uint8_t*)malloc((size_t)build_tile_size * build_tile_size * 4);
+
+    if (!tile.data) {
+        for (int32_t i = 0; i < chunk_count; i++) {
+            aodecode_free_image(&chunks[i], pool);
+        }
+        free(chunks);
+        return 0;
+    }
+
+    aodds_fill_and_compose(chunks, chunks_per_side, &tile,
+                           missing_r, missing_g, missing_b);
+
+    /* Free chunk images (no longer needed). */
+    for (int32_t i = 0; i < chunk_count; i++) {
+        aodecode_free_image(&chunks[i], pool);
+    }
+    free(chunks);
+
+    /* Upscale to layout dimensions if needed.  This is the key step that
+     * differentiates this function from ``aodds_build_mipmap_chain``:
+     * fixes the white-tile bug that would otherwise occur when BC1-
+     * compressing a smaller buffer into the larger layout-sized DDS slot. */
+    if (layout_tile_size > build_tile_size) {
+        if (!aodds_upscale_nearest_inplace(&tile, layout_tile_size)) {
+            free(tile.data);
+            return 0;
+        }
+    }
+
+    /* Generate mipmap chain from the (possibly upscaled) layout-sized tile.
+     * Same ping-pong reduce strategy as aodds_build_mipmap_chain. */
+    size_t mip1_size = ((size_t)layout_tile_size / 2) *
+                       ((size_t)layout_tile_size / 2) * 4;
+    size_t mip2_size = ((size_t)layout_tile_size / 4) *
+                       ((size_t)layout_tile_size / 4) * 4;
+
+    uint8_t* mip_buf_a = (total_mipmaps > 1) ? (uint8_t*)malloc(mip1_size) : NULL;
+    uint8_t* mip_buf_b = (total_mipmaps > 2) ? (uint8_t*)malloc(mip2_size) : NULL;
+
+    aodecode_image_t current = tile;
+    aodecode_image_t next = {0};
+    int use_buf_a = 1;
+    uint32_t offset = 0;
+    int32_t mip_count = 0;
+
+    for (int32_t mip = 0; mip < total_mipmaps; mip++) {
+        mipmap_offsets[mip] = offset;
+
+        uint32_t compressed = aodds_compress(&current, format, output + offset);
+        mipmap_sizes[mip] = compressed;
+        offset += compressed;
+        mip_count++;
+
+        if (mip < total_mipmaps - 1 && current.width > 4 && current.height > 4) {
+            next.width = current.width / 2;
+            next.height = current.height / 2;
+            next.stride = next.width * 4;
+            next.channels = 4;
+
+            if (use_buf_a && mip_buf_a) {
+                next.data = mip_buf_a;
+            } else if (!use_buf_a && mip_buf_b) {
+                next.data = mip_buf_b;
+            } else {
+                next.data = (uint8_t*)malloc((size_t)next.width * next.height * 4);
+            }
+
+            if (next.data) {
+                aodds_reduce_half(&current, &next);
+                current = next;
+                memset(&next, 0, sizeof(next));
+                use_buf_a = !use_buf_a;
+            } else {
+                break;
+            }
+        }
+    }
+
+    free(mip_buf_a);
+    free(mip_buf_b);
+    free(tile.data);
+
+    *bytes_written = offset;
+    *mipmap_count_out = mip_count;
+    return (mip_count > 0) ? 1 : 0;
+}
+
+/*============================================================================
  * Build All Mipmaps from Native Zoom Level Chunks
- * 
+ *
  * QUALITY OPTIMIZATION:
  * Instead of building mipmap 0 and deriving smaller mipmaps via reduce_half,
  * this function builds EACH mipmap from its native zoom level chunks:
