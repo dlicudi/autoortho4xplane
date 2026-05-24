@@ -7834,6 +7834,29 @@ class Tile(object):
             log.debug(f"GET_BYTES: DDS is None for {self}, likely closing; skipping")
             return True
 
+        # Header-read instrumentation: count offset=0 reads + length distribution
+        # so we can confirm whether XP header probes are triggering wasted mm0
+        # partial builds.  Bucketed by length: <=128 is pure header,
+        # 128<len<=4096 is header + small mm0 prefix (forces mm0 partial build),
+        # >4096 is header + bigger mm0 region.
+        if offset == 0:
+            self._last_get_bytes_was_header = True
+            try:
+                bump_many({
+                    'header_read_count': 1,
+                    'header_read_length_total': length,
+                })
+                if length <= 128:
+                    bump('header_read_len_le128')
+                elif length <= 4096:
+                    bump('header_read_len_le4096')
+                else:
+                    bump('header_read_len_gt4096')
+            except Exception:
+                pass
+        else:
+            self._last_get_bytes_was_header = False
+
         requested_mipmap = self.find_mipmap_pos(offset)
 
         # ═══════════════════════════════════════════════════════════════════
@@ -8063,7 +8086,36 @@ class Tile(object):
                 log.debug(f"GET_BYTES: aopipeline exception: {e}, using progressive path")
                 bump('live_aopipeline_exception')
         # ═══════════════════════════════════════════════════════════════════
-        
+
+        # ═══════════════════════════════════════════════════════════════════
+        # HEADER-READ SHORT-CIRCUIT
+        # ═══════════════════════════════════════════════════════════════════
+        # XP opens each tile with a single read at offset=0, length~35KB
+        # (header + first chunk-row of mm0).  Empirically (instrumentation
+        # 2026-05-24) 99.4% of partial mm0 builds in this codebase are
+        # triggered by header reads, and only ~0.2% of tiles ever come back
+        # to read more of mm0.  So the ~16 chunks downloaded per header read
+        # are mostly thrown away in VRAM.
+        #
+        # By the time control reaches here for offset=0:
+        # - Persistent DDS cache check above already populated the buffer
+        #   on warm-cache hit (and returned).
+        # - Prefetch-to-live transition above waited up to 2s for any
+        #   in-flight prebuild (and returned on success).
+        # - The aopipeline batch was correctly skipped (is_pure_mipmap_request
+        #   was False).
+        #
+        # If we still need to build mm0 here, that's a cold-cache offset=0
+        # read.  Return early: the DDS header bytes (0-127) are valid from
+        # DDS.__init__, and the mm0 region returns whatever's in the
+        # buffer (typically zeros).  X-Plane uses the header to set up the
+        # texture but rarely renders mm0 of a tile XP only saw at distance.
+        # If XP DOES later read mm0 byte ranges (offset > 0, mm_idx == 0),
+        # the regular progressive path below will trigger a real mm0 build.
+        if offset == 0:
+            bump('header_read_skipped_build')
+            return True
+
         if mipmap > self.max_mipmap:
             # Just get the entire mipmap
             self.get_mipmap(self.max_mipmap, time_budget=time_budget)
@@ -8899,6 +8951,17 @@ class Tile(object):
 
         log.debug(f"GET_IMG: Will use image {new_im}")
 
+        # get_img phase timing accumulators — split where time goes inside
+        # get_img between (a) waiting for chunks to download (pass 2 wait
+        # loop is the network proxy), (b) JPEG decode, and (c) PIL paste.
+        # Bumped at the bottom of the function so one set of counters
+        # captures all three passes.
+        _gi_decode_ms = 0.0
+        _gi_paste_ms = 0.0
+        _gi_wait_ms = 0.0
+        _gi_decode_count = 0
+        _gi_paste_count = 0
+
         # Check if we have any chunks to process
         if len(chunks) == 0:
             log.warning(f"GET_IMG: No chunks created for zoom {zoom}, mipmap {mipmap}")
@@ -8948,10 +9011,16 @@ class Tile(object):
             if chunk.ready.is_set() and chunk_data:
                 # Decode immediately
                 try:
+                    _gi_t0 = time.monotonic()
                     with _decode_sem:
                         chunk_img = AoImage.load_from_memory(chunk_data)
+                    _gi_decode_ms += (time.monotonic() - _gi_t0) * 1000.0
+                    _gi_decode_count += 1
                     if chunk_img:
+                        _gi_tp = time.monotonic()
                         _safe_paste(new_im, chunk_img, start_x, start_y)
+                        _gi_paste_ms += (time.monotonic() - _gi_tp) * 1000.0
+                        _gi_paste_count += 1
                         chunks_with_images.add(id(chunk))
                         time_budget.record_chunk_processed()
                     else:
@@ -9016,10 +9085,16 @@ class Tile(object):
                     chunk_data = chunk.data
                     if chunk_data:
                         try:
+                            _gi_t0 = time.monotonic()
                             with _decode_sem:
                                 chunk_img = AoImage.load_from_memory(chunk_data)
+                            _gi_decode_ms += (time.monotonic() - _gi_t0) * 1000.0
+                            _gi_decode_count += 1
                             if chunk_img:
+                                _gi_tp = time.monotonic()
                                 _safe_paste(new_im, chunk_img, sx, sy)
+                                _gi_paste_ms += (time.monotonic() - _gi_tp) * 1000.0
+                                _gi_paste_count += 1
                                 chunks_with_images.add(id(chunk))
                                 time_budget.record_chunk_processed()
                         except Exception as e:
@@ -9041,7 +9116,9 @@ class Tile(object):
                 if wait_cap <= 0:
                     break
                 chunk_to_wait = still_waiting[0][0]
+                _gi_tw = time.monotonic()
                 time_budget.wait_with_budget(chunk_to_wait.ready, max_single_wait=wait_cap)
+                _gi_wait_ms += (time.monotonic() - _gi_tw) * 1000.0
 
             # Update deferred_chunks for pass 3
             deferred_chunks = [(chunk, sx, sy) for chunk, sx, sy in deferred_chunks
@@ -9122,13 +9199,19 @@ class Tile(object):
                     chunk_data = chunk.data
                     if chunk.ready.is_set() and chunk_data:
                         try:
+                            _gi_t0 = time.monotonic()
                             with _decode_sem:
                                 chunk_img = AoImage.load_from_memory(chunk_data)
+                            _gi_decode_ms += (time.monotonic() - _gi_t0) * 1000.0
+                            _gi_decode_count += 1
                         except Exception:
                             chunk_img = None
 
                 if chunk_img:
+                    _gi_tp = time.monotonic()
                     _safe_paste(new_im, chunk_img, sx, sy)
+                    _gi_paste_ms += (time.monotonic() - _gi_tp) * 1000.0
+                    _gi_paste_count += 1
                     chunks_with_images.add(id(chunk))
                     time_budget.record_chunk_processed()
                 else:
@@ -9211,6 +9294,20 @@ class Tile(object):
                     # In-place desaturation - assign result for error handling
                     new_im = new_im.desaturate(saturation)
         
+        # Emit phase split for get_img — decode (JPEG), paste (compose), wait
+        # (proxy for network download wait in pass 2).  Compare against
+        # phase_get_img_ms_total to find the residual unexplained time.
+        try:
+            bump_many({
+                'gi_decode_ms_total': int(_gi_decode_ms),
+                'gi_paste_ms_total': int(_gi_paste_ms),
+                'gi_wait_ms_total': int(_gi_wait_ms),
+                'gi_decode_count': _gi_decode_count,
+                'gi_paste_count': _gi_paste_count,
+            })
+        except Exception:
+            pass
+
         # Return image along with mipmap and zoom level this was created at
         return new_im
 
@@ -10417,7 +10514,25 @@ class Tile(object):
         if chunk_count == 0:
             log.debug(f"_try_native_partial_mipmap_build: No chunks for rows {startrow}-{endrow}")
             return False
-        
+
+        # Header-attribution counters: count chunks pulled by partial builds and
+        # specifically how many of those builds were triggered by an offset=0
+        # (header) read.  If header_triggered_chunks_total dominates, the
+        # offset=0 fall-through is downloading data XP rarely consumes.
+        try:
+            _from_header = bool(getattr(self, '_last_get_bytes_was_header', False))
+            bump_many({
+                'partial_build_calls': 1,
+                'partial_build_chunks_total': chunk_count,
+            })
+            if _from_header:
+                bump_many({
+                    'header_triggered_partial_build_calls': 1,
+                    'header_triggered_chunks_total': chunk_count,
+                })
+        except Exception:
+            pass
+
         # Check threshold - need ALL chunks for native partial build
         valid_count = sum(1 for d in jpeg_datas if d is not None)
 
