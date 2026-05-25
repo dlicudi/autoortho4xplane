@@ -300,7 +300,9 @@ AODDS_API int32_t aodds_build_from_jpegs(
     uint32_t output_size,
     uint32_t* bytes_written,
     aodecode_pool_t* pool,
-    int32_t max_threads          /**< 0 = auto (default), >0 = limit OpenMP threads */
+    int32_t max_threads,         /**< 0 = auto (default), >0 = limit OpenMP threads */
+    int32_t layout_chunks_per_side /**< 0 or ==chunks: no upscale.  >chunks: upscale composed
+                                        tile to layout dims (must be power-of-2 multiple). */
 );
 
 /**
@@ -728,13 +730,20 @@ typedef enum {
  * Streaming builder configuration.
  */
 typedef struct {
-    int32_t chunks_per_side;    /**< Chunks per side (typically 16) */
+    int32_t chunks_per_side;    /**< Chunks per side at BUILD zoom (typically 16) */
     dds_format_t format;        /**< Output compression format (BC1/BC3) */
     uint8_t missing_r;          /**< Fallback color R component */
     uint8_t missing_g;          /**< Fallback color G component */
     uint8_t missing_b;          /**< Fallback color B component */
-    uint8_t nocopy_mode;        /**< Zero-copy mode: 0=C copies JPEG data (default), 
+    uint8_t nocopy_mode;        /**< Zero-copy mode: 0=C copies JPEG data (default),
                                      1=C stores pointers only (caller owns memory) */
+    int32_t layout_chunks_per_side; /**< Chunks per side at LAYOUT zoom.
+                                         0 or <=chunks_per_side: no upscale (output sized to build).
+                                         >chunks_per_side: composed tile is nearest-neighbor
+                                         upscaled to layout dims before mipmap chain build,
+                                         producing a DDS sized for the layout zoom.
+                                         Must be a power-of-two multiple of chunks_per_side.
+                                         Mirrors the upscale step in aodds_build_layout_aware_chain. */
 } aodds_builder_config_t;
 
 /**

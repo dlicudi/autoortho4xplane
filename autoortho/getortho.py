@@ -1239,6 +1239,31 @@ def bump_many(d: dict):
         inc_many(d)
 
 
+def _trace_mm_assign(tile_id, origin, mm, mm_data_len):
+    """Attribute mm-buffer assignments to a specific build path so the
+    green-strip bug (mm0 buffer shorter than the DDS structure expects)
+    can be traced to its source.
+
+    Read-only instrumentation: per-origin counters and a WARNING log line
+    when mm0 is assigned fewer bytes than `mm.endpos - mm.startpos`.
+    No behaviour change.  Counters surface in the STATS dump as
+    `mm0_assign_<origin>` and `mm0_short_assign_<origin>`.
+    """
+    try:
+        bump(f'mm{mm.idx}_assign_{origin}')
+        if mm.idx == 0:
+            expected = mm.endpos - mm.startpos
+            if mm_data_len < expected:
+                log.warning(
+                    f"MM_ASSIGN_SHORT origin={origin} tile={tile_id} "
+                    f"mm0 actual={mm_data_len} expected={expected} "
+                    f"missing={expected - mm_data_len}"
+                )
+                bump(f'mm0_short_assign_{origin}')
+    except Exception:
+        pass
+
+
 def get_tile_creation_stats():
     """
     Get tile creation statistics for monitoring and tuning.
@@ -4284,9 +4309,18 @@ class BackgroundDDSBuilder:
         # Set available mipmap images for scaling fallback
         resolver.set_mipmap_images(tile.imgs)
         
-        # Acquire streaming builder (blocking OK for background thread)
+        # Acquire streaming builder (blocking OK for background thread).
+        # layout_chunks_per_side: when build_zoom < layout_zoom (e.g. cruise
+        # ZL16 layout / airport ZL17 layout served from a ZL-1 build), the
+        # native finalize path upscales the composed build-sized tile to
+        # layout dims before BC1 compression so the on-disk DDS matches the
+        # DDM that store_from_file will write (which uses tile.dds layout
+        # dims).  Without this, finalize_to_file produces a build-sized DDS
+        # while the DDM claims layout-sized → pydds loads a short mm0 buffer
+        # and serves missing_color for the tail (the airport green-strip bug).
         config = {
             'chunks_per_side': tile.chunks_per_row,
+            'layout_chunks_per_side': tile.width,
             'format': dxt_format,
             'missing_color': missing_color
         }
@@ -7033,6 +7067,14 @@ class Tile(object):
             # ═══════════════════════════════════════════════════════════════
             # STEP 4: Build DDS with native aopipeline
             # ═══════════════════════════════════════════════════════════════
+            # layout_chunks_per_side: when build_zoom < layout_zoom, the C side
+            # nearest-neighbor upscales the composed build-sized tile to layout
+            # dims before the mipmap chain is written.  Without this, the C
+            # function produces a build-sized DDS but tile.dds in Python expects
+            # layout-sized — causing the green-strip mm0-short-buffer bug we
+            # saw at PALU.  Mirrors the fix already applied in
+            # aodds_builder_finalize_to_file (BG path) and the existing live
+            # layout-aware path.
             with _native_build_context() as threads:
                 with _native_path_count('live_aopipeline'):
                     result = native_dds.build_from_jpegs_to_buffer(
@@ -7040,7 +7082,8 @@ class Tile(object):
                         jpeg_datas,
                         format=dxt_format,
                         missing_color=missing_color,
-                        max_threads=threads
+                        max_threads=threads,
+                        layout_chunks_per_side=self.width,
                     )
 
             if not result.success:
@@ -7060,7 +7103,8 @@ class Tile(object):
             
             # Reuse existing _populate_dds_from_prebuilt (proven, tested)
             # This populates all mipmap buffers and marks them as retrieved
-            if not self._populate_dds_from_prebuilt(dds_bytes):
+            if not self._populate_dds_from_prebuilt(dds_bytes,
+                                                     _origin='live_aopipeline'):
                 log.debug(f"_try_aopipeline_build: Failed to populate DDS for {self.id}")
                 bump('live_aopipeline_populate_failed')
                 return False
@@ -7413,7 +7457,8 @@ class Tile(object):
                         raise
                 if result.success and result.bytes_written >= 128:
                     dds_bytes = bytes(buffer[:result.bytes_written])
-                    if self._populate_dds_from_prebuilt(dds_bytes):
+                    if self._populate_dds_from_prebuilt(dds_bytes,
+                                                         _origin='live_streaming'):
                         build_time = (time.monotonic() - build_start) * 1000
                         status = builder.get_status()
                         log.debug(f"_try_streaming_aopipeline_build: SUCCESS for {self.id} - "
@@ -7603,7 +7648,8 @@ class Tile(object):
 
         return True
     
-    def _populate_dds_from_prebuilt(self, prebuilt_bytes: bytes) -> bool:
+    def _populate_dds_from_prebuilt(self, prebuilt_bytes: bytes,
+                                     _origin: str = 'unknown') -> bool:
         """
         Populate DDS mipmap buffers from prebuilt byte buffer.
         
@@ -7647,6 +7693,8 @@ class Tile(object):
                                 continue
                             trailing_mm.databuffer = BytesIO(initial_bytes=last_valid_mm_data)
                             trailing_mm.retrieved = True
+                            _trace_mm_assign(self.id, _origin + '_trail_past_end',
+                                             trailing_mm, len(last_valid_mm_data))
                     break
 
                 # Skip unpopulated mipmaps (partial DDS from incremental save)
@@ -7663,13 +7711,16 @@ class Tile(object):
                                 continue
                             trailing_mm.databuffer = BytesIO(initial_bytes=last_valid_mm_data)
                             trailing_mm.retrieved = True
+                            _trace_mm_assign(self.id, _origin + '_trail_no_data',
+                                             trailing_mm, len(last_valid_mm_data))
                     break
-                    
+
                 mm_data = prebuilt_bytes[mm.startpos:mm_end]
-                
+
                 # Store in the mipmap's databuffer
                 mm.databuffer = BytesIO(initial_bytes=mm_data)
                 mm.retrieved = True
+                _trace_mm_assign(self.id, _origin + '_main', mm, len(mm_data))
                 
                 # Track last valid mipmap data for propagation to trailing mipmaps
                 last_valid_mm_data = mm_data
@@ -7933,7 +7984,8 @@ class Tile(object):
                 if cache_has_requested_mipmap else None
             )
             if cached_bytes is not None:
-                if self._populate_dds_from_prebuilt(cached_bytes):
+                if self._populate_dds_from_prebuilt(cached_bytes,
+                                                     _origin='disk_cache_primary'):
                     # FIX: Only return early if mm0 was actually populated.
                     # Partial DDS entries (from store_incremental) contain mm4-12 but
                     # NOT mm0. Returning True here would serve empty mm0 data to X-Plane
@@ -7978,7 +8030,8 @@ class Tile(object):
                     if dynamic_dds_cache is not None:
                         cached_bytes = dynamic_dds_cache.load(self.id, self.max_zoom, self)
                         if cached_bytes is not None:
-                            if self._populate_dds_from_prebuilt(cached_bytes):
+                            if self._populate_dds_from_prebuilt(cached_bytes,
+                                                                 _origin='disk_cache_post_transition'):
                                 # Only return if mm0 was populated (same guard as primary cache path)
                                 if self.dds and self.dds.mipmap_list and self.dds.mipmap_list[0].retrieved:
                                     log.debug(f"GET_BYTES: DDS cache HIT after transition for {self.id}")
@@ -8647,6 +8700,8 @@ class Tile(object):
                             initial_bytes=mip_data
                         )
                         self.dds.mipmap_list[i].retrieved = True
+                        _trace_mm_assign(self.id, 'layout_aware_main',
+                                         self.dds.mipmap_list[i], len(mip_data))
                     # Mipmaps past smallest_mm get the 4×4 BC1 block copied —
                     # matches pydds gen_mipmaps placeholder behaviour.
                     if (result.mipmap_count > 0
@@ -8660,6 +8715,8 @@ class Tile(object):
                                     initial_bytes=smallest_data
                                 )
                                 mm.retrieved = True
+                                _trace_mm_assign(self.id, 'layout_aware_trail',
+                                                 mm, len(smallest_data))
                 finally:
                     self.ready.set()
             return True
@@ -10581,6 +10638,8 @@ class Tile(object):
                             if mip_data:
                                 self.dds.mipmap_list[target_mipmap].databuffer = BytesIO(initial_bytes=mip_data)
                                 self.dds.mipmap_list[target_mipmap].retrieved = True
+                                _trace_mm_assign(self.id, 'mipmap_build_chain',
+                                                 self.dds.mipmap_list[target_mipmap], len(mip_data))
 
                     # For mipmaps beyond smallest_mm, copy the 4×4 block
                     # (This matches Python gen_mipmaps behavior)
@@ -10591,6 +10650,8 @@ class Tile(object):
                             for mm in self.dds.mipmap_list[smallest_mm + 1:]:
                                 mm.databuffer = BytesIO(initial_bytes=smallest_data)
                                 mm.retrieved = True
+                                _trace_mm_assign(self.id, 'mipmap_build_trail',
+                                                 mm, len(smallest_data))
 
                     log.debug(f"_try_native_mipmap_build: Built {result.mipmap_count} mipmaps "
                              f"({mipmap} to {mipmap + result.mipmap_count - 1})")
@@ -10598,6 +10659,8 @@ class Tile(object):
                     # SingleMipmapResult: only write the one mipmap
                     self.dds.mipmap_list[mipmap].databuffer = BytesIO(initial_bytes=result.data)
                     self.dds.mipmap_list[mipmap].retrieved = True
+                    _trace_mm_assign(self.id, 'mipmap_build_single',
+                                     self.dds.mipmap_list[mipmap], len(result.data))
                 self.ready.set()
             
             # Record timing stats

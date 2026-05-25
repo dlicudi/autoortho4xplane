@@ -1700,6 +1700,11 @@ AODDS_API int32_t aodds_build_from_chunks(
  * - Native decodes + composes + compresses (parallelism helps)
  *============================================================================*/
 
+/* Forward decl — definition below at file-scope (used by both aodds_build_from_jpegs
+ * and aodds_build_layout_aware_chain). */
+static int32_t aodds_upscale_nearest_inplace(aodecode_image_t* tile,
+                                             int32_t target_size);
+
 AODDS_API int32_t aodds_build_from_jpegs(
     const uint8_t** jpeg_data,
     const uint32_t* jpeg_sizes,
@@ -1712,22 +1717,47 @@ AODDS_API int32_t aodds_build_from_jpegs(
     uint32_t output_size,
     uint32_t* bytes_written,
     aodecode_pool_t* pool,
-    int32_t max_threads
+    int32_t max_threads,
+    int32_t layout_chunks_per_side
 ) {
     if (!jpeg_data || !jpeg_sizes || !dds_output || !bytes_written || chunk_count <= 0) {
         return 0;
     }
-    
+
     /* Calculate chunks per side (must be perfect square) */
     int32_t chunks_per_side = (int32_t)sqrt((double)chunk_count);
     if (chunks_per_side * chunks_per_side != chunk_count) {
         return 0;  /* Not a perfect square */
     }
-    
+
     int32_t tile_size = chunks_per_side * CHUNK_SIZE;
-    int32_t mipmap_count = aodds_calc_mipmap_count(tile_size, tile_size);
-    uint32_t required = aodds_calc_dds_size(tile_size, tile_size, mipmap_count, format);
-    
+
+    /* Layout-aware sizing.  When layout_chunks_per_side > chunks_per_side,
+     * the composed build-sized tile is nearest-neighbor upscaled to layout
+     * dims before mipmap chain build, producing a DDS sized for the layout
+     * zoom — mirrors aodds_builder_finalize_to_file's layout-aware path.
+     * Without this, a build-zoom DDS shipped to Python's pydds (which is
+     * sized for layout zoom) produces a short mm0 buffer → green strip.
+     *
+     * layout_chunks_per_side == 0 or == chunks_per_side: legacy no-upscale. */
+    int32_t upscale_factor = 1;
+    int32_t output_tile_size = tile_size;
+    if (layout_chunks_per_side > 0 && layout_chunks_per_side != chunks_per_side) {
+        if (layout_chunks_per_side < chunks_per_side) {
+            return 0;
+        }
+        int32_t scale = layout_chunks_per_side / chunks_per_side;
+        if (scale * chunks_per_side != layout_chunks_per_side ||
+            (scale & (scale - 1)) != 0) {
+            return 0;
+        }
+        upscale_factor = scale;
+        output_tile_size = layout_chunks_per_side * CHUNK_SIZE;
+    }
+
+    int32_t mipmap_count = aodds_calc_mipmap_count(output_tile_size, output_tile_size);
+    uint32_t required = aodds_calc_dds_size(output_tile_size, output_tile_size, mipmap_count, format);
+
     if (output_size < required) {
         return 0;
     }
@@ -1879,26 +1909,37 @@ AODDS_API int32_t aodds_build_from_jpegs(
         return 0;
     }
     
-    /* Fill and compose in a single pass */
+    /* Fill and compose in a single pass (at BUILD dims). */
     aodds_fill_and_compose(chunks, chunks_per_side, &tile,
                            missing_r, missing_g, missing_b);
-    
+
     /* Free chunk images */
     for (int32_t i = 0; i < chunk_count; i++) {
         aodecode_free_image(&chunks[i], pool);
     }
     free(chunks);
-    
-    /* Write header and generate mipmaps */
-    uint32_t offset = aodds_write_header(dds_output, tile_size, tile_size, 
+
+    /* Upscale composed tile to LAYOUT dims if requested.  Uses the existing
+     * in-place nearest-neighbor helper (frees the old build-sized buffer,
+     * allocates a new layout-sized one). */
+    if (upscale_factor > 1) {
+        if (!aodds_upscale_nearest_inplace(&tile, output_tile_size)) {
+            free(tile.data);
+            return 0;
+        }
+    }
+
+    /* Write header and generate mipmaps (at OUTPUT/layout dims). */
+    uint32_t offset = aodds_write_header(dds_output, output_tile_size, output_tile_size,
                                           mipmap_count, format);
-    
+
     /* ═══════════════════════════════════════════════════════════════════════
      * MIPMAP BUFFER REUSE (Phase 2.2)
      * Pre-allocate ping-pong buffers instead of allocating per mipmap level
+     * Sized for OUTPUT dims (the largest mipmap-1 / mipmap-2).
      * ═══════════════════════════════════════════════════════════════════════*/
-    size_t mip1_size = ((size_t)tile_size / 2) * ((size_t)tile_size / 2) * 4;
-    size_t mip2_size = ((size_t)tile_size / 4) * ((size_t)tile_size / 4) * 4;
+    size_t mip1_size = ((size_t)output_tile_size / 2) * ((size_t)output_tile_size / 2) * 4;
+    size_t mip2_size = ((size_t)output_tile_size / 4) * ((size_t)output_tile_size / 4) * 4;
     
     uint8_t* mip_buf_a = (mipmap_count > 1) ? (uint8_t*)malloc(mip1_size) : NULL;
     uint8_t* mip_buf_b = (mipmap_count > 2) ? (uint8_t*)malloc(mip2_size) : NULL;
@@ -4674,12 +4715,44 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
 
     int32_t chunks_per_side = builder->config.chunks_per_side;
     int32_t tile_size = chunks_per_side * CHUNK_SIZE;
-    int32_t mipmap_count = aodds_calc_mipmap_count(tile_size, tile_size);
 
-    aodds_trace_emit("finalize ENTER builder=%p output=%s tile_size=%d mipmap_count=%d max_threads=%d",
-                     (void*)builder, output_path, tile_size, mipmap_count, max_threads);
+    /* Layout-aware sizing: when layout_chunks_per_side > chunks_per_side, the
+     * composed build-sized tile is nearest-neighbor upscaled to layout dims
+     * after compose, and the on-disk DDS is sized for the layout zoom.  This
+     * mirrors aodds_build_layout_aware_chain and fixes the green-strip bug
+     * where the streaming builder wrote build-sized DDS files but the DDM
+     * (from tile.dds in Python) claimed layout-sized dimensions — when those
+     * tiles were later loaded, pydds saw a short mm0 buffer and filled the
+     * tail with missing_color.
+     *
+     * layout_cps == 0 or layout_cps == chunks_per_side: legacy no-upscale
+     * path.  Output is sized for the build zoom (existing behavior). */
+    int32_t layout_cps = builder->config.layout_chunks_per_side;
+    int32_t upscale_factor = 1;
+    int32_t output_tile_size = tile_size;
+    if (layout_cps > 0 && layout_cps != chunks_per_side) {
+        if (layout_cps < chunks_per_side) {
+            aodds_trace_emit("finalize FAIL layout_lt_build builder=%p layout_cps=%d chunks_per_side=%d",
+                             (void*)builder, layout_cps, chunks_per_side);
+            return 0;
+        }
+        int32_t scale = layout_cps / chunks_per_side;
+        if (scale * chunks_per_side != layout_cps || (scale & (scale - 1)) != 0) {
+            aodds_trace_emit("finalize FAIL layout_not_pow2 builder=%p layout_cps=%d chunks_per_side=%d",
+                             (void*)builder, layout_cps, chunks_per_side);
+            return 0;
+        }
+        upscale_factor = scale;
+        output_tile_size = layout_cps * CHUNK_SIZE;
+    }
 
-    /* Allocate tile image if not already */
+    int32_t mipmap_count = aodds_calc_mipmap_count(output_tile_size, output_tile_size);
+
+    aodds_trace_emit("finalize ENTER builder=%p output=%s build_tile_size=%d output_tile_size=%d upscale=%d mipmap_count=%d max_threads=%d",
+                     (void*)builder, output_path, tile_size, output_tile_size, upscale_factor, mipmap_count, max_threads);
+
+    /* Allocate tile image if not already.  Sized for BUILD dims — compose
+     * runs at build dims, then upscale (if any) produces a separate buffer. */
     if (!builder->tile_allocated) {
         builder->tile_image.width = tile_size;
         builder->tile_image.height = tile_size;
@@ -4776,6 +4849,53 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
     }
     aodds_trace_emit("finalize POST_CHUNK_RELEASE builder=%p", (void*)builder);
 
+    /* Upscale build-sized composed tile to layout dims if requested.  Non-
+     * destructive w.r.t. builder->tile_image — allocates a fresh buffer that
+     * the mipmap loop consumes, then freed at function end.  Mirrors the
+     * nearest-neighbor pixel-replication in aodds_upscale_nearest_inplace
+     * but writes to a separate dst so the persistent build-sized tile_image
+     * stays intact for builder reuse. */
+    uint8_t* upscale_buf = NULL;
+    if (upscale_factor > 1) {
+        size_t upscale_bytes = (size_t)output_tile_size * (size_t)output_tile_size * 4;
+        upscale_buf = (uint8_t*)malloc(upscale_bytes);
+        if (!upscale_buf) {
+            aodds_trace_emit("finalize FAIL upscale_malloc builder=%p bytes=%zu",
+                             (void*)builder, upscale_bytes);
+            return 0;
+        }
+        aodds_trace_emit("finalize PRE_UPSCALE builder=%p factor=%d build=%d output=%d",
+                         (void*)builder, upscale_factor, tile_size, output_tile_size);
+        const uint8_t* src = builder->tile_image.data;
+        const int32_t scale = upscale_factor;
+        const int32_t out_size = output_tile_size;
+        const int32_t in_size = tile_size;
+#if AOPIPELINE_HAS_OPENMP
+        #pragma omp parallel for schedule(static) num_threads(max_threads > 0 ? max_threads : omp_get_max_threads())
+#endif
+        for (int32_t sy = 0; sy < in_size; sy++) {
+            const uint8_t* src_row = src + (size_t)sy * (size_t)in_size * 4;
+            for (int32_t ry = 0; ry < scale; ry++) {
+                uint8_t* dst_row = upscale_buf +
+                    ((size_t)sy * scale + ry) * (size_t)out_size * 4;
+                uint8_t* dp = dst_row;
+                for (int32_t sx = 0; sx < in_size; sx++) {
+                    uint8_t r = src_row[sx * 4 + 0];
+                    uint8_t g = src_row[sx * 4 + 1];
+                    uint8_t b = src_row[sx * 4 + 2];
+                    uint8_t a = src_row[sx * 4 + 3];
+                    for (int32_t rx = 0; rx < scale; rx++) {
+                        *dp++ = r;
+                        *dp++ = g;
+                        *dp++ = b;
+                        *dp++ = a;
+                    }
+                }
+            }
+        }
+        aodds_trace_emit("finalize POST_UPSCALE builder=%p", (void*)builder);
+    }
+
     /* Create temp file path */
     char temp_path[4096];
     snprintf(temp_path, sizeof(temp_path), "%s.tmp", output_path);
@@ -4785,6 +4905,7 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
     FILE* fp = fopen(temp_path, "wb");
     if (!fp) {
         aodds_trace_emit("finalize FAIL fopen builder=%p temp=%s", (void*)builder, temp_path);
+        free(upscale_buf);
         return 0;
     }
     aodds_trace_emit("finalize POST_FOPEN builder=%p fp=%p", (void*)builder, (void*)fp);
@@ -4795,12 +4916,12 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
     aodds_trace_emit("finalize PRE_SETVBUF builder=%p fp=%p buf=%p", (void*)builder, (void*)fp, (void*)dds_write_buffer3);
     setvbuf(fp, dds_write_buffer3, _IOFBF, sizeof(dds_write_buffer3));
     aodds_trace_emit("finalize PRE_PREALLOC builder=%p fp=%p", (void*)builder, (void*)fp);
-    preallocate_file_dds(fp, calc_dds_file_size(tile_size, mipmap_count, builder->config.format));
+    preallocate_file_dds(fp, calc_dds_file_size(output_tile_size, mipmap_count, builder->config.format));
     aodds_trace_emit("finalize POST_PREALLOC builder=%p fp=%p", (void*)builder, (void*)fp);
 
-    /* Write DDS header */
+    /* Write DDS header (dimensions match the on-disk mipmap chain). */
     uint8_t header[DDS_HEADER_SIZE];
-    aodds_write_header(header, tile_size, tile_size, mipmap_count, builder->config.format);
+    aodds_write_header(header, output_tile_size, output_tile_size, mipmap_count, builder->config.format);
 
     aodds_trace_emit("finalize PRE_HEADER_WRITE builder=%p fp=%p size=%d", (void*)builder, (void*)fp, (int)DDS_HEADER_SIZE);
     errno = 0;
@@ -4812,37 +4933,40 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
         fclose(fp);
         WRITE_BUFFER_UNLOCK();
         remove(temp_path);
+        free(upscale_buf);
         return 0;
     }
-    
+
     uint32_t total_written = DDS_HEADER_SIZE;
-    
-    /* Block size for compression size calculations */
+
+    /* Block size for compression size calculations (use output dims). */
     uint32_t block_size = (builder->config.format == DDS_FORMAT_BC1) ? 8 : 16;
-    uint32_t max_blocks_x = (tile_size + 3) / 4;
-    uint32_t max_blocks_y = (tile_size + 3) / 4;
+    uint32_t max_blocks_x = (output_tile_size + 3) / 4;
+    uint32_t max_blocks_y = (output_tile_size + 3) / 4;
     uint32_t max_compressed_size = max_blocks_x * max_blocks_y * block_size;
-    
+
     /* Ensure compression buffer is allocated and large enough (still needed for file writes) */
     if (builder->compress_buffer_size < max_compressed_size) {
         free(builder->compress_buffer);
         builder->compress_buffer = (uint8_t*)malloc(max_compressed_size);
         builder->compress_buffer_size = builder->compress_buffer ? max_compressed_size : 0;
     }
-    
+
     if (!builder->compress_buffer) {
         fclose(fp);
         WRITE_BUFFER_UNLOCK();
         remove(temp_path);
+        free(upscale_buf);
         return 0;
     }
-    
+
     uint8_t* compress_buffer = builder->compress_buffer;
-    
-    /* Ensure mipmap buffers are allocated and large enough (persistent in builder) */
-    size_t mip1_size = ((size_t)tile_size / 2) * ((size_t)tile_size / 2) * 4;
-    size_t mip2_size = ((size_t)tile_size / 4) * ((size_t)tile_size / 4) * 4;
-    
+
+    /* Ensure mipmap buffers are allocated and large enough (persistent in builder).
+     * Sized for OUTPUT dims (the largest mipmap-1 and mipmap-2). */
+    size_t mip1_size = ((size_t)output_tile_size / 2) * ((size_t)output_tile_size / 2) * 4;
+    size_t mip2_size = ((size_t)output_tile_size / 4) * ((size_t)output_tile_size / 4) * 4;
+
     if (mipmap_count > 1) {
         if (builder->mip_buf_a_size < (uint32_t)mip1_size) {
             free(builder->mip_buf_a);
@@ -4857,12 +4981,26 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
             builder->mip_buf_b_size = builder->mip_buf_b ? mip2_size : 0;
         }
     }
-    
+
     /* Local pointers for compatibility with existing code flow */
     uint8_t* mip_buf_a = builder->mip_buf_a;
     uint8_t* mip_buf_b = builder->mip_buf_b;
-    
-    aodecode_image_t current = builder->tile_image;
+
+    /* Mipmap-loop input: upscale_buf if upscale ran, else the build-sized
+     * tile_image directly.  `current` is a stack-local struct that points
+     * into one of these buffers — it does NOT own data, so freeing
+     * upscale_buf at function end is the only cleanup required. */
+    aodecode_image_t current;
+    if (upscale_buf) {
+        current.data = upscale_buf;
+        current.width = output_tile_size;
+        current.height = output_tile_size;
+        current.stride = output_tile_size * 4;
+        current.channels = 4;
+        current.from_pool = 0;
+    } else {
+        current = builder->tile_image;
+    }
     aodecode_image_t next = {0};
     int success = 1;
     int use_buf_a = 1;
@@ -4931,6 +5069,7 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
     if (!success) {
         aodds_trace_emit("finalize FAIL pre_rename builder=%p", (void*)builder);
         remove(temp_path);
+        free(upscale_buf);
         return 0;
     }
 
@@ -4945,6 +5084,7 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
     if (!atomic_rename(temp_path, output_path)) {
         aodds_trace_emit("finalize FAIL atomic_rename builder=%p", (void*)builder);
         remove(temp_path);
+        free(upscale_buf);
         return 0;
     }
 
@@ -4959,6 +5099,7 @@ AODDS_API int32_t aodds_builder_finalize_to_file(
     aodds_trace_emit("finalize EXIT_OK builder=%p total_written=%u", (void*)builder, total_written);
 
     *bytes_written = total_written;
+    free(upscale_buf);
     return 1;
 }
 

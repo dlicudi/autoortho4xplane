@@ -365,6 +365,14 @@ class BuilderConfig(Structure):
     """
     Builder configuration structure.
     Maps to aodds_builder_config_t in C.
+
+    layout_chunks_per_side: when > chunks_per_side, the composed build-sized
+    tile is nearest-neighbor upscaled to layout dims before the mipmap chain
+    is built — so the on-disk DDS matches the layout zoom rather than the
+    build zoom.  Required when build_zoom < layout_zoom; otherwise the DDM
+    (which uses tile.dds layout dims) and the DDS file (build dims) disagree
+    and pydds fills the mm0 tail with missing_color (green strip).
+    Set to 0 (or == chunks_per_side) to disable upscale.
     """
     _fields_ = [
         ('chunks_per_side', c_int32),
@@ -373,6 +381,7 @@ class BuilderConfig(Structure):
         ('missing_g', c_uint8),
         ('missing_b', c_uint8),
         ('nocopy_mode', c_uint8),  # 1 = zero-copy mode (Python owns JPEG memory)
+        ('layout_chunks_per_side', c_int32),  # 0 = no upscale (legacy behavior)
     ]
 
 
@@ -957,6 +966,7 @@ class StreamingBuilderPool:
             missing_g=missing_color[1],
             missing_b=missing_color[2],
             nocopy_mode=nocopy_mode,
+            layout_chunks_per_side=config.get('layout_chunks_per_side', 0),
         )
         
         import time
@@ -2217,12 +2227,13 @@ def build_from_jpegs(
             c_uint32,                   # output_size
             POINTER(c_uint32),          # bytes_written
             c_void_p,                   # pool
-            c_int32                     # max_threads
+            c_int32,                    # max_threads
+            c_int32                     # layout_chunks_per_side
         ]
         lib.aodds_build_from_jpegs.restype = c_int32
         lib._hybrid_setup_done = True
 
-    # Call native function
+    # Call native function (legacy entry — no layout upscale)
     success = lib.aodds_build_from_jpegs(
         jpeg_ptrs,
         jpeg_sizes,
@@ -2235,12 +2246,13 @@ def build_from_jpegs(
         dds_size,
         byref(bytes_written),
         pool_handle,
-        c_int32(0)
+        c_int32(0),
+        c_int32(0)  # layout_chunks_per_side = 0 (no upscale)
     )
-    
+
     if not success:
         raise RuntimeError("Failed to build DDS from JPEGs")
-    
+
     return bytes(buffer[:bytes_written.value])
 
 
@@ -2250,7 +2262,8 @@ def build_from_jpegs_to_buffer(
     format: str = "BC1",
     missing_color: Tuple[int, int, int] = (66, 77, 55),
     decode_pool: Optional[c_void_p] = None,
-    max_threads: int = 0
+    max_threads: int = 0,
+    layout_chunks_per_side: int = 0
 ) -> BufferBuildResult:
     """
     Build DDS from pre-read JPEG data into a pre-allocated buffer (ZERO-COPY).
@@ -2358,7 +2371,8 @@ def build_from_jpegs_to_buffer(
             c_uint32,                   # output_size
             POINTER(c_uint32),          # bytes_written
             c_void_p,                   # pool
-            c_int32                     # max_threads
+            c_int32,                    # max_threads
+            c_int32                     # layout_chunks_per_side
         ]
         lib.aodds_build_from_jpegs.restype = c_int32
         lib._hybrid_setup_done = True
@@ -2376,7 +2390,8 @@ def build_from_jpegs_to_buffer(
         len(buffer),
         byref(bytes_written),
         pool_handle,
-        c_int32(max_threads)
+        c_int32(max_threads),
+        c_int32(layout_chunks_per_side)
     )
     
     return BufferBuildResult(
