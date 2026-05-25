@@ -1239,16 +1239,19 @@ def bump_many(d: dict):
         inc_many(d)
 
 
-def _trace_chunk_failures(tile_id, build_path, jpeg_datas, threshold=4):
+def _trace_chunk_failures(tile, build_path, jpeg_datas, threshold=4):
     """Log when a native build receives a tile with N or more missing/empty
     JPEG chunks — produces a vertical/horizontal green band when contiguous
     or a peppered "swiss-cheese" effect when scattered.
 
     Bumps per-path counters and emits a WARNING at threshold with the
-    missing-chunk pattern.  Returns the list of missing chunk indices so
-    the caller can flag the tile for BG healing once the build succeeds —
-    the existing _dds_needs_healing / _dispatch_healing_for_incomplete
-    infrastructure will then refetch missing chunks and rebuild the tile.
+    missing-chunk pattern + per-chunk state attribution (permanent_failure
+    vs in_flight vs ready_but_empty) so we can distinguish "Bing genuinely
+    has no imagery here" from "AO fired the build before chunks arrived."
+    Returns the list of missing chunk indices so the caller can flag the
+    tile for BG healing once the build succeeds — the existing
+    _dds_needs_healing / _dispatch_healing_for_incomplete infrastructure
+    will then refetch missing chunks and rebuild the tile.
     Returns [] when nothing is missing (caller can skip the heal step).
     """
     try:
@@ -1281,10 +1284,47 @@ def _trace_chunk_failures(tile_id, build_path, jpeg_datas, threshold=4):
         elif row_strips:
             pattern = f"horizontal_strip_rows={row_strips}"
             bump(f'tile_chunk_missing_{build_path}_horizontal_strip')
+        # Per-chunk state attribution.  Distinguishes transient (in-flight)
+        # from permanent (no_imagery / marked unhealable) failures so we
+        # know whether the heal-trigger has a chance of fixing this tile or
+        # whether it's a Bing coverage limitation.  Wrapped in try/except —
+        # tile.chunks may be mid-modification by another thread.
+        states = {'permanent_failure': 0, 'in_flight': 0, 'ready_but_empty': 0,
+                  'unknown': 0}
+        try:
+            chunks_list = None
+            if hasattr(tile, 'chunks') and isinstance(tile.chunks, dict):
+                chunks_list = tile.chunks.get(tile.max_zoom)
+            if chunks_list:
+                for idx in missing_idxs:
+                    if idx >= len(chunks_list):
+                        states['unknown'] += 1
+                        continue
+                    chunk = chunks_list[idx]
+                    if getattr(chunk, 'permanent_failure', False):
+                        states['permanent_failure'] += 1
+                    else:
+                        ev = getattr(chunk, 'ready', None)
+                        if ev is None:
+                            states['unknown'] += 1
+                        elif not ev.is_set():
+                            states['in_flight'] += 1
+                        else:
+                            states['ready_but_empty'] += 1
+                # Bump per-state aggregate counters
+                state_bumps = {}
+                for state_name, count in states.items():
+                    if count > 0:
+                        state_bumps[f'tile_chunk_missing_{build_path}_state_{state_name}'] = count
+                if state_bumps:
+                    bump_many(state_bumps)
+        except Exception:
+            pass
         log.warning(
-            f"TILE_CHUNK_MISSING tile={tile_id} path={build_path} "
+            f"TILE_CHUNK_MISSING tile={tile.id} path={build_path} "
             f"missing={n_missing}/{len(jpeg_datas)} "
-            f"({100*n_missing/len(jpeg_datas):.0f}%) pattern={pattern}"
+            f"({100*n_missing/len(jpeg_datas):.0f}%) pattern={pattern} "
+            f"states={states}"
         )
         return missing_idxs
     except Exception:
@@ -7154,7 +7194,7 @@ class Tile(object):
             # saw at PALU.  Mirrors the fix already applied in
             # aodds_builder_finalize_to_file (BG path) and the existing live
             # layout-aware path.
-            _missing_idxs = _trace_chunk_failures(self.id, 'live_aopipeline', jpeg_datas)
+            _missing_idxs = _trace_chunk_failures(self, 'live_aopipeline', jpeg_datas)
             with _native_build_context() as threads:
                 with _native_path_count('live_aopipeline'):
                     result = native_dds.build_from_jpegs_to_buffer(
@@ -8721,7 +8761,7 @@ class Tile(object):
             # get_img + chunk-collection cost.  Lets us see whether the
             # remaining latency is in get_img (network/IO bound) or in
             # the native build (CPU bound).
-            _missing_idxs = _trace_chunk_failures(self.id, 'layout_aware', jpeg_datas)
+            _missing_idxs = _trace_chunk_failures(self, 'layout_aware', jpeg_datas)
             _native_call_t0 = time.monotonic()
             with _native_build_context() as threads:
                 with _native_path_count('layout_aware_chain'):
