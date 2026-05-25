@@ -73,13 +73,36 @@ def _get_missing_color_bc1_block(blocksize: int = 8) -> bytes:
 _cached_bc1_block_8 = None
 _cached_bc1_block_16 = None
 
+# Diagnostic counters for fallback-byte serving — exposed for outside readers
+# (getortho STATS dump) to detect the "tile served before any build completed"
+# case where pydds.read serves missing_color bytes because mm.databuffer is None.
+# This is the source of cold-start green strips when the build trigger fails
+# or hasn't completed yet at FUSE-read time.  No locking; the +=1 is racy but
+# fine for diagnostic counters (integer increment under GIL).
+fallback_bytes_call_count = 0
+fallback_bytes_total = 0
+
 def get_fallback_bytes(length: int, blocksize: int = 8) -> bytes:
     """
     Generate fallback bytes for missing mipmap data using the configured missing_color.
     Returns BC1/BC3 blocks that render as the missing_color instead of garbage.
     """
     global _cached_bc1_block_8, _cached_bc1_block_16
-    
+    global fallback_bytes_call_count, fallback_bytes_total
+
+    fallback_bytes_call_count += 1
+    fallback_bytes_total += length
+    # Rate-limited WARNING — fires on first call and every 100th after to
+    # detect frequency without spamming the log.  If this fires repeatedly
+    # while no TILE_CHUNK_MISSING events appear, the strip class is from
+    # tiles served before any build completes (the gap we couldn't see).
+    if fallback_bytes_call_count == 1 or fallback_bytes_call_count % 100 == 0:
+        log.warning(
+            f"PYDDS_FALLBACK_SERVED count={fallback_bytes_call_count} "
+            f"total_bytes={fallback_bytes_total} this_length={length} "
+            f"blocksize={blocksize}"
+        )
+
     if blocksize == 16:
         if _cached_bc1_block_16 is None:
             _cached_bc1_block_16 = _get_missing_color_bc1_block(16)
@@ -88,7 +111,7 @@ def get_fallback_bytes(length: int, blocksize: int = 8) -> bytes:
         if _cached_bc1_block_8 is None:
             _cached_bc1_block_8 = _get_missing_color_bc1_block(8)
         block = _cached_bc1_block_8
-    
+
     # Generate enough blocks to cover the requested length
     num_blocks = (length + blocksize - 1) // blocksize
     return (block * num_blocks)[:length]
