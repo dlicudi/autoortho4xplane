@@ -1239,6 +1239,54 @@ def bump_many(d: dict):
         inc_many(d)
 
 
+def _trace_chunk_failures(tile_id, build_path, jpeg_datas, threshold=4):
+    """Log when a native build receives a tile with N or more missing/empty
+    JPEG chunks — produces a vertical/horizontal green band when contiguous
+    or a peppered "swiss-cheese" effect when scattered.
+
+    Read-only diagnostic: bumps a per-build-path counter and emits a WARNING
+    log line with the missing-chunk bitmask so we can correlate visible
+    green strips to specific tiles + chunk positions.  No behaviour change.
+    """
+    try:
+        chunks_per_side = int(len(jpeg_datas) ** 0.5)
+        if chunks_per_side * chunks_per_side != len(jpeg_datas):
+            return  # non-square grid; bail without logging
+        missing_idxs = [i for i, d in enumerate(jpeg_datas) if not d or len(d) == 0]
+        n_missing = len(missing_idxs)
+        if n_missing == 0:
+            return
+        # Bump aggregate counters
+        bump(f'tile_chunk_missing_{build_path}_count')
+        bump_many({f'tile_chunk_missing_{build_path}_total': n_missing})
+        if n_missing < threshold:
+            return
+        # Detect contiguous run (column or row) — indicative of imagery-source
+        # boundary or CDN-edge failure rather than scattered network drops.
+        per_row = {}
+        per_col = {}
+        for i in missing_idxs:
+            per_row.setdefault(i // chunks_per_side, []).append(i % chunks_per_side)
+            per_col.setdefault(i % chunks_per_side, []).append(i // chunks_per_side)
+        # Look for a column with ≥ chunks_per_side/2 missing rows = vertical strip
+        col_strips = [c for c, ys in per_col.items() if len(ys) >= chunks_per_side // 2]
+        row_strips = [r for r, xs in per_row.items() if len(xs) >= chunks_per_side // 2]
+        pattern = "scattered"
+        if col_strips:
+            pattern = f"vertical_strip_cols={col_strips}"
+            bump(f'tile_chunk_missing_{build_path}_vertical_strip')
+        elif row_strips:
+            pattern = f"horizontal_strip_rows={row_strips}"
+            bump(f'tile_chunk_missing_{build_path}_horizontal_strip')
+        log.warning(
+            f"TILE_CHUNK_MISSING tile={tile_id} path={build_path} "
+            f"missing={n_missing}/{len(jpeg_datas)} "
+            f"({100*n_missing/len(jpeg_datas):.0f}%) pattern={pattern}"
+        )
+    except Exception:
+        pass
+
+
 def _trace_mm_assign(tile_id, origin, mm, mm_data_len):
     """Attribute mm-buffer assignments to a specific build path so the
     green-strip bug (mm0 buffer shorter than the DDS structure expects)
@@ -7075,6 +7123,7 @@ class Tile(object):
             # saw at PALU.  Mirrors the fix already applied in
             # aodds_builder_finalize_to_file (BG path) and the existing live
             # layout-aware path.
+            _trace_chunk_failures(self.id, 'live_aopipeline', jpeg_datas)
             with _native_build_context() as threads:
                 with _native_path_count('live_aopipeline'):
                     result = native_dds.build_from_jpegs_to_buffer(
@@ -8634,6 +8683,7 @@ class Tile(object):
             # get_img + chunk-collection cost.  Lets us see whether the
             # remaining latency is in get_img (network/IO bound) or in
             # the native build (CPU bound).
+            _trace_chunk_failures(self.id, 'layout_aware', jpeg_datas)
             _native_call_t0 = time.monotonic()
             with _native_build_context() as threads:
                 with _native_path_count('layout_aware_chain'):
