@@ -1244,23 +1244,26 @@ def _trace_chunk_failures(tile_id, build_path, jpeg_datas, threshold=4):
     JPEG chunks — produces a vertical/horizontal green band when contiguous
     or a peppered "swiss-cheese" effect when scattered.
 
-    Read-only diagnostic: bumps a per-build-path counter and emits a WARNING
-    log line with the missing-chunk bitmask so we can correlate visible
-    green strips to specific tiles + chunk positions.  No behaviour change.
+    Bumps per-path counters and emits a WARNING at threshold with the
+    missing-chunk pattern.  Returns the list of missing chunk indices so
+    the caller can flag the tile for BG healing once the build succeeds —
+    the existing _dds_needs_healing / _dispatch_healing_for_incomplete
+    infrastructure will then refetch missing chunks and rebuild the tile.
+    Returns [] when nothing is missing (caller can skip the heal step).
     """
     try:
         chunks_per_side = int(len(jpeg_datas) ** 0.5)
         if chunks_per_side * chunks_per_side != len(jpeg_datas):
-            return  # non-square grid; bail without logging
+            return []  # non-square grid; bail without logging
         missing_idxs = [i for i, d in enumerate(jpeg_datas) if not d or len(d) == 0]
         n_missing = len(missing_idxs)
         if n_missing == 0:
-            return
+            return []
         # Bump aggregate counters
         bump(f'tile_chunk_missing_{build_path}_count')
         bump_many({f'tile_chunk_missing_{build_path}_total': n_missing})
         if n_missing < threshold:
-            return
+            return missing_idxs
         # Detect contiguous run (column or row) — indicative of imagery-source
         # boundary or CDN-edge failure rather than scattered network drops.
         per_row = {}
@@ -1283,6 +1286,34 @@ def _trace_chunk_failures(tile_id, build_path, jpeg_datas, threshold=4):
             f"missing={n_missing}/{len(jpeg_datas)} "
             f"({100*n_missing/len(jpeg_datas):.0f}%) pattern={pattern}"
         )
+        return missing_idxs
+    except Exception:
+        return []
+
+
+def _flag_tile_for_healing(tile, missing_indices, build_path):
+    """Mark a freshly-built tile for BG healing when the live build had to
+    fill chunks with missing_color.  Uses the existing
+    _dds_needs_healing / _dispatch_healing_for_incomplete infrastructure
+    (originally only wired into the cache-miss path).  The BG path will
+    refetch the missing chunks and rebuild the tile, replacing the
+    green-strip live result with a clean serve.
+    No-op if missing_indices is empty or the cache module isn't available.
+    """
+    try:
+        if not missing_indices:
+            return
+        # Merge with any prior missing indices (e.g. from a partial cache load
+        # earlier in this tile's lifetime).  Set semantics prevent duplicates.
+        prior = set(getattr(tile, '_dds_missing_indices', []) or [])
+        prior.update(missing_indices)
+        tile._dds_missing_indices = sorted(prior)
+        tile._dds_needs_healing = True
+        if dynamic_dds_cache is not None:
+            dynamic_dds_cache._dispatch_healing_for_incomplete(
+                tile.id, tile.max_zoom, tile
+            )
+        bump(f'tile_heal_dispatched_{build_path}')
     except Exception:
         pass
 
@@ -7123,7 +7154,7 @@ class Tile(object):
             # saw at PALU.  Mirrors the fix already applied in
             # aodds_builder_finalize_to_file (BG path) and the existing live
             # layout-aware path.
-            _trace_chunk_failures(self.id, 'live_aopipeline', jpeg_datas)
+            _missing_idxs = _trace_chunk_failures(self.id, 'live_aopipeline', jpeg_datas)
             with _native_build_context() as threads:
                 with _native_path_count('live_aopipeline'):
                     result = native_dds.build_from_jpegs_to_buffer(
@@ -7134,6 +7165,13 @@ class Tile(object):
                         max_threads=threads,
                         layout_chunks_per_side=self.width,
                     )
+            # When the build went out with chunks not yet downloaded (vertical
+            # green strip on first serve), flag the tile so BG healing
+            # refetches those chunks and rebuilds.  Only fires above the
+            # WARNING threshold (>=4 missing) — scattered single-chunk drops
+            # aren't visually significant enough to warrant a rebuild.
+            if result.success and _missing_idxs and len(_missing_idxs) >= 4:
+                _flag_tile_for_healing(self, _missing_idxs, 'live_aopipeline')
 
             if not result.success:
                 log.debug(f"_try_aopipeline_build: Native build failed for {self.id}: {result.error}")
@@ -8683,7 +8721,7 @@ class Tile(object):
             # get_img + chunk-collection cost.  Lets us see whether the
             # remaining latency is in get_img (network/IO bound) or in
             # the native build (CPU bound).
-            _trace_chunk_failures(self.id, 'layout_aware', jpeg_datas)
+            _missing_idxs = _trace_chunk_failures(self.id, 'layout_aware', jpeg_datas)
             _native_call_t0 = time.monotonic()
             with _native_build_context() as threads:
                 with _native_path_count('layout_aware_chain'):
@@ -8695,6 +8733,10 @@ class Tile(object):
                         max_mipmaps=0,  # all the way down to 4×4
                         max_threads=threads,
                     )
+            # See comment at _try_aopipeline_build call site — same rationale:
+            # flag for BG healing when build went out with missing chunks.
+            if result.success and _missing_idxs and len(_missing_idxs) >= 4:
+                _flag_tile_for_healing(self, _missing_idxs, 'layout_aware')
             _native_call_ms = int((time.monotonic() - _native_call_t0) * 1000)
             try:
                 bump_many({
