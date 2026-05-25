@@ -4598,7 +4598,25 @@ class BackgroundDDSBuilder:
                     else:
                         builder.mark_missing(i)
                         prefetch_mm0_missing.append(i)
-            
+
+            # Per-tile chunk-failure attribution for the BG streaming path —
+            # missing-chunk indices come from prefetch_mm0_missing rather
+            # than a jpeg_datas list, so synthesize the equivalent input
+            # to reuse the same helper + counters (path tag 'bg_streaming').
+            # Heal flagging not needed here: store_from_file below already
+            # writes mm0_missing_indices into the DDM, and the cache-miss
+            # path at dynamic_dds_cache.load triggers heal natively when
+            # the DDM marks needs_healing on next read.
+            try:
+                _bg_missing_set = set(prefetch_mm0_missing)
+                _bg_jpeg_datas = [
+                    None if i in _bg_missing_set else b'x'
+                    for i in range(len(chunks))
+                ]
+                _trace_chunk_failures(tile, 'bg_streaming', _bg_jpeg_datas)
+            except Exception:
+                pass
+
             # Finalize directly to disk via DynamicDDSCache staging path
             if self._dds_cache is not None:
                 _defer_background_build_if_live(tile)
@@ -9765,6 +9783,55 @@ class Tile(object):
         # can skip caching a tile that will show stale green chunks on future opens.
         if mipmap == 0 and len(chunks_with_images) < len(chunks):
             self._built_with_missing_chunks = True
+            # Python get_img path: this is the build path NOT covered by the
+            # native _trace_chunk_failures helper (which only fires for
+            # native C build entry points).  When get_img exits with any
+            # chunk lacking an image, those chunk regions will be left as
+            # missing_color pixels in the AoImage that gen_mipmaps then
+            # compresses into the BC1 mm0 buffer → visible green strip.
+            # Diagnostic-only counter + WARNING at strip threshold so we can
+            # attribute strips to the Python fallback rather than native paths.
+            try:
+                n_missing = len(chunks) - len(chunks_with_images)
+                n_total = len(chunks)
+                bump('python_get_img_missing_count')
+                bump_many({'python_get_img_missing_total': n_missing})
+                if n_missing >= 4:
+                    bump('python_get_img_strip_event')
+                    # Try to derive missing chunk indices from each chunk's
+                    # geographic offset from the tile origin.  If chunks_per_row
+                    # is known and the offsets stay non-negative within range,
+                    # bump the strip-pattern counter and flag for heal — same
+                    # threshold as native paths.
+                    missing_idxs = []
+                    chunks_per_side = getattr(self, 'chunks_per_row', 0) or 0
+                    tile_col_base = getattr(self, 'col', None)
+                    tile_row_base = getattr(self, 'row', None)
+                    if chunks_per_side > 0 and tile_col_base is not None and tile_row_base is not None:
+                        for chunk in chunks:
+                            if id(chunk) in chunks_with_images:
+                                continue
+                            try:
+                                co = chunk.col - tile_col_base
+                                ro = chunk.row - tile_row_base
+                                if 0 <= co < chunks_per_side and 0 <= ro < chunks_per_side:
+                                    missing_idxs.append(ro * chunks_per_side + co)
+                            except Exception:
+                                continue
+                    log.warning(
+                        f"PYTHON_GET_IMG_MISSING tile={self.id} "
+                        f"missing={n_missing}/{n_total} "
+                        f"({100*n_missing/n_total:.0f}%) "
+                        f"derived_idxs={len(missing_idxs)}"
+                    )
+                    # Flag for BG heal if we derived enough indices (matches
+                    # native threshold).  If index derivation failed, the
+                    # _built_with_missing_chunks flag still prevents the bad
+                    # tile from being persisted via _save_tile_to_passthrough.
+                    if len(missing_idxs) >= 4:
+                        _flag_tile_for_healing(self, missing_idxs, 'python_get_img')
+            except Exception:
+                pass
 
         # Determine if we need to cache this image for fallback/upscaling
         should_cache = complete_img and mipmap <= self.max_mipmap
@@ -10717,6 +10784,11 @@ class Tile(object):
                             jpeg_datas_per_zoom.append([])
                             chain_truncated = True
                 
+                # Trace the mm0-equivalent (highest-detail / first zoom) chunks
+                # — that's the layer most likely to produce a visible strip.
+                _missing_idxs_mm = _trace_chunk_failures(
+                    self, 'mipmap_all_native', jpeg_datas_per_zoom[0]
+                ) if jpeg_datas_per_zoom else []
                 with _native_build_context() as threads:
                     with _native_path_count('mipmap_all_native'):
                         result = native_dds.build_all_mipmaps_native(
@@ -10726,6 +10798,9 @@ class Tile(object):
                             max_threads=threads
                         )
             elif hasattr(native_dds, 'build_mipmap_chain'):
+                _missing_idxs_mm = _trace_chunk_failures(
+                    self, 'mipmap_chain', jpeg_datas
+                )
                 with _native_build_context() as threads:
                     with _native_path_count('mipmap_chain'):
                         result = native_dds.build_mipmap_chain(
@@ -10736,6 +10811,9 @@ class Tile(object):
                             max_threads=threads
                         )
             else:
+                _missing_idxs_mm = _trace_chunk_failures(
+                    self, 'mipmap_single', jpeg_datas
+                )
                 with _native_build_context() as threads:
                     with _native_path_count('mipmap_single'):
                         result = native_dds.build_single_mipmap(
@@ -10757,7 +10835,17 @@ class Tile(object):
             if self.dds is None:
                 log.debug(f"_try_native_mipmap_build: DDS cleared during build for {self.id}")
                 return False
-            
+
+            # Flag tile for BG heal when the per-mipmap build went out with
+            # missing chunks.  Same rationale + threshold as the whole-tile
+            # native paths.  _missing_idxs_mm was set above at each native
+            # call branch; default to [] if none of the branches ran.
+            try:
+                if (_missing_idxs_mm and len(_missing_idxs_mm) >= 4):
+                    _flag_tile_for_healing(self, _missing_idxs_mm, 'mipmap_build')
+            except NameError:
+                pass  # _missing_idxs_mm not set — no native branch ran
+
             # Write mipmap data to DDS buffers — short critical section
             with self._dds_write_lock:
                 self.ready.clear()
