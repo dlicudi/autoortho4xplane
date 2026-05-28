@@ -8207,6 +8207,41 @@ class Tile(object):
         # If XP DOES later read mm0 byte ranges (offset > 0, mm_idx == 0),
         # the regular progressive path below will trigger a real mm0 build.
         if offset == 0:
+            # GREEN-STRIP FIX (2026-05-28): XP's first read is offset=0,
+            # length~35KB — header (128B) PLUS the first chunk-row of mm0
+            # (the top strip of the texture).  The early-return below skips
+            # the build, so dds.read serves missing_color (green) for that
+            # mm0 region; XP uploads it to the GPU and never re-reads the
+            # top strip → persistent green strip at the top of the tile,
+            # same spot every restart (mechanism traced get_bytes:8209 +
+            # read_dds_bytes:8969).
+            #
+            # When this offset=0 read extends into mm0 (length > 128) on a
+            # layout-downgraded tile (build_zoom < layout_zoom, i.e. z18),
+            # and the build-zoom chunks are ALREADY warm (no network needed),
+            # build mm0 now via the existing upscale path so the served
+            # bytes are real imagery, not green.  Cold cache still returns
+            # early (can't fix without a network fetch we won't do on a
+            # header probe).  Gated behind a config flag so the working
+            # baseline is untouched until explicitly enabled.
+            if (getattr(CFG.autoortho, 'prefill_mm0_on_header_read', False)
+                    and length > 128
+                    and self.max_zoom < self.layout_zoom
+                    and self.dds is not None
+                    and len(self.dds.mipmap_list) > 0
+                    and not self.dds.mipmap_list[0].retrieved):
+                try:
+                    if self._probe_chunk_cache_ratio(self.max_zoom) >= 1.0:
+                        bump('prefill_mm0_header_warm_attempt')
+                        if self._build_all_mipmaps_from_mm0(time_budget=time_budget):
+                            bump('prefill_mm0_header_built')
+                            return True
+                        bump('prefill_mm0_header_build_failed')
+                    else:
+                        bump('prefill_mm0_header_cold_skip')
+                except Exception as _e:
+                    log.debug(f"prefill_mm0_on_header_read failed: {_e}")
+                    bump('prefill_mm0_header_exception')
             bump('header_read_skipped_build')
             return True
 
