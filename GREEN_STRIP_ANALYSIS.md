@@ -204,7 +204,7 @@ suspect for "why doesn't it heal."
 ### Existing partial attempt (incomplete — do not rely on)
 
 Commit on `fix/z18-mm0-prefill` adds a config flag `prefill_mm0_on_header_read`
-(default off) that builds mm0 on the header read — **but it is gated on
+(default on) that builds mm0 on the header read — **but it is gated on
 `max_zoom < layout_zoom` (layout-mismatch only)**, which we now know is the WRONG
 gate (the green tiles are plain z16, not layout-mismatch). The gate must be
 **replaced with a location/proximity gate**, not layout-mismatch.

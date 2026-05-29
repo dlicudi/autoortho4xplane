@@ -171,7 +171,7 @@ tile_time_budget = 180.0
 # likely to be rendered up close. This prevents missing_color blocks in the
 # top strip of cold tiles while preserving the cheap header-skip for distant
 # probes.
-prefill_mm0_on_header_read = False
+prefill_mm0_on_header_read = True
 # Aircraft-distance gate for header-read mm0 prefill once position data is valid.
 prefill_mm0_header_radius_nm = 12.0
 # Bounded allowance for the initial scenery-load burst before aircraft position

@@ -14,6 +14,7 @@ except ImportError:
 import logging
 log = logging.getLogger(__name__)
 
+_native_image_lock = threading.RLock()
 _delete_lock = threading.Lock()
 _deleted_ptrs = set()
 
@@ -50,35 +51,64 @@ class AoImage(Structure):
     def __repr__(self):
         return f"ptr:  width: {self._width} height: {self._height} stride: {self._stride} channels: {self._channels}"
 
+    def _native_error(self):
+        try:
+            return self._errmsg.decode(errors="replace").rstrip("\x00")
+        except Exception:
+            return ""
+
+    def _validate_native_image(self, context="AoImage"):
+        if getattr(self, "_freed", False):
+            raise AOImageException(f"{context}: image has been freed")
+
+        try:
+            data_ptr = int(getattr(self, "_data", 0) or 0)
+            width = int(getattr(self, "_width", 0) or 0)
+            height = int(getattr(self, "_height", 0) or 0)
+            stride = int(getattr(self, "_stride", 0) or 0)
+            channels = int(getattr(self, "_channels", 0) or 0)
+        except Exception as e:
+            raise AOImageException(f"{context}: invalid image metadata: {e}") from e
+
+        if data_ptr == 0:
+            raise AOImageException(f"{context}: image data pointer is NULL")
+        if width <= 0 or height <= 0:
+            raise AOImageException(f"{context}: invalid image dimensions {width}x{height}")
+        if channels != 4:
+            raise AOImageException(f"{context}: unsupported channel count {channels}")
+        if stride < width * channels:
+            raise AOImageException(f"{context}: invalid stride {stride} for {width}x{channels}")
+
     def close(self):
         # aoimage_delete ultimately calls free().  A stale duplicate wrapper
         # around the same native pointer can crash the whole worker before
         # Python sees an exception, so guard deletion globally by pointer.
-        with _delete_lock:
-            if self._freed:
-                return
+        with _native_image_lock:
+            with _delete_lock:
+                if self._freed:
+                    return
 
-            ptr = int(getattr(self, "_data", 0) or 0)
-            if not ptr:
+                ptr = int(getattr(self, "_data", 0) or 0)
+                if not ptr:
+                    self._freed = True
+                    return
+
+                if ptr in _deleted_ptrs:
+                    self._data = 0
+                    self._width = 0
+                    self._height = 0
+                    self._stride = 0
+                    self._channels = 0
+                    self._freed = True
+                    return
+
+                _deleted_ptrs.add(ptr)
                 self._freed = True
-                return
 
-            if ptr in _deleted_ptrs:
-                self._data = 0
-                self._width = 0
-                self._height = 0
-                self._stride = 0
-                self._channels = 0
-                self._freed = True
-                return
-
-            _deleted_ptrs.add(ptr)
-            self._freed = True
-
-        try:
-            _aoi.aoimage_delete(self)
-        except Exception as e:
-            log.error(f"Error in AoImage.close: {e}")
+            try:
+                _aoi.aoimage_delete(self)
+            except Exception as e:
+                log.error(f"Error in AoImage.close: {e}")
 
     def __enter__(self):
         """Context manager entry - enables 'with AoImage(...) as img:' pattern."""
@@ -250,16 +280,53 @@ class AoImage(Structure):
         Returns:
             New AoImage with dimensions (width * scale_factor, height * scale_factor)
         """
-        result = AoImage()
         try:
-            if not _aoi.aoimage_crop_and_upscale(self, result, x, y, width, height, scale_factor):
-                result.close()  # Cleanup on failure
-                raise AOImageException(f"crop_and_upscale failed: {result._errmsg.decode()}")
-            return result
+            x = int(x)
+            y = int(y)
+            width = int(width)
+            height = int(height)
+            scale_factor = int(scale_factor)
+        except Exception as e:
+            raise AOImageException(f"crop_and_upscale: invalid integer argument: {e}") from e
+
+        if x < 0 or y < 0:
+            raise AOImageException(f"crop_and_upscale: negative crop origin ({x},{y})")
+        if width <= 0 or height <= 0:
+            raise AOImageException(f"crop_and_upscale: invalid crop size {width}x{height}")
+        if scale_factor <= 0 or (scale_factor & (scale_factor - 1)) != 0:
+            raise AOImageException(f"crop_and_upscale: scale_factor must be a positive power of 2, got {scale_factor}")
+        if scale_factor > 64:
+            raise AOImageException(f"crop_and_upscale: scale_factor too large: {scale_factor}")
+
+        try:
+            self._validate_native_image("crop_and_upscale source")
+            src_w = int(self._width)
+            src_h = int(self._height)
+            if x > src_w or width > src_w - x:
+                raise AOImageException(f"crop_and_upscale: crop x bounds {x}+{width}>{src_w}")
+            if y > src_h or height > src_h - y:
+                raise AOImageException(f"crop_and_upscale: crop y bounds {y}+{height}>{src_h}")
+            if width * scale_factor > 32768 or height * scale_factor > 32768:
+                raise AOImageException(
+                    f"crop_and_upscale: destination too large {width * scale_factor}x{height * scale_factor}"
+                )
+
+            result = AoImage()
+            try:
+                with _native_image_lock:
+                    self._validate_native_image("crop_and_upscale source")
+                    if not _aoi.aoimage_crop_and_upscale(self, result, x, y, width, height, scale_factor):
+                        errmsg = result._native_error()
+                        result.close()
+                        raise AOImageException(f"crop_and_upscale failed: {errmsg}")
+                result._validate_native_image("crop_and_upscale result")
+                return result
+            except Exception:
+                result.close()
+                raise
         except AOImageException:
             raise  # Re-raise our exception
         except Exception as e:
-            result.close()  # Cleanup on exception
             raise AOImageException(f"crop_and_upscale exception: {e}")
 
     @property

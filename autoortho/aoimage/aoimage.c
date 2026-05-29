@@ -496,10 +496,36 @@ AOIAPI int32_t aoimage_crop_and_upscale(aoimage_t *src_img, aoimage_t *dst_img,
                                         uint32_t crop_x, uint32_t crop_y,
                                         uint32_t crop_width, uint32_t crop_height,
                                         uint32_t scale_factor) {
+    if (dst_img == NULL) {
+        return FALSE;
+    }
     memset(dst_img, 0, sizeof(aoimage_t));
     
     // Validate inputs
-    assert(src_img->channels == 4);
+    if (src_img == NULL) {
+        strcpy(dst_img->errmsg, "source image is NULL");
+        return FALSE;
+    }
+    if (src_img->ptr == NULL) {
+        strcpy(dst_img->errmsg, "source image data is NULL");
+        return FALSE;
+    }
+    if (src_img->width == 0 || src_img->height == 0) {
+        sprintf(dst_img->errmsg, "invalid source dimensions: %ux%u", src_img->width, src_img->height);
+        return FALSE;
+    }
+    if (src_img->channels != 4) {
+        sprintf(dst_img->errmsg, "channel error %u != 4", src_img->channels);
+        return FALSE;
+    }
+    if (src_img->stride < src_img->width * 4) {
+        sprintf(dst_img->errmsg, "invalid source stride: %u", src_img->stride);
+        return FALSE;
+    }
+    if (crop_width == 0 || crop_height == 0) {
+        strcpy(dst_img->errmsg, "crop size must be nonzero");
+        return FALSE;
+    }
     
     if (scale_factor == 0 || (scale_factor & (scale_factor - 1)) != 0) {
         strcpy(dst_img->errmsg, "scale_factor must be power of 2");
@@ -507,17 +533,21 @@ AOIAPI int32_t aoimage_crop_and_upscale(aoimage_t *src_img, aoimage_t *dst_img,
     }
     
     // Bounds check
-    if (crop_x + crop_width > src_img->width) {
+    if (crop_x > src_img->width || crop_width > src_img->width - crop_x) {
         sprintf(dst_img->errmsg, "crop x bounds: %u + %u > %u", crop_x, crop_width, src_img->width);
         return FALSE;
     }
     
-    if (crop_y + crop_height > src_img->height) {
+    if (crop_y > src_img->height || crop_height > src_img->height - crop_y) {
         sprintf(dst_img->errmsg, "crop y bounds: %u + %u > %u", crop_y, crop_height, src_img->height);
         return FALSE;
     }
     
     // Calculate destination dimensions
+    if (crop_width > UINT32_MAX / scale_factor || crop_height > UINT32_MAX / scale_factor) {
+        strcpy(dst_img->errmsg, "destination dimension overflow");
+        return FALSE;
+    }
     uint32_t dst_width = crop_width * scale_factor;
     uint32_t dst_height = crop_height * scale_factor;
     

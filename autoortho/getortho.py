@@ -8087,7 +8087,7 @@ class Tile(object):
 
     def _should_prefill_mm0_for_header_read(self) -> tuple:
         """Return (should_prefill, reason, distance_nm) for offset=0 mm0 reads."""
-        if not _get_bool_config(CFG.autoortho, 'prefill_mm0_on_header_read', False):
+        if not _get_bool_config(CFG.autoortho, 'prefill_mm0_on_header_read', True):
             return False, 'disabled', None
         if self.dds is None or not self.dds.mipmap_list:
             return False, 'no_dds', None
@@ -9283,7 +9283,7 @@ class Tile(object):
         try:
             if self.dds is None or img is None or self._closed:
                 return img
-            if getattr(img, '_freed', False):
+            if not self._is_valid_aoimage(img):
                 return img
             target_w = max(1, self.dds.width >> mipmap)
             target_h = max(1, self.dds.height >> mipmap)
@@ -9298,7 +9298,7 @@ class Tile(object):
                 return img
             with self._lock:
                 # Re-check after lock acquisition — close() may have run.
-                if self._closed or getattr(img, '_freed', False):
+                if self._closed or not self._is_valid_aoimage(img):
                     return img
                 # Timing baseline: total wall-clock cost of the Python
                 # upscale path (orchestration + ctypes call + C upscale).
@@ -10482,6 +10482,10 @@ class Tile(object):
                     if fallback_img is None:
                         log.warning(f"Cascading fallback: load_from_memory returned None for {fallback_chunk}")
                         continue
+                    if not self._is_valid_aoimage(fallback_img):
+                        log.warning(f"Cascading fallback: invalid image from {fallback_chunk}")
+                        fallback_img.close()
+                        continue
                 
                 # Calculate which portion to extract and upscale
                 scale_factor = 1 << mipmap_diff
@@ -10546,6 +10550,8 @@ class Tile(object):
             
             if higher_img is None:
                 continue
+            if not self._is_valid_aoimage(higher_img):
+                continue
             
             # Calculate scale factor
             scale_factor = 1 << (target_mipmap - higher_mipmap)
@@ -10597,6 +10603,8 @@ class Tile(object):
                 lower_img, base_col, base_row, base_zoom = img_data
             else:
                 continue  # Old format without metadata, skip
+            if not self._is_valid_aoimage(lower_img):
+                continue
             
             # Calculate scale factor and relative position
             scale_factor = 1 << (lower_mipmap - target_mipmap)
