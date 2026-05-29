@@ -3,6 +3,7 @@
 import os
 import sys
 from ctypes import *
+import threading
 
 # Handle imports for both frozen (PyInstaller) and direct Python execution
 try:
@@ -12,6 +13,9 @@ except ImportError:
 
 import logging
 log = logging.getLogger(__name__)
+
+_delete_lock = threading.Lock()
+_deleted_ptrs = set()
 
 class AOImageException(Exception):
     pass
@@ -38,26 +42,43 @@ class AoImage(Structure):
         self._freed = False  # Prevent double-free crashes
 
     def __del__(self):
-        # Only delete if not already freed (prevents double-free crash)
-        if not self._freed:
-            try:
-                _aoi.aoimage_delete(self)
-                self._freed = True
-            except Exception as e:
-                # Log but don't raise in __del__ (causes issues)
-                log.debug(f"Error in AoImage.__del__: {e}")
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def __repr__(self):
         return f"ptr:  width: {self._width} height: {self._height} stride: {self._stride} channels: {self._channels}"
 
     def close(self):
-        # Only delete if not already freed (prevents double-free crash)
-        if not self._freed:
-            try:
-                _aoi.aoimage_delete(self)
+        # aoimage_delete ultimately calls free().  A stale duplicate wrapper
+        # around the same native pointer can crash the whole worker before
+        # Python sees an exception, so guard deletion globally by pointer.
+        with _delete_lock:
+            if self._freed:
+                return
+
+            ptr = int(getattr(self, "_data", 0) or 0)
+            if not ptr:
                 self._freed = True
-            except Exception as e:
-                log.error(f"Error in AoImage.close: {e}")
+                return
+
+            if ptr in _deleted_ptrs:
+                self._data = 0
+                self._width = 0
+                self._height = 0
+                self._stride = 0
+                self._channels = 0
+                self._freed = True
+                return
+
+            _deleted_ptrs.add(ptr)
+            self._freed = True
+
+        try:
+            _aoi.aoimage_delete(self)
+        except Exception as e:
+            log.error(f"Error in AoImage.close: {e}")
 
     def __enter__(self):
         """Context manager entry - enables 'with AoImage(...) as img:' pattern."""

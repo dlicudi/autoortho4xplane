@@ -1027,6 +1027,26 @@ _live_reads_lock = threading.Lock()
 _partial_mm0_promotions = OrderedDict()
 _partial_mm0_promotions_lock = threading.Lock()
 
+# Bounded startup allowance for header-read mm0 prefill before aircraft
+# position data is available.  This covers X-Plane's initial scenery-load burst
+# without turning every distant header probe into a full mm0 download.
+_header_mm0_startup_prefills = OrderedDict()
+_header_mm0_startup_prefills_lock = threading.Lock()
+
+# Bounded startup allowance for real non-header mm0 reads before aircraft
+# position data is available. Unlike header probes, these reads indicate
+# X-Plane is already trying to render the tile.
+_startup_real_mm0_builds = OrderedDict()
+_startup_real_mm0_builds_lock = threading.Lock()
+_reconnect_real_mm0_builds = OrderedDict()
+_reconnect_real_mm0_builds_lock = threading.Lock()
+
+# Bounded background repair set for header reads that kept the fast skip path.
+# These repairs are speculative and low-priority: they should improve future
+# reads/restarts without delaying X-Plane's current read.
+_header_mm0_heals = OrderedDict()
+_header_mm0_heals_lock = threading.Lock()
+
 _shutdown_requested = threading.Event()
 
 
@@ -4204,6 +4224,10 @@ class BackgroundDDSBuilder:
         finally:
             if not deferred:
                 try:
+                    tile._release_header_mm0_heal_claim()
+                except Exception:
+                    pass
+                try:
                     tile._clear_mm0_promotion_pin()
                 except Exception:
                     pass
@@ -6486,6 +6510,7 @@ class Tile(object):
         # Bounded repair state for partial DDS cache entries missing mipmap 0.
         self._mm0_promotion_queued = False
         self._mm0_promotion_pin_until = 0.0
+        self._header_mm0_heal_queued = False
 
         # Diagnostic instrumentation — per-tile lifetime tracking.  Populated
         # by build paths and serve path; consumed by TILE_LIFETIME log in
@@ -7912,7 +7937,409 @@ class Tile(object):
             bump('partial_mm0_promote_error')
             return False
 
-    def get_bytes(self, offset, length, time_budget=None):
+    def _distance_to_aircraft_nm(self):
+        if not bool(datareftracker.data_valid and datareftracker.connected):
+            return None
+        with datareftracker._lock:
+            player_lat = datareftracker.lat
+            player_lon = datareftracker.lon
+
+        center_row = self.row + (self.height / 2.0) - 0.5
+        center_col = self.col + (self.width / 2.0) - 0.5
+        tile_lat, tile_lon = _chunk_to_latlon(center_row, center_col, self.tilename_zoom)
+        return _haversine_distance(player_lat, player_lon, tile_lat, tile_lon) / 1852.0
+
+    def _distance_to_last_known_aircraft_nm(self):
+        with datareftracker._lock:
+            player_lat = datareftracker.lat
+            player_lon = datareftracker.lon
+
+        if not (-90.0 <= player_lat <= 90.0 and -180.0 <= player_lon <= 180.0):
+            return None
+
+        center_row = self.row + (self.height / 2.0) - 0.5
+        center_col = self.col + (self.width / 2.0) - 0.5
+        tile_lat, tile_lon = _chunk_to_latlon(center_row, center_col, self.tilename_zoom)
+        return _haversine_distance(player_lat, player_lon, tile_lat, tile_lon) / 1852.0
+
+    def _claim_real_mm0_build(self, claimed_builds, claimed_builds_lock,
+                              max_tiles: int, window_sec: float) -> bool:
+        with claimed_builds_lock:
+            cutoff = time.monotonic() - window_sec
+            while claimed_builds:
+                _old_id, old_ts = next(iter(claimed_builds.items()))
+                if old_ts >= cutoff:
+                    break
+                claimed_builds.popitem(last=False)
+
+            if self.id not in claimed_builds:
+                if len(claimed_builds) >= max_tiles:
+                    return False
+                claimed_builds[self.id] = time.monotonic()
+        return True
+
+    def _should_build_full_mm0_for_near_read(self, mipmap: int, read_branch: str) -> tuple:
+        """Return (should_build, reason, distance_nm) for real near-aircraft mm0 reads."""
+        if not _get_bool_config(CFG.autoortho, 'full_mm0_near_aircraft_enabled', True):
+            return False, 'disabled', None
+        if mipmap != 0:
+            return False, 'not_mm0', None
+        if read_branch == 'header':
+            return False, 'header_probe', None
+        if self.dds is None or not self.dds.mipmap_list:
+            return False, 'no_dds', None
+        if self.dds.mipmap_list[0].retrieved:
+            return False, 'already_built', None
+
+        try:
+            radius_nm = float(getattr(CFG.autoortho, 'full_mm0_near_aircraft_radius_nm', 10.0))
+        except Exception:
+            radius_nm = 10.0
+        radius_nm = max(1.0, min(100.0, radius_nm))
+
+        try:
+            distance_nm = self._distance_to_aircraft_nm()
+        except Exception as e:
+            log.debug(f"Near-aircraft full mm0 distance check failed for {self.id}: {e}")
+            bump('full_mm0_near_aircraft_distance_error')
+            return False, 'distance_error', None
+        if distance_nm is None:
+            if (not getattr(datareftracker, 'has_ever_connected', False)
+                    and _get_bool_config(CFG.autoortho,
+                                         'full_mm0_startup_real_read_enabled',
+                                         True)):
+                try:
+                    startup_cap = int(getattr(
+                        CFG.autoortho, 'full_mm0_startup_real_read_max_tiles', 32))
+                except Exception:
+                    startup_cap = 32
+                startup_cap = max(0, min(512, startup_cap))
+                if startup_cap <= 0:
+                    return False, 'startup_cap_zero', None
+
+                try:
+                    startup_window_sec = float(getattr(
+                        CFG.autoortho, 'full_mm0_startup_real_read_window_sec', 180.0))
+                except Exception:
+                    startup_window_sec = 180.0
+                startup_window_sec = max(30.0, min(900.0, startup_window_sec))
+
+                if not self._claim_real_mm0_build(
+                        _startup_real_mm0_builds,
+                        _startup_real_mm0_builds_lock,
+                        startup_cap,
+                        startup_window_sec):
+                    return False, 'startup_cap_hit', None
+
+                return True, 'startup_real_read', None
+
+            if (getattr(datareftracker, 'has_ever_connected', False)
+                    and _get_bool_config(CFG.autoortho,
+                                         'full_mm0_reconnect_real_read_enabled',
+                                         True)):
+                try:
+                    last_distance_nm = self._distance_to_last_known_aircraft_nm()
+                except Exception as e:
+                    log.debug(f"Reconnect full mm0 distance check failed for {self.id}: {e}")
+                    bump('full_mm0_near_aircraft_reconnect_distance_error')
+                    last_distance_nm = None
+
+                try:
+                    min_switch_distance_nm = float(getattr(
+                        CFG.autoortho,
+                        'full_mm0_reconnect_real_read_min_distance_nm',
+                        40.0))
+                except Exception:
+                    min_switch_distance_nm = 40.0
+                min_switch_distance_nm = max(5.0, min(500.0, min_switch_distance_nm))
+
+                if last_distance_nm is not None and last_distance_nm < min_switch_distance_nm:
+                    return False, 'reconnect_near_last_position', last_distance_nm
+
+                try:
+                    reconnect_cap = int(getattr(
+                        CFG.autoortho, 'full_mm0_reconnect_real_read_max_tiles', 64))
+                except Exception:
+                    reconnect_cap = 64
+                reconnect_cap = max(0, min(512, reconnect_cap))
+                if reconnect_cap <= 0:
+                    return False, 'reconnect_cap_zero', last_distance_nm
+
+                try:
+                    reconnect_window_sec = float(getattr(
+                        CFG.autoortho, 'full_mm0_reconnect_real_read_window_sec', 180.0))
+                except Exception:
+                    reconnect_window_sec = 180.0
+                reconnect_window_sec = max(30.0, min(900.0, reconnect_window_sec))
+
+                if not self._claim_real_mm0_build(
+                        _reconnect_real_mm0_builds,
+                        _reconnect_real_mm0_builds_lock,
+                        reconnect_cap,
+                        reconnect_window_sec):
+                    return False, 'reconnect_cap_hit', last_distance_nm
+
+                return True, 'reconnect_real_read', last_distance_nm
+            return False, 'no_current_position', None
+        if distance_nm <= radius_nm:
+            return True, 'near_aircraft', distance_nm
+        return False, 'too_far', distance_nm
+
+    def _should_prefill_mm0_for_header_read(self) -> tuple:
+        """Return (should_prefill, reason, distance_nm) for offset=0 mm0 reads."""
+        if not _get_bool_config(CFG.autoortho, 'prefill_mm0_on_header_read', False):
+            return False, 'disabled', None
+        if self.dds is None or not self.dds.mipmap_list:
+            return False, 'no_dds', None
+        if self.dds.mipmap_list[0].retrieved:
+            return False, 'already_built', None
+
+        have_position = bool(datareftracker.data_valid and datareftracker.connected)
+        if have_position:
+            try:
+                radius_nm = float(getattr(CFG.autoortho, 'prefill_mm0_header_radius_nm', 12.0))
+            except Exception:
+                radius_nm = 12.0
+            radius_nm = max(1.0, min(100.0, radius_nm))
+
+            try:
+                distance_nm = self._distance_to_aircraft_nm()
+                if distance_nm is None:
+                    return False, 'no_current_position', None
+            except Exception as e:
+                log.debug(f"Header mm0 prefill distance check failed for {self.id}: {e}")
+                bump('prefill_mm0_header_distance_error')
+                return False, 'distance_error', None
+
+            if distance_nm <= radius_nm:
+                return True, 'near_aircraft', distance_nm
+            return False, 'too_far', distance_nm
+
+        # Before the first dataref connection, the initial request burst is the
+        # spawn area. Allow a bounded number of header-prefill builds so start
+        # tiles do not get permanently uploaded with missing_color in mm0.
+        if getattr(datareftracker, 'has_ever_connected', False):
+            return False, 'no_current_position', None
+
+        try:
+            startup_cap = int(getattr(CFG.autoortho, 'prefill_mm0_header_startup_max_tiles', 256))
+        except Exception:
+            startup_cap = 256
+        startup_cap = max(0, min(2000, startup_cap))
+        if startup_cap <= 0:
+            return False, 'startup_cap_zero', None
+
+        try:
+            startup_window_sec = float(getattr(CFG.autoortho, 'prefill_mm0_header_startup_window_sec', 180.0))
+        except Exception:
+            startup_window_sec = 180.0
+        startup_window_sec = max(30.0, min(900.0, startup_window_sec))
+
+        with _header_mm0_startup_prefills_lock:
+            cutoff = time.monotonic() - startup_window_sec
+            while _header_mm0_startup_prefills:
+                _old_id, old_ts = next(iter(_header_mm0_startup_prefills.items()))
+                if old_ts >= cutoff:
+                    break
+                _header_mm0_startup_prefills.popitem(last=False)
+
+            if self.id not in _header_mm0_startup_prefills:
+                if len(_header_mm0_startup_prefills) >= startup_cap:
+                    return False, 'startup_cap_hit', None
+                _header_mm0_startup_prefills[self.id] = time.monotonic()
+
+        return True, 'startup_burst', None
+
+    def _store_complete_dds_cache(self, origin: str) -> bool:
+        """Persist a fully populated in-memory DDS, if the dynamic cache is enabled."""
+        if dynamic_dds_cache is None or self.dds is None:
+            return False
+        try:
+            unpopulated = []
+            if self.dds.mipmap_list:
+                for mm in self.dds.mipmap_list[:self.dds.smallest_mm + 1]:
+                    if not mm.retrieved or mm.databuffer is None:
+                        unpopulated.append(mm.idx)
+            if unpopulated:
+                log.debug(
+                    f"{origin}: cache store for {self.id} skipped; "
+                    f"unpopulated mipmaps {unpopulated}"
+                )
+                bump(f'{origin}_cache_store_skipped_unpopulated')
+                return False
+
+            self.dds.seek(0)
+            dds_bytes = self.dds.read(self.dds.total_size)
+            if not dds_bytes or len(dds_bytes) < 128:
+                bump(f'{origin}_cache_store_empty')
+                return False
+
+            mm0_missing = None
+            with self._lock:
+                mm0_chunks = self.chunks.get(self.max_zoom, [])
+            if mm0_chunks:
+                missing = [i for i, c in enumerate(mm0_chunks)
+                           if not (c.ready.is_set() and c.data)]
+                mm0_missing = missing or None
+
+            dynamic_dds_cache.store(
+                self.id, self.max_zoom, dds_bytes, self,
+                mm0_missing_indices=mm0_missing)
+            bump(f'{origin}_cache_stored')
+            return True
+        except Exception as e:
+            log.debug(f"{origin}: cache store failed for {self.id}: {e}")
+            bump(f'{origin}_cache_store_error')
+            return False
+
+    def _release_header_mm0_heal_claim(self) -> None:
+        self._header_mm0_heal_queued = False
+        with _header_mm0_heals_lock:
+            _header_mm0_heals.pop(self.id, None)
+
+    def _maybe_queue_header_mm0_heal(self, read_branch: str = 'header') -> bool:
+        """Queue a low-priority background DDS build after a skipped header read."""
+        if read_branch != 'header':
+            bump('header_mm0_heal_not_header_probe')
+            return False
+        if self._header_mm0_heal_queued:
+            bump('header_mm0_heal_duplicate')
+            return False
+        if not _get_bool_config(CFG.autoortho, 'header_mm0_heal_enabled', True):
+            bump('header_mm0_heal_disabled')
+            return False
+        if background_dds_builder is None or tile_completion_tracker is None:
+            bump('header_mm0_heal_no_builder')
+            return False
+        if dynamic_dds_cache is None:
+            bump('header_mm0_heal_no_cache')
+            return False
+        if self.dds is None or not self.dds.mipmap_list or self.dds.mipmap_list[0].retrieved:
+            return False
+
+        have_position = bool(datareftracker.data_valid and datareftracker.connected)
+        distance_nm = None
+        if have_position:
+            try:
+                radius_nm = float(getattr(CFG.autoortho, 'header_mm0_heal_radius_nm', 20.0))
+            except Exception:
+                radius_nm = 20.0
+            radius_nm = max(1.0, min(150.0, radius_nm))
+            try:
+                distance_nm = self._distance_to_aircraft_nm()
+                if distance_nm is None:
+                    bump('header_mm0_heal_no_current_position')
+                    return False
+            except Exception as e:
+                log.debug(f"Header mm0 heal distance check failed for {self.id}: {e}")
+                bump('header_mm0_heal_distance_error')
+                return False
+            if distance_nm > radius_nm:
+                bump('header_mm0_heal_too_far')
+                return False
+
+        try:
+            max_heals = int(getattr(CFG.autoortho, 'header_mm0_heal_max_tiles', 384))
+        except Exception:
+            max_heals = 384
+        max_heals = max(0, min(3000, max_heals))
+        if max_heals <= 0:
+            bump('header_mm0_heal_cap_zero')
+            return False
+
+        if not have_position and not getattr(datareftracker, 'has_ever_connected', False):
+            if not _get_bool_config(CFG.autoortho, 'header_mm0_heal_startup_probe_enabled', False):
+                bump('header_mm0_heal_startup_probe_skipped')
+                return False
+            try:
+                startup_cap = int(getattr(CFG.autoortho, 'header_mm0_heal_startup_max_tiles', 192))
+            except Exception:
+                startup_cap = 192
+            max_heals = max(0, min(max_heals, startup_cap))
+            if max_heals <= 0:
+                bump('header_mm0_heal_startup_cap_zero')
+                return False
+        elif not have_position:
+            bump('header_mm0_heal_no_current_position')
+            return False
+
+        try:
+            heal_window_sec = float(getattr(CFG.autoortho, 'header_mm0_heal_window_sec', 300.0))
+        except Exception:
+            heal_window_sec = 300.0
+        heal_window_sec = max(30.0, min(1800.0, heal_window_sec))
+
+        with _header_mm0_heals_lock:
+            cutoff = time.monotonic() - heal_window_sec
+            while _header_mm0_heals:
+                _old_id, old_ts = next(iter(_header_mm0_heals.items()))
+                if old_ts >= cutoff:
+                    break
+                _header_mm0_heals.popitem(last=False)
+
+            if self.id in _header_mm0_heals:
+                self._header_mm0_heal_queued = True
+                bump('header_mm0_heal_duplicate')
+                return False
+            if len(_header_mm0_heals) >= max_heals:
+                bump('header_mm0_heal_cap_hit')
+                return False
+            _header_mm0_heals[self.id] = time.monotonic()
+
+        try:
+            self._create_chunks(self.max_zoom)
+            chunks = self.chunks.get(self.max_zoom, [])
+            if not chunks:
+                bump('header_mm0_heal_no_chunks')
+                self._release_header_mm0_heal_claim()
+                return False
+
+            not_ready = [c for c in chunks if not c.ready.is_set()]
+            self._header_mm0_heal_queued = True
+            self._pin_mm0_promotion()
+
+            if not not_ready:
+                if background_dds_builder.submit(self, priority=PRIORITY_CACHE_REPAIR):
+                    bump('header_mm0_heal_builder_ready')
+                    return True
+                bump('header_mm0_heal_builder_rejected')
+                self._release_header_mm0_heal_claim()
+                self._clear_mm0_promotion_pin()
+                return False
+
+            tile_completion_tracker.start_tracking(self, self.max_zoom)
+            submitted = 0
+            for chunk in not_ready:
+                if chunk.ready.is_set():
+                    continue
+                if not getattr(chunk, 'in_queue', False) and not getattr(chunk, 'in_flight', False):
+                    chunk.priority = (
+                        PRIORITY_CACHE_REPAIR +
+                        _calculate_spatial_priority(chunk.row, chunk.col, chunk.zoom, 0)
+                    )
+                    chunk.prefetch = True
+                    chunk_getter.submit(chunk)
+                    submitted += 1
+
+            bump('header_mm0_heal_queued')
+            if submitted:
+                bump('header_mm0_heal_chunks_submitted', submitted)
+            log.debug(
+                f"HEADER_MM0_HEAL: queued {self.id} "
+                f"distance={distance_nm:.1f}nm submitted={submitted} pending={len(not_ready)}"
+                if distance_nm is not None else
+                f"HEADER_MM0_HEAL: queued {self.id} "
+                f"distance=unknown submitted={submitted} pending={len(not_ready)}"
+            )
+            return True
+        except Exception as e:
+            self._release_header_mm0_heal_claim()
+            self._clear_mm0_promotion_pin()
+            log.debug(f"Header mm0 heal failed for {self.id}: {e}")
+            bump('header_mm0_heal_error')
+            return False
+
+    def get_bytes(self, offset, length, time_budget=None, read_branch: str = 'unknown'):
         """
         Get bytes from DDS at specified offset.
         
@@ -7931,7 +8358,7 @@ class Tile(object):
         # partial builds.  Bucketed by length: <=128 is pure header,
         # 128<len<=4096 is header + small mm0 prefix (forces mm0 partial build),
         # >4096 is header + bigger mm0 region.
-        if offset == 0:
+        if offset == 0 and read_branch == 'header':
             self._last_get_bytes_was_header = True
             try:
                 bump_many({
@@ -8199,49 +8626,47 @@ class Tile(object):
         # - The aopipeline batch was correctly skipped (is_pure_mipmap_request
         #   was False).
         #
-        # If we still need to build mm0 here, that's a cold-cache offset=0
-        # read.  Return early: the DDS header bytes (0-127) are valid from
-        # DDS.__init__, and the mm0 region returns whatever's in the
-        # buffer (typically zeros).  X-Plane uses the header to set up the
-        # texture but rarely renders mm0 of a tile XP only saw at distance.
-        # If XP DOES later read mm0 byte ranges (offset > 0, mm_idx == 0),
-        # the regular progressive path below will trigger a real mm0 build.
-        if offset == 0:
-            # GREEN-STRIP FIX (2026-05-28): XP's first read is offset=0,
-            # length~35KB — header (128B) PLUS the first chunk-row of mm0
-            # (the top strip of the texture).  The early-return below skips
-            # the build, so dds.read serves missing_color (green) for that
-            # mm0 region; XP uploads it to the GPU and never re-reads the
-            # top strip → persistent green strip at the top of the tile,
-            # same spot every restart (mechanism traced get_bytes:8209 +
-            # read_dds_bytes:8969).
-            #
-            # When this offset=0 read extends into mm0 (length > 128) on a
-            # layout-downgraded tile (build_zoom < layout_zoom, i.e. z18),
-            # and the build-zoom chunks are ALREADY warm (no network needed),
-            # build mm0 now via the existing upscale path so the served
-            # bytes are real imagery, not green.  Cold cache still returns
-            # early (can't fix without a network fetch we won't do on a
-            # header probe).  Gated behind a config flag so the working
-            # baseline is untouched until explicitly enabled.
-            if (getattr(CFG.autoortho, 'prefill_mm0_on_header_read', False)
-                    and length > 128
-                    and self.max_zoom < self.layout_zoom
-                    and self.dds is not None
-                    and len(self.dds.mipmap_list) > 0
-                    and not self.dds.mipmap_list[0].retrieved):
-                try:
-                    if self._probe_chunk_cache_ratio(self.max_zoom) >= 1.0:
-                        bump('prefill_mm0_header_warm_attempt')
+        # If we still need to build mm0 here, the proximity/startup gate below
+        # decides whether this header read is likely to become visible. Near
+        # tiles build now; distant probes still return early and keep the
+        # header-skip optimization. If XP later reads mm0 byte ranges
+        # (offset > 0, mm_idx == 0), the regular progressive path below will
+        # trigger a real mm0 build.
+        if offset == 0 and read_branch == 'header':
+            # GREEN-STRIP FIX (2026-05-28): XP's first read is offset=0 and
+            # often extends past the 128-byte DDS header into the top strip of
+            # mm0. If mm0 is unbuilt, pydds serves missing_color blocks there;
+            # XP uploads those bytes once and usually never asks for that strip
+            # again. Build mm0 for tiles that are likely to be rendered up close:
+            # near the aircraft when position is known, and a bounded initial
+            # load burst before the first dataref position arrives.
+            if length > 128:
+                should_prefill, prefill_reason, prefill_distance_nm = (
+                    self._should_prefill_mm0_for_header_read()
+                )
+                if should_prefill:
+                    try:
+                        bump(f'prefill_mm0_header_attempt_{prefill_reason}')
                         if self._build_all_mipmaps_from_mm0(time_budget=time_budget):
-                            bump('prefill_mm0_header_built')
+                            bump(f'prefill_mm0_header_built_{prefill_reason}')
+                            self._store_complete_dds_cache('prefill_mm0_header')
+                            log.debug(
+                                f"PREFILL_MM0_HEADER: built {self.id} "
+                                f"reason={prefill_reason} "
+                                f"distance={prefill_distance_nm:.1f}nm"
+                                if prefill_distance_nm is not None else
+                                f"PREFILL_MM0_HEADER: built {self.id} "
+                                f"reason={prefill_reason} distance=unknown"
+                            )
                             return True
-                        bump('prefill_mm0_header_build_failed')
-                    else:
-                        bump('prefill_mm0_header_cold_skip')
-                except Exception as _e:
-                    log.debug(f"prefill_mm0_on_header_read failed: {_e}")
-                    bump('prefill_mm0_header_exception')
+                        bump(f'prefill_mm0_header_build_failed_{prefill_reason}')
+                    except Exception as _e:
+                        log.debug(f"prefill_mm0_on_header_read failed: {_e}")
+                        bump('prefill_mm0_header_exception')
+                else:
+                    bump(f'prefill_mm0_header_skip_{prefill_reason}')
+                if not should_prefill:
+                    self._maybe_queue_header_mm0_heal(read_branch=read_branch)
             bump('header_read_skipped_build')
             return True
 
@@ -8255,6 +8680,36 @@ class Tile(object):
             log.debug(f"We already have mipmap {mipmap} for {self}")
             return True
 
+        # Real close-up mm0 reads are visible terrain, not disposable file
+        # probes. If we let native partial serve only the requested rows for a
+        # nearby cold ZL16 tile, X-Plane can keep rendering that incomplete
+        # texture. Build the full mm0 chain for close tiles; distant reads keep
+        # the faster partial path below.
+        if mipmap == 0:
+            should_full_mm0, full_mm0_reason, full_mm0_distance_nm = (
+                self._should_build_full_mm0_for_near_read(mipmap, read_branch)
+            )
+            if should_full_mm0:
+                try:
+                    bump(f'full_mm0_near_aircraft_attempt_{full_mm0_reason}')
+                    if self._build_all_mipmaps_from_mm0(time_budget=time_budget):
+                        bump(f'full_mm0_near_aircraft_built_{full_mm0_reason}')
+                        self._store_complete_dds_cache('full_mm0_near_aircraft')
+                        log.debug(
+                            f"FULL_MM0_NEAR_AIRCRAFT: built {self.id} "
+                            f"branch={read_branch} distance={full_mm0_distance_nm:.1f}nm"
+                            if full_mm0_distance_nm is not None else
+                            f"FULL_MM0_NEAR_AIRCRAFT: built {self.id} "
+                            f"branch={read_branch} distance=unknown"
+                        )
+                        return True
+                    bump(f'full_mm0_near_aircraft_build_failed_{full_mm0_reason}')
+                except Exception as _e:
+                    log.debug(f"full_mm0_near_aircraft build failed for {self.id}: {_e}")
+                    bump('full_mm0_near_aircraft_exception')
+            elif full_mm0_reason in ('too_far', 'no_current_position'):
+                bump(f'full_mm0_near_aircraft_skip_{full_mm0_reason}')
+
         # ═══════════════════════════════════════════════════════════════════
         # DYNAMIC-ZOOM DOWNGRADE: build mm0..mmN from one upscaled source
         # ═══════════════════════════════════════════════════════════════════
@@ -8265,7 +8720,12 @@ class Tile(object):
         # terrain).  Instead, build mm0 from the available build-zoom
         # chunks (upscaled to layout) and let pydds.gen_mipmaps derive
         # all subsequent mipmaps from it in a single pass.
-        if self.max_zoom < self.layout_zoom:
+        #
+        # Do this only for high-detail demand. X-Plane also issues many
+        # one-shot distant mm3/mm4 reads during scenery discovery; treating
+        # those as a reason to build mm0 downloads/compresses a full tile for
+        # what is effectively a low-detail probe.
+        if self.max_zoom < self.layout_zoom and mipmap <= 1:
             if self._build_all_mipmaps_from_mm0(time_budget=time_budget):
                 return True
             # mm0 image not yet available — fall through to legacy path
@@ -8385,6 +8845,18 @@ class Tile(object):
             else:
                 bump('partial_build_python_fallback_none')
             return True
+        if not self._is_valid_aoimage(new_im):
+            bump('partial_build_invalid_image')
+            log.warning(
+                f"READ_DDS_BYTES: invalid partial image for {self.id} mipmap={mipmap} "
+                f"size={getattr(new_im, 'size', None)} "
+                f"channels={getattr(new_im, '_channels', None)}"
+            )
+            try:
+                new_im.close()
+            except Exception:
+                pass
+            return False
 
         # If tile is being closed concurrently, avoid touching DDS
         if self.dds is None:
@@ -8402,7 +8874,20 @@ class Tile(object):
         # Upscale to layout mipmap size when dynamic-zoom downgraded the
         # build below layout_zoom — keeps mm slot fully populated.
         new_im = self._upscale_to_layout(new_im, mipmap)
+        if not self._is_valid_aoimage(new_im):
+            bump('partial_build_invalid_upscaled_image')
+            log.warning(
+                f"READ_DDS_BYTES: invalid upscaled partial image for {self.id} mipmap={mipmap} "
+                f"size={getattr(new_im, 'size', None)} "
+                f"channels={getattr(new_im, '_channels', None)}"
+            )
+            try:
+                new_im.close()
+            except Exception:
+                pass
+            return False
 
+        gen_mipmap_error = None
         with self._dds_write_lock:
             self.ready.clear()
             try:
@@ -8424,6 +8909,8 @@ class Tile(object):
                         bump('phase_gen_mipmaps_slow_250ms')
                 except Exception:
                     pass
+            except Exception as e:
+                gen_mipmap_error = e
             finally:
                 # We haven't fully retrieved so unset flag; guard against DDS being cleared
                 log.debug(f"UNSETTING RETRIEVED! {self}")
@@ -8433,6 +8920,18 @@ class Tile(object):
                 except Exception:
                     pass
                 self.ready.set()
+
+        if gen_mipmap_error is not None:
+            bump('partial_build_gen_mipmaps_exception')
+            log.warning(
+                f"READ_DDS_BYTES: gen_mipmaps failed for partial image {self.id} "
+                f"mipmap={mipmap}: {gen_mipmap_error}"
+            )
+            try:
+                new_im.close()
+            except Exception:
+                pass
+            return False
 
         # Close image if not cached in self.imgs to free native memory immediately
         if mipmap not in self.imgs:
@@ -8961,7 +9460,7 @@ class Tile(object):
             # (offset=0) so this won't trigger unnecessary mipmap 0 builds
             log.debug("READ_DDS_BYTES: Read header")
             _branch = 'header'
-            self.get_bytes(0, length, time_budget=request_budget)
+            self.get_bytes(0, length, time_budget=request_budget, read_branch=_branch)
         else:
             # Dynamically scale the early-read heuristic based on actual mip-0 bytes per chunk-row
             blocksize = 8 if CFG.pydds.format == "BC1" else 16
@@ -8975,7 +9474,7 @@ class Tile(object):
             if mm_idx == 0 and offset < early_threshold:
                 log.debug("READ_DDS_BYTES: Early region of mipmap 0 - fetching from start")
                 _branch = 'early_mm0'
-                self.get_bytes(0, length + offset, time_budget=request_budget)
+                self.get_bytes(0, length + offset, time_budget=request_budget, read_branch=_branch)
             elif (offset + length) < mipmap.endpos:
                 # Total length is within this mipmap.  Make sure we have it.
                 log.debug(f"READ_DDS_BYTES: Detected middle read for mipmap {mipmap.idx}")
@@ -8992,7 +9491,7 @@ class Tile(object):
                 # We must extend beyond the length.
 
                 # Get bytes prior to this mipmap
-                self.get_bytes(offset, length, time_budget=request_budget)
+                self.get_bytes(offset, length, time_budget=request_budget, read_branch=_branch)
 
                 # Get the entire next mipmap
                 self.get_mipmap(mm_idx + 1, time_budget=request_budget)
@@ -9076,6 +9575,19 @@ class Tile(object):
         self.dds.write(outfile)
         self.ready.set()
         return outfile
+
+    @staticmethod
+    def _is_valid_aoimage(img) -> bool:
+        if img is None or getattr(img, '_freed', False):
+            return False
+        try:
+            width = int(getattr(img, '_width', 0) or 0)
+            height = int(getattr(img, '_height', 0) or 0)
+            channels = int(getattr(img, '_channels', 0) or 0)
+            data_ptr = int(getattr(img, '_data', 0) or 0)
+        except Exception:
+            return False
+        return width > 0 and height > 0 and channels == 4 and data_ptr != 0
 
     def get_img(self, mipmap, startrow=0, endrow=None, maxwait=5, min_zoom=None, time_budget=None,
                 fallback_level_override=None):
@@ -11072,9 +11584,10 @@ class Tile(object):
 
         log.debug(f"GET_MIPMAP: {self}")
 
-        # Dynamic-zoom downgrade: build mm0..mmN from one upscaled source.
-        # See _build_all_mipmaps_from_mm0 for rationale.
-        if self.max_zoom < self.layout_zoom:
+        # Dynamic-zoom downgrade: build mm0..mmN from one upscaled source for
+        # high-detail demand only. Distant mm3/mm4 requests are common probe
+        # reads and should not force a full mm0 build.
+        if self.max_zoom < self.layout_zoom and mipmap <= 1:
             if self._build_all_mipmaps_from_mm0(time_budget=time_budget):
                 return True
             # mm0 image not yet available — fall through to legacy path
@@ -11116,13 +11629,38 @@ class Tile(object):
         if not new_im:
             log.debug("GET_MIPMAP: No updates, so no image generated")
             return True
+        if not self._is_valid_aoimage(new_im):
+            bump('get_mipmap_invalid_image')
+            log.warning(
+                f"GET_MIPMAP: invalid image for {self.id} mipmap={mipmap} "
+                f"size={getattr(new_im, 'size', None)} "
+                f"channels={getattr(new_im, '_channels', None)}"
+            )
+            try:
+                new_im.close()
+            except Exception:
+                pass
+            return False
 
         # Upscale to layout mipmap size when dynamic-zoom downgraded the
         # build below layout_zoom — keeps mm slot fully populated.
         new_im = self._upscale_to_layout(new_im, mipmap)
+        if not self._is_valid_aoimage(new_im):
+            bump('get_mipmap_invalid_upscaled_image')
+            log.warning(
+                f"GET_MIPMAP: invalid upscaled image for {self.id} mipmap={mipmap} "
+                f"size={getattr(new_im, 'size', None)} "
+                f"channels={getattr(new_im, '_channels', None)}"
+            )
+            try:
+                new_im.close()
+            except Exception:
+                pass
+            return False
 
         # DDS WRITE — short critical section (~10-50ms)
         compress_start_time = time.monotonic()
+        gen_mipmap_error = None
         with self._dds_write_lock:
             self.ready.clear()
             try:
@@ -11130,8 +11668,23 @@ class Tile(object):
                     self.dds.gen_mipmaps(new_im, mipmap, 0)
                 else:
                     self.dds.gen_mipmaps(new_im, mipmap)
+            except Exception as e:
+                gen_mipmap_error = e
             finally:
                 self.ready.set()
+
+        if gen_mipmap_error is not None:
+            bump('get_mipmap_gen_mipmaps_exception')
+            log.warning(
+                f"GET_MIPMAP: gen_mipmaps failed for {self.id} "
+                f"mipmap={mipmap}: {gen_mipmap_error}"
+            )
+            if mipmap not in self.imgs:
+                try:
+                    new_im.close()
+                except Exception:
+                    pass
+            return False
 
         compress_end_time = time.monotonic()
 

@@ -920,6 +920,7 @@ class DynamicDDSCache:
             # Update LRU tracking (use on-disk size for accurate budget)
             key = self._tile_key(tile_id, max_zoom)
             size = len(disk_bytes)
+            old_size = 0
             with self._lock:
                 if key in self._entries:
                     old_size = self._entries[key][2]
@@ -930,6 +931,7 @@ class DynamicDDSCache:
                 self._stores += 1
 
             log.debug(f"DDS cache STORE: {tile_id} z{max_zoom} ({size} bytes)")
+            self._after_store_size_change(size - old_size)
 
             if not mm0_missing_indices and not mm0_fallback_indices:
                 try:
@@ -1085,6 +1087,7 @@ class DynamicDDSCache:
 
             # 5. LRU tracking (use actual on-disk size)
             key = self._tile_key(tile_id, max_zoom)
+            old_size = 0
             with self._lock:
                 if key in self._entries:
                     old_size = self._entries[key][2]
@@ -1104,6 +1107,7 @@ class DynamicDDSCache:
                       f"mipmaps={sorted(new_mipmaps.keys())} "
                       f"populated={merged_populated} "
                       f"disk={disk_size} compression={disk_compression}")
+            self._after_store_size_change(disk_size - old_size)
 
             return True
 
@@ -1206,6 +1210,7 @@ class DynamicDDSCache:
 
             # Update LRU tracking (use on-disk size for accurate budget)
             key = self._tile_key(tile_id, max_zoom)
+            old_size = 0
             with self._lock:
                 if key in self._entries:
                     old_size = self._entries[key][2]
@@ -1217,6 +1222,7 @@ class DynamicDDSCache:
 
             log.debug(f"DDS cache STORE (from file): {tile_id} z{max_zoom} "
                       f"({disk_size} bytes, compression={disk_compression})")
+            self._after_store_size_change(disk_size - old_size)
 
             if not mm0_missing_indices and not mm0_fallback_indices:
                 try:
@@ -1634,8 +1640,28 @@ class DynamicDDSCache:
 
             log.info(f"DDS cache scan: found {count} entries "
                      f"({self._current_size / (1024*1024):.1f}MB)")
+            self._enforce_size_limit_async()
 
         return count
+
+    def _after_store_size_change(self, delta_bytes: int) -> None:
+        """Update external budget accounting and enforce this cache's own limit."""
+        if delta_bytes:
+            budget_manager = self._budget_manager
+            if budget_manager is not None:
+                try:
+                    budget_manager.account_dds(delta_bytes)
+                except Exception as e:
+                    log.debug(f"DDS cache budget accounting failed: {e}")
+        self._enforce_size_limit_async()
+
+    def _enforce_size_limit_async(self) -> None:
+        if not self._max_size:
+            return
+        with self._lock:
+            over_limit = self._current_size > self._max_size and len(self._entries) > 1
+        if over_limit:
+            self._evict_lru_async()
 
     def migrate_uncompressed(self) -> int:
         """Re-compress existing uncompressed DDS files in-place.

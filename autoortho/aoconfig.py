@@ -167,6 +167,48 @@ use_time_budget = True
 # Recommended: 15.0 (very fast), 30.0 (balanced), 60.0 (quality)
 # Note: Higher values (120+) can cause multi-minute stalls when cache eviction occurs
 tile_time_budget = 180.0
+# Build mipmap 0 during X-Plane's first offset=0 DDS read when the tile is
+# likely to be rendered up close. This prevents missing_color blocks in the
+# top strip of cold tiles while preserving the cheap header-skip for distant
+# probes.
+prefill_mm0_on_header_read = False
+# Aircraft-distance gate for header-read mm0 prefill once position data is valid.
+prefill_mm0_header_radius_nm = 12.0
+# Bounded allowance for the initial scenery-load burst before aircraft position
+# data is available.
+prefill_mm0_header_startup_max_tiles = 256
+prefill_mm0_header_startup_window_sec = 180.0
+# Queue skipped cold header-read tiles for low-priority background DDS repair.
+# This keeps X-Plane load fast while making repeated starts cleaner once the
+# background cache has caught up.
+header_mm0_heal_enabled = True
+header_mm0_heal_radius_nm = 20.0
+header_mm0_heal_max_tiles = 384
+# Startup header probes are broad before X-Plane exposes aircraft datarefs.
+# Keep them out of the repair queue by default; real near-detail reads still
+# build through the normal mm0 path.
+header_mm0_heal_startup_probe_enabled = False
+header_mm0_heal_startup_max_tiles = 192
+header_mm0_heal_window_sec = 300.0
+# For real mm0 reads close to the aircraft, prefer a complete mm0/mipmap chain
+# over native partial rows. This prevents nearby tiles from staying visibly
+# incomplete after X-Plane has moved past the initial header-probe phase.
+full_mm0_near_aircraft_enabled = True
+full_mm0_near_aircraft_radius_nm = 10.0
+# Before X-Plane datarefs connect, allow a small number of real mm0 reads to
+# build complete tiles. These are not header probes; they are the startup tiles
+# X-Plane is already asking to render.
+full_mm0_startup_real_read_enabled = True
+full_mm0_startup_real_read_max_tiles = 32
+full_mm0_startup_real_read_window_sec = 180.0
+# During an in-session airport/location switch, datarefs can temporarily drop
+# while X-Plane is already issuing real texture reads at the new airport. If
+# those reads are far from the last known aircraft position, allow a bounded
+# number of complete DDS builds for the new close-in area.
+full_mm0_reconnect_real_read_enabled = True
+full_mm0_reconnect_real_read_min_distance_nm = 40.0
+full_mm0_reconnect_real_read_max_tiles = 64
+full_mm0_reconnect_real_read_window_sec = 180.0
 # Fallback level when chunks fail to download in time:
 # none = Skip all fallbacks (fastest, may have missing tiles)
 # cache = Use disk cache and already-built mipmaps, no network (balanced)

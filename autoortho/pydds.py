@@ -413,13 +413,18 @@ class DDS(Structure):
     def read(self, length):
         log.debug(f"PYDDS: READ: {self.position} {length} bytes")
 
+        requested_length = length
         outdata = b''
+        start_position = self.position
 
         if self.position < 128:
             log.debug("Read the header")
-            outdata = self.header.getvalue()
-            self.position = 128
-            length -= 128
+            header_pos = max(0, self.position)
+            header_len = min(length, 128 - header_pos)
+            self.header.seek(header_pos)
+            outdata = self.header.read(header_len)
+            self.position += header_len
+            length -= header_len
 
         for mipmap in self.mipmap_list:
            
@@ -490,6 +495,16 @@ class DDS(Structure):
                     #self.position += remaining_mipmap_len
                     self.position = mipmap.endpos
 
+
+        if len(outdata) < requested_length and start_position < self.total_size:
+            missing_len = min(requested_length - len(outdata), self.total_size - self.position)
+            if missing_len > 0:
+                log.warning(
+                    f"PYDDS: short read at pos={start_position} requested={requested_length} "
+                    f"returned={len(outdata)}; padding {missing_len} bytes with missing_color."
+                )
+                outdata += get_fallback_bytes(missing_len, self.blocksize)
+                self.position += missing_len
 
         log.debug(f"PYDDS: END READ: At {self.position} returning {len(outdata)} bytes")
         return outdata
@@ -650,6 +665,14 @@ class DDS(Structure):
 
         # Print info outside lock; keep compression non-critical except for writes
         width, height = img.size
+        channels = int(getattr(img, "_channels", 0) or 0)
+        data_ptr = int(getattr(img, "_data", 0) or 0)
+        if width <= 0 or height <= 0 or channels != 4 or data_ptr == 0:
+            raise ValueError(
+                f"invalid image for DDS mipmap generation: "
+                f"size={width}x{height} channels={channels} data={data_ptr}"
+            )
+
         mipmap = startmipmap
         # I believe XP only references up to MM8, so might be able to trim
         # this down more
