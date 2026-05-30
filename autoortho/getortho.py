@@ -822,7 +822,12 @@ def _build_dds_native(cache_dir: str, tile_row: int, tile_col: int,
         return None
 
 
-MEMTRACE = False
+# Leak-hunting probe. Enable by launching with env AO_MEMTRACE=1 (per-process,
+# so you can target a single region worker). When on, the TileCacher eviction
+# loop periodically logs a gc object-type histogram and the top tracemalloc
+# allocation *growth* sites vs the previous probe — the growth delta is what
+# pinpoints a leak, not the absolute top-N.
+MEMTRACE = os.environ.get("AO_MEMTRACE", "").strip().lower() in ("1", "true", "yes", "on")
 
 log = logging.getLogger(__name__)
 
@@ -12030,7 +12035,14 @@ class TileCacher(object):
         # On macOS multi-process, "cold" workers (no recent access) evict
         # more aggressively than "hot" workers with fresh tiles.
         self._last_access_ts = time.monotonic()
-        
+
+        # Leak probe state (only used when MEMTRACE). Throttle probe output to
+        # once per _mem_probe_interval_s; keep the previous tracemalloc snapshot
+        # so we can report allocation *growth* between probes.
+        self._last_mem_probe_ts = 0.0
+        self._mem_probe_interval_s = 60.0
+        self._prev_tm_snapshot = None
+
         self.cache_dir = CFG.paths.cache_dir
         log.info(f"Cache dir: {self.cache_dir}")
         self.min_zoom = int(CFG.autoortho.min_zoom)
@@ -12069,6 +12081,67 @@ class TileCacher(object):
             # Windows doesn't handle FS cache the same way so enable here.
             self.enable_cache = True
             self.cache_tile_lim = 50
+
+    def _log_mem_probe(self):
+        """Leak-hunting probe (MEMTRACE only). Throttled to once per
+        _mem_probe_interval_s. Logs two views at WARNING so they surface in
+        the usual log grep:
+
+          1. gc object-type histogram — top Python object types by live count.
+             Cheap, and tells us *what kind* of object is accumulating
+             (e.g. bytes/bytearray => buffers; Tile => tiles not released;
+             dict/list => container leak).
+          2. tracemalloc growth — top allocation sites by *increase in size*
+             since the previous probe. The growth delta, not the absolute
+             top-N, is what fingers the leaking call site.
+
+        Both are best-effort; any failure is swallowed so the probe can never
+        take down the eviction loop.
+        """
+        now = time.monotonic()
+        if (now - self._last_mem_probe_ts) < self._mem_probe_interval_s:
+            return
+        self._last_mem_probe_ts = now
+        pid = self._pid
+
+        # --- 1. gc object-type histogram -----------------------------------
+        try:
+            counts = {}
+            for obj in gc.get_objects():
+                tn = type(obj).__name__
+                counts[tn] = counts.get(tn, 0) + 1
+            top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:15]
+            hist = " ".join(f"{name}={n}" for name, n in top)
+            log.warning(
+                f"MEMPROBE pid={pid} gc_objects={sum(counts.values())} "
+                f"gc_tracked_types={len(counts)} top: {hist}"
+            )
+        except Exception as e:
+            log.warning(f"MEMPROBE pid={pid} gc histogram failed: {e}")
+
+        # --- 2. tracemalloc growth vs previous probe -----------------------
+        try:
+            if tracemalloc.is_tracing():
+                snap = tracemalloc.take_snapshot()
+                if self._prev_tm_snapshot is not None:
+                    diffs = snap.compare_to(self._prev_tm_snapshot, 'lineno')
+                    log.warning(f"MEMPROBE pid={pid} tracemalloc TOP GROWTH since last probe:")
+                    for stat in diffs[:12]:
+                        # stat.size_diff is the byte growth at this site
+                        log.warning(f"MEMPROBE pid={pid}   {stat}")
+                else:
+                    log.warning(
+                        f"MEMPROBE pid={pid} tracemalloc baseline captured "
+                        f"(growth shown on next probe)"
+                    )
+                self._prev_tm_snapshot = snap
+            else:
+                log.warning(
+                    f"MEMPROBE pid={pid} tracemalloc not tracing — "
+                    f"start the worker with AO_MEMTRACE=1 to capture allocation sites"
+                )
+        except Exception as e:
+            log.warning(f"MEMPROBE pid={pid} tracemalloc probe failed: {e}")
 
     def compute_layout_zoom(self, tilename_zoom: int) -> int:
         """Single source of truth for a tile's DDS output dimensions.
@@ -12791,12 +12864,7 @@ class TileCacher(object):
                     )
 
             if MEMTRACE:
-                snapshot = tracemalloc.take_snapshot()
-                top_stats = snapshot.statistics('lineno')
-
-                log.info("[ Top 10 ]")
-                for stat in top_stats[:10]:
-                        log.info(stat)
+                self._log_mem_probe()
 
             # Adaptive poll interval: check more frequently when
             # memory is above 70% of the limit so eviction can
