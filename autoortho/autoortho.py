@@ -737,7 +737,8 @@ class AOMount:
         if not blocking:
             log.info("Running mounts in non-blocking mode.")
             time.sleep(1)
-            diagnose(self.cfg)
+            ready = diagnose(self.cfg)
+            self._announce_ready(ready)
             return
 
         try:
@@ -748,7 +749,8 @@ class AOMount:
 
             time.sleep(1)
             # Check things out
-            diagnose(self.cfg)
+            ready = diagnose(self.cfg)
+            self._announce_ready(ready)
 
             self._monitor_mount_workers()
 
@@ -758,6 +760,31 @@ class AOMount:
         finally:
             log.info("Shutting down ...")
             self.unmount_sceneries()
+
+    def _announce_ready(self, ready):
+        """Emit a prominent, console-visible go/no-go for starting X-Plane.
+
+        diagnose() already gates on every mount serving and maptypes being
+        reachable; this just makes the result unmissable in the log/console
+        (WARNING level so it survives INFO filtering) instead of a quiet
+        'All checks passed' line.
+        """
+        if ready:
+            banner = [
+                "==================================================",
+                "  AutoOrtho READY - all mounts serving.",
+                "  >>> Safe to start X-Plane now. <<<",
+                "==================================================",
+            ]
+        else:
+            banner = [
+                "==================================================",
+                "  AutoOrtho NOT READY - mount/maptype check failed.",
+                "  >>> Do NOT start X-Plane; review the log above. <<<",
+                "==================================================",
+            ]
+        for line in banner:
+            log.warning(line)
 
     def unmount_sceneries(self, force=False):
         log.info("Unmounting ...")
