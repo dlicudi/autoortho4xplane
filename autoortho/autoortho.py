@@ -912,7 +912,15 @@ def main():
 
     from datareftrack import dt
     dt.start()
-    
+
+    # Auto-close AutoOrtho when X-Plane exits (PID-based watcher; on by default,
+    # disable with env AO_NO_XPLANE_WATCH=1 or [general] exit_with_xplane=False).
+    try:
+        from autoortho import xplane_watcher
+    except ImportError:
+        import xplane_watcher
+    xplane_watcher.start(CFG)
+
     # Run things
     if args.root and args.mountpoint:
         # Just mount specific requested dirs
@@ -952,6 +960,10 @@ def main():
             cfgui = AOMountUI(CFG)
             cfgui.setup()
 
+    try:
+        xplane_watcher.stop()
+    except Exception:
+        pass
     dt.stop()
     flighttrack.ft.stop()
 
