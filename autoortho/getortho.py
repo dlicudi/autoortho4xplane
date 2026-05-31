@@ -9322,6 +9322,16 @@ class Tile(object):
             target_w = max(1, self.dds.width >> mipmap)
             target_h = max(1, self.dds.height >> mipmap)
             src_w, src_h = img.size
+            # Green-strip diag (2026-05-31): for sub-full source images, capture
+            # the exact dims + whether the pass-through branch fires. pass3=True
+            # here with a small img is the bug (returns one-level-short image).
+            if src_w < self.dds.width or src_h < self.dds.height:
+                log.warning(
+                    f"UPSCALE_DIAG tile={getattr(self, 'id', None)} mm{mipmap} "
+                    f"img={src_w}x{src_h} dds={self.dds.width}x{self.dds.height} "
+                    f"target={target_w}x{target_h} "
+                    f"pass3={(src_w >= target_w and src_h >= target_h)}"
+                )
             if src_w >= target_w and src_h >= target_h:
                 return img
             scale_w = target_w // max(1, src_w)
