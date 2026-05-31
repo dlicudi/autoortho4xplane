@@ -1276,15 +1276,16 @@ def _trace_mm_assign(tile_id, origin, mm, mm_data_len):
     """
     try:
         bump(f'mm{mm.idx}_assign_{origin}')
-        if mm.idx == 0:
-            expected = mm.endpos - mm.startpos
-            if mm_data_len < expected:
-                log.warning(
-                    f"MM_ASSIGN_SHORT origin={origin} tile={tile_id} "
-                    f"mm0 actual={mm_data_len} expected={expected} "
-                    f"missing={expected - mm_data_len}"
-                )
-                bump(f'mm0_short_assign_{origin}')
+        # Check EVERY mip, not just mm0 — the green-strip bug fills mm2/mm3
+        # (a one-level chain shift) and only logging mm0 hid it (2026-05-31).
+        expected = mm.endpos - mm.startpos
+        if mm_data_len < expected:
+            log.warning(
+                f"MM_ASSIGN_SHORT origin={origin} tile={tile_id} "
+                f"mm{mm.idx} actual={mm_data_len} expected={expected} "
+                f"missing={expected - mm_data_len}"
+            )
+            bump(f'mm{mm.idx}_short_assign_{origin}')
     except Exception:
         pass
 
@@ -9229,6 +9230,26 @@ class Tile(object):
                 self.ready.clear()
                 try:
                     smallest_mm = self.dds.smallest_mm
+                    # Green-strip proof (2026-05-31): is the native chain one
+                    # level too small vs the pydds layout slots? Logs native
+                    # mip0 size vs pydds's expected mm0 size + the build/layout
+                    # zooms and width arg. Read-only.
+                    try:
+                        _m0 = result.get_mipmap_data(0)
+                        _exp0 = (self.dds.mipmap_list[0].endpos
+                                 - self.dds.mipmap_list[0].startpos)
+                        log.warning(
+                            f"LAYOUT_AWARE_DIAG tile={self.id} "
+                            f"build_zoom={self.max_zoom} "
+                            f"layout_zoom={getattr(self, 'layout_zoom', None)} "
+                            f"width={self.width} "
+                            f"native_mip_count={result.mipmap_count} "
+                            f"native_mm0={len(_m0) if _m0 else 0} "
+                            f"pydds_mm0_expected={_exp0} "
+                            f"native_total={len(result.data) if result.data else 0}"
+                        )
+                    except Exception:
+                        pass
                     for i in range(result.mipmap_count):
                         if i >= len(self.dds.mipmap_list):
                             break
