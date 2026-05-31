@@ -9444,7 +9444,33 @@ class Tile(object):
                             if _sample == b'\x00' * 8:
                                 bump(f'serve_mm0_buf_zero_zl{self.tilename_zoom}')
                             else:
-                                bump(f'serve_mm0_buf_filled_zl{self.tilename_zoom}')
+                                # CLEAN green vs real split.  serve_mm0_buf_filled
+                                # lumped real ortho + missing_color together (both
+                                # non-zero).  mm0 is BC1: bytes[0:2] are the c0
+                                # RGB565 endpoint; a missing_color fill is a solid
+                                # block, so c0 decodes to ~missing_color.  This
+                                # gives the actual count of tiles served GREEN.
+                                _c0 = _sample[0] | (_sample[1] << 8)
+                                _r = ((_c0 >> 11) & 0x1f) * 255 // 31
+                                _g = ((_c0 >> 5) & 0x3f) * 255 // 63
+                                _b = (_c0 & 0x1f) * 255 // 31
+                                _mc = CFG.autoortho.missing_color
+                                if (abs(_r - _mc[0]) <= 12 and abs(_g - _mc[1]) <= 12
+                                        and abs(_b - _mc[2]) <= 12):
+                                    bump(f'serve_mm0_buf_green_zl{self.tilename_zoom}')
+                                    # Log the tile ONCE (first green serve) so we
+                                    # get a clean, non-spammy list of which tiles
+                                    # actually went out green, with how complete
+                                    # mm0 was and the decoded colour.
+                                    if not getattr(self, '_logged_green', False):
+                                        self._logged_green = True
+                                        log.warning(
+                                            f"SERVE_GREEN tile={self.id} "
+                                            f"zl={self.tilename_zoom} mm0_pct={_pct} "
+                                            f"c0=({_r},{_g},{_b}) serves={self._serve_count + 1}"
+                                        )
+                                else:
+                                    bump(f'serve_mm0_buf_real_zl{self.tilename_zoom}')
                     except Exception:
                         pass
 
