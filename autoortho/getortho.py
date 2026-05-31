@@ -9316,8 +9316,17 @@ class Tile(object):
         """
         try:
             if self.dds is None or img is None or self._closed:
+                log.warning(
+                    f"UPSCALE_EARLY_BAIL path=guard1 tile={getattr(self, 'id', None)} "
+                    f"mm{mipmap} img={getattr(img, 'size', None)} "
+                    f"dds_none={self.dds is None} img_none={img is None} closed={self._closed}"
+                )
                 return img
             if not self._is_valid_aoimage(img):
+                log.warning(
+                    f"UPSCALE_EARLY_BAIL path=invalid_img tile={getattr(self, 'id', None)} "
+                    f"mm{mipmap} img={getattr(img, 'size', None)}"
+                )
                 return img
             target_w = max(1, self.dds.width >> mipmap)
             target_h = max(1, self.dds.height >> mipmap)
