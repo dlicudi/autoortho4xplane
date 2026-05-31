@@ -18,6 +18,15 @@ _native_image_lock = threading.RLock()
 _delete_lock = threading.Lock()
 _deleted_ptrs = set()
 
+# Leak-diagnosis counters (2026-05-31). `_free_skipped_reused` counts close()
+# calls that skipped aoimage_delete because the pointer was already recorded in
+# the add-only `_deleted_ptrs` set. Since malloc reuses freed addresses, a skip
+# on a reused address means a live native buffer is never freed → leak. A high
+# skipped:real ratio confirms `_deleted_ptrs` is the source of the aoimage RSS
+# leak. Pure instrumentation: no change to the free logic itself.
+_free_real = 0
+_free_skipped_reused = 0
+
 class AOImageException(Exception):
     pass
 
@@ -83,6 +92,7 @@ class AoImage(Structure):
         # aoimage_delete ultimately calls free().  A stale duplicate wrapper
         # around the same native pointer can crash the whole worker before
         # Python sees an exception, so guard deletion globally by pointer.
+        global _free_real, _free_skipped_reused
         with _native_image_lock:
             with _delete_lock:
                 if self._freed:
@@ -94,6 +104,14 @@ class AoImage(Structure):
                     return
 
                 if ptr in _deleted_ptrs:
+                    # Pointer already recorded as freed. On a reused malloc
+                    # address this skips a live buffer's free → leak. Count it.
+                    _free_skipped_reused += 1
+                    if _free_skipped_reused % 500 == 0:
+                        log.warning(
+                            f"AOIMAGE_FREE_SKIP skipped={_free_skipped_reused} "
+                            f"real={_free_real} deleted_set={len(_deleted_ptrs)}"
+                        )
                     self._data = 0
                     self._width = 0
                     self._height = 0
@@ -104,6 +122,7 @@ class AoImage(Structure):
 
                 _deleted_ptrs.add(ptr)
                 self._freed = True
+                _free_real += 1
 
             try:
                 _aoi.aoimage_delete(self)
