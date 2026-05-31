@@ -16,16 +16,43 @@ log = logging.getLogger(__name__)
 
 _native_image_lock = threading.RLock()
 _delete_lock = threading.Lock()
-_deleted_ptrs = set()
 
-# Leak-diagnosis counters (2026-05-31). `_free_skipped_reused` counts close()
-# calls that skipped aoimage_delete because the pointer was already recorded in
-# the add-only `_deleted_ptrs` set. Since malloc reuses freed addresses, a skip
-# on a reused address means a live native buffer is never freed → leak. A high
-# skipped:real ratio confirms `_deleted_ptrs` is the source of the aoimage RSS
-# leak. Pure instrumentation: no change to the free logic itself.
+# Ownership tracking for the native image buffer (leak fix 2026-05-31).
+# `_live_ptrs` holds the native pointers we CURRENTLY own and must free exactly
+# once. A pointer is added when a native call allocates an output buffer (via
+# _register_live) and removed when close() frees it. close() frees ONLY pointers
+# present in this set, which:
+#   * frees a reused malloc address correctly (it was re-registered on its new
+#     allocation) — this fixes the leak that the old add-only `_deleted_ptrs`
+#     set caused by permanently remembering freed addresses and then skipping
+#     every re-free at a recycled address;
+#   * still safely skips an aliased/duplicate wrapper whose owner already freed
+#     the pointer (absent from the set), preserving double-free protection.
+_live_ptrs = set()
+
+# Validation counters (carried over from the diagnosis step). After this fix
+# `_free_skipped_reused` should stay near 0 — it now counts close() calls that
+# skipped because the pointer was not owned, which means either a genuine alias
+# or a missed registration site (residual leak). `_free_registered` ~= `_free_real`.
 _free_real = 0
 _free_skipped_reused = 0
+_free_registered = 0
+
+
+def _register_live(img):
+    """Record that `img` owns a freshly-allocated native buffer so close() frees
+    it exactly once. Call on the SUCCESS path of every native call that allocates
+    an output buffer. Idempotent (set add); a NULL/zero pointer is ignored."""
+    global _free_registered
+    try:
+        ptr = int(getattr(img, "_data", 0) or 0)
+    except Exception:
+        return
+    if not ptr:
+        return
+    with _delete_lock:
+        _live_ptrs.add(ptr)
+        _free_registered += 1
 
 class AOImageException(Exception):
     pass
@@ -103,14 +130,17 @@ class AoImage(Structure):
                     self._freed = True
                     return
 
-                if ptr in _deleted_ptrs:
-                    # Pointer already recorded as freed. On a reused malloc
-                    # address this skips a live buffer's free → leak. Count it.
+                if ptr not in _live_ptrs:
+                    # Not an owned-live pointer: either an aliased/duplicate
+                    # wrapper whose owner already freed it (skipping is
+                    # double-free safe), or a buffer from a path that failed to
+                    # register (residual leak — this counter flags it). Either
+                    # way, do NOT call the native free.
                     _free_skipped_reused += 1
                     if _free_skipped_reused % 500 == 0:
                         log.warning(
                             f"AOIMAGE_FREE_SKIP skipped={_free_skipped_reused} "
-                            f"real={_free_real} deleted_set={len(_deleted_ptrs)}"
+                            f"real={_free_real} live={len(_live_ptrs)}"
                         )
                     self._data = 0
                     self._width = 0
@@ -120,7 +150,7 @@ class AoImage(Structure):
                     self._freed = True
                     return
 
-                _deleted_ptrs.add(ptr)
+                _live_ptrs.discard(ptr)
                 self._freed = True
                 _free_real += 1
 
@@ -149,6 +179,7 @@ class AoImage(Structure):
                 log.debug(f"AoImage.convert error: {new_img._errmsg.decode()}")
                 new_img.close()  # Cleanup on failure
                 return None
+            _register_live(new_img)
             return new_img
         except Exception as e:
             log.error(f"AoImage.convert exception: {e}")
@@ -169,6 +200,7 @@ class AoImage(Structure):
                 log.debug(f"AoImage.reduce_2 error: {half._errmsg.decode()}")
                 raise AOImageException(f"AoImage.reduce_2 error: {half._errmsg.decode()}")
                 #return None
+            _register_live(half)
 
             steps -= 1
 
@@ -194,6 +226,7 @@ class AoImage(Structure):
                 scaled.close()  # Cleanup on failure
                 return None
             log.debug(f"AoImage.scale: Success, created {scaled._width}x{scaled._height}")
+            _register_live(scaled)
             return scaled
         except Exception as e:
             log.error(f"scale: Exception: {e}")
@@ -273,6 +306,7 @@ class AoImage(Structure):
             log.error(f"AoImage.copy error: {self._errmsg.decode()}")
             return None
 
+        _register_live(new)
         return new
 
     
@@ -338,6 +372,9 @@ class AoImage(Structure):
                         errmsg = result._native_error()
                         result.close()
                         raise AOImageException(f"crop_and_upscale failed: {errmsg}")
+                    # Register before the post-lock validate so a validation
+                    # failure's result.close() actually frees the buffer.
+                    _register_live(result)
                 result._validate_native_image("crop_and_upscale result")
                 return result
             except Exception:
@@ -362,6 +399,7 @@ def new(mode, wh, color):
             log.debug(f"AoImage.new error: {new_img._errmsg.decode()}")
             new_img.close()  # Cleanup on failure
             return None
+        _register_live(new_img)
         return new_img
     except Exception as e:
         log.error(f"AoImage.new exception: {e}")
@@ -393,9 +431,10 @@ def load_from_memory(mem, datalen=None):
             log.error(f"AoImage.load_from_memory error: {new_img._errmsg.decode()}")
             new_img.close()  # Cleanup on failure
             return None
-        
+
         # Breadcrumb: Made it through C code successfully
         log.debug(f"AoImage: C call succeeded, created {new_img._width}x{new_img._height} image")
+        _register_live(new_img)
         return new_img
     except Exception as e:
         log.error(f"AoImage.load_from_memory exception: {e}")
@@ -409,6 +448,7 @@ def open(filename):
             log.debug(f"AoImage.open error for {filename}: {new_img._errmsg.decode()}")
             new_img.close()  # Cleanup on failure
             return None
+        _register_live(new_img)
         return new_img
     except Exception as e:
         log.error(f"AoImage.open exception: {e}")
