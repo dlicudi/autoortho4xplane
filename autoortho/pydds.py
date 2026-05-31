@@ -260,7 +260,8 @@ class DDS(Structure):
 
 
     def __init__(self, width, height, ispc=True, dxt_format="BC1"):
-        self.magic = b"DDS "  
+        self.tile_id = None  # set by getortho so fill/gen_mipmaps warnings name the tile
+        self.magic = b"DDS "
         self.size = 124
         self.flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT | DDSD_MIPMAPCOUNT | DDSD_LINEARSIZE
         self.width = width
@@ -485,7 +486,14 @@ class DDS(Structure):
                     # Make sure we retrieved all the expected data from the mipmap we can.
                     ret_len = remaining_mipmap_len - len(data)
                     if ret_len != 0:
-                        log.error(f"PYDDS: ERROR! Didn't retrieve full length of mipmap {mipmap.idx}! Filling {ret_len} bytes with missing_color.")
+                        try:
+                            _cur = mipmap.databuffer.tell()
+                            mipmap.databuffer.seek(0, 2)
+                            _dblen = mipmap.databuffer.tell()
+                            mipmap.databuffer.seek(_cur)
+                        except Exception:
+                            _dblen = -1
+                        log.error(f"PYDDS: ERROR! Didn't retrieve full length of mipmap {mipmap.idx}! Filling {ret_len} bytes with missing_color. tile={getattr(self, 'tile_id', None)} db_len={_dblen} mm_declared={mipmap.endpos - mipmap.startpos}")
                         # Use proper BC1/BC3 blocks with missing_color instead of garbage
                         data += get_fallback_bytes(ret_len, self.blocksize)
 
@@ -750,6 +758,17 @@ class DDS(Structure):
                     self.mipmap_list[mipmap].databuffer = BytesIO(initial_bytes=dxtdata)
                     if not compress_bytes:
                         self.mipmap_list[mipmap].retrieved = True
+                        # Green-strip trace (2026-05-31): gen_mipmaps assigns
+                        # databuffers WITHOUT _trace_mm_assign, so a one-level-
+                        # short mm2/mm3 here was invisible. Log it.
+                        _exp = (self.mipmap_list[mipmap].endpos
+                                - self.mipmap_list[mipmap].startpos)
+                        if len(dxtdata) < _exp:
+                            log.warning(
+                                f"GENMIPMAP_SHORT tile={getattr(self, 'tile_id', None)} "
+                                f"mm{mipmap} actual={len(dxtdata)} expected={_exp} "
+                                f"missing={_exp - len(dxtdata)}"
+                            )
 
                     # we are already at 4x4 so push result forward to
                     # remaining MMs

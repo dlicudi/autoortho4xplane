@@ -6608,6 +6608,10 @@ class Tile(object):
                 dxt_format=CFG.pydds.format)
 
         self.id = f"{row}_{col}_{maptype}_{self.tilename_zoom}"
+        try:
+            self.dds.tile_id = self.id  # so pydds fill/gen_mipmaps warnings name the tile
+        except Exception:
+            pass
 
 
     def __lt__(self, other):
