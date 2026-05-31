@@ -5074,6 +5074,10 @@ class BackgroundDDSBuilder:
             width = tile.dds.width if tile.dds is not None else img0.size[0]
             height = tile.dds.height if tile.dds is not None else img0.size[1]
             temp_dds = pydds.DDS(width, height, ispc=use_ispc, dxt_format=dxt_format)
+            try:
+                temp_dds.tile_id = tile_id  # so GENMIPMAP_SHORT names the tile
+            except Exception:
+                pass
 
             # Compress mipmap 0 only (not generating lower mipmaps from it).
             img0_for_mm0 = tile._upscale_to_layout(img0, 0)
@@ -9325,6 +9329,11 @@ class Tile(object):
             scale = min(scale_w, scale_h)
             if scale < 2 or (scale & (scale - 1)) != 0:
                 # crop_and_upscale only supports power-of-two scales.
+                log.warning(
+                    f"UPSCALE_SKIP tile={getattr(self, 'id', None)} mm{mipmap} "
+                    f"src={src_w}x{src_h} target={target_w}x{target_h} scale={scale} "
+                    f"(non-power-of-2; returning build-size image, may render short)"
+                )
                 return img
             with self._lock:
                 # Re-check after lock acquisition — close() may have run.
@@ -9357,6 +9366,13 @@ class Tile(object):
                 f"{src_w}x{src_h} -> {src_w*scale}x{src_h*scale} (target {target_w}x{target_h}) "
                 f"in {_up_ms}ms"
             )
+            if upscaled is None or upscaled.size[0] < target_w or upscaled.size[1] < target_h:
+                log.warning(
+                    f"UPSCALE_UNDERSHOOT tile={getattr(self, 'id', None)} mm{mipmap} "
+                    f"src={src_w}x{src_h} scale={scale} "
+                    f"result={None if upscaled is None else upscaled.size} "
+                    f"target={target_w}x{target_h} (may render short)"
+                )
             return upscaled
         except Exception as e:
             log.warning(f"compose upscale failed for {self} mipmap={mipmap}: {e}; "
