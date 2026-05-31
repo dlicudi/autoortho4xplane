@@ -767,7 +767,10 @@ class DDS(Structure):
                             log.warning(
                                 f"GENMIPMAP_SHORT tile={getattr(self, 'tile_id', None)} "
                                 f"mm{mipmap} actual={len(dxtdata)} expected={_exp} "
-                                f"missing={_exp - len(dxtdata)}"
+                                f"missing={_exp - len(dxtdata)} "
+                                f"compress_dims={width}x{height} "
+                                f"startmm={startmipmap} dds_w={self.width} "
+                                f"img_size={img_ref.size}"
                             )
 
                     # we are already at 4x4 so push result forward to
